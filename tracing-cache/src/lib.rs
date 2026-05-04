@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use tracing::metadata::LevelFilter;
@@ -109,7 +109,7 @@ fn u64_to_id(n: u64) -> tracing::span::Id {
 
 /// A `tracing::Subscriber` that holds spans in memory for inspection.
 ///
-/// Open (in-flight) spans live in a `Mutex<HashMap>`.  When a span closes it
+/// Open (in-flight) spans live in a `RwLock<HashMap>`.  When a span closes it
 /// moves to a per-thread buffer; the buffer is flushed to the [`Driver`] via a
 /// spillway channel, keeping the hot path free of shared-map write contention.
 ///
@@ -117,7 +117,7 @@ fn u64_to_id(n: u64) -> tracing::span::Id {
 /// `(SpanCache, Driver)`.  Spawn the [`Driver`] as a background task to commit
 /// closed spans to the shared readable map.
 pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
-    in_flight: Mutex<HashMap<u64, SpanRecord>>,
+    in_flight: RwLock<HashMap<u64, SpanRecord>>,
     map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
     next_id: AtomicU64,
     predicate: P,
@@ -144,7 +144,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
         let (sender, receiver) = spillway::channel();
         let map = Arc::new(RwLock::new(BTreeMap::new()));
         let cache = SpanCache {
-            in_flight: Mutex::new(HashMap::new()),
+            in_flight: RwLock::new(HashMap::new()),
             map: Arc::clone(&map),
             next_id: AtomicU64::new(10),
             predicate,
@@ -161,7 +161,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
         if let Some(r) = self.map.read().unwrap().get(&id).cloned() {
             return Some(r);
         }
-        self.in_flight.lock().unwrap().get(&id).cloned()
+        self.in_flight.read().unwrap().get(&id).cloned()
     }
 
     /// Returns closed spans in ascending id order.  Open spans are not
@@ -262,7 +262,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
         attrs.record(&mut FieldVisitor { fields: &mut record.fields });
 
-        let mut in_flight = self.in_flight.lock().unwrap();
+        let mut in_flight = self.in_flight.write().unwrap();
         if in_flight.len() >= self.capacity {
             log::warn!(
                 "span buffer full; new span disabled. \
@@ -279,7 +279,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         if id == DISABLED {
             return;
         }
-        let mut in_flight = self.in_flight.lock().unwrap();
+        let mut in_flight = self.in_flight.write().unwrap();
         if let Some(rec) = in_flight.get_mut(&id) {
             values.record(&mut FieldVisitor { fields: &mut rec.fields });
         }
@@ -314,7 +314,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             recorded_at: Instant::now(),
         };
 
-        let mut in_flight = self.in_flight.lock().unwrap();
+        let mut in_flight = self.in_flight.write().unwrap();
         if let Some(span) = in_flight.get_mut(&parent_id) {
             span.events.push(record);
         } else {
@@ -338,7 +338,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             return false;
         }
 
-        let record = self.in_flight.lock().unwrap().remove(&id).map(|mut r| {
+        let record = self.in_flight.write().unwrap().remove(&id).map(|mut r| {
             r.closed_at = Some(Instant::now());
             r
         });
