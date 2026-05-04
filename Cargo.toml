@@ -6,6 +6,7 @@ members = ["tracing-console", "tracing-cache"]
 criterion                       = { version = "0", features = ["async_tokio"] }
 k-cache                         = { version = "0" }
 log                             = { version = "0.4" }
-tokio                           = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
+spillway                        = { version = "1" }
+tokio                           = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tracing                         = { version = "0" }
 tracing-futures                 = { version = "0.2" }

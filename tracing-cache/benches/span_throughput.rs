@@ -25,8 +25,21 @@ use tracing_futures::Instrument;
 // A single SpanCache set as the global subscriber so all threads (including
 // Tokio worker threads) automatically route through it.  The capacity is large
 // enough that eviction is a minor fraction of each iteration's cost.
-static CACHE: LazyLock<Arc<SpanCache>> =
-    LazyLock::new(|| Arc::new(SpanCache::new(4096)));
+//
+// The Driver runs on a dedicated background thread so the benchmark threads
+// never block on a map write lock.
+static CACHE: LazyLock<Arc<SpanCache>> = LazyLock::new(|| {
+    let (cache, driver) = SpanCache::new(4096);
+    let cache = Arc::new(cache);
+    std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(driver.run())
+    });
+    cache
+});
 
 static SUBSCRIBER_INIT: OnceLock<()> = OnceLock::new();
 
