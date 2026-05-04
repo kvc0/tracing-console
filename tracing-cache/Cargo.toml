@@ -1,0 +1,18 @@
+[package]
+name = "tracing-cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+k-cache                         = { workspace = true }
+log                             = { workspace = true }
+tracing                         = { workspace = true }
+
+[[bench]]
+name = "span_throughput"
+harness = false
+
+[dev-dependencies]
+criterion                       = { workspace = true }
+tokio                           = { workspace = true }
+tracing-futures                 = { workspace = true }
