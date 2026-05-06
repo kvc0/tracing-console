@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use slab::Slab;
 use tracing::metadata::LevelFilter;
 use tracing::{Level, Metadata};
 
@@ -82,14 +83,25 @@ pub struct SpanRecord {
 
 // ── SpanCache & Driver ───────────────────────────────────────────────────────
 
-// ID 1 is the sentinel for disabled spans.  Counter starts at 10.
+// Two disjoint id namespaces share the same u64 carried by `tracing::span::Id`:
+//
+//   1                       — DISABLED sentinel
+//   [2, ID_THRESHOLD)       — active tracing id (slab_idx + 2), assigned at
+//                             new_span and used in SPAN_STACK / try_close /
+//                             record / event.  Reused as slabs are reclaimed.
+//   [ID_THRESHOLD, u64::MAX)— actual_id (from AtomicU64), monotonic.  Stored
+//                             in `SpanRecord.id` and `parent_id`; used as the
+//                             BTreeMap key after a span closes.
+//
+// Disjoint ranges let `get_span(id)` dispatch by value without a separate flag.
 const DISABLED: u64 = 1;
+const ID_THRESHOLD: u64 = 1 << 32;
 
 // Flush the thread-local PENDING buffer to the spillway after this many closes.
 const PENDING_BATCH: usize = 32;
 
 thread_local! {
-    // Active span ids on this thread — includes DISABLED entries.
+    // Active tracing ids on this thread — DISABLED or `slab_idx + 2`.
     static SPAN_STACK: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
     // Closed spans waiting to be sent to the driver via spillway.
     static PENDING: std::cell::RefCell<Vec<SpanRecord>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -107,19 +119,36 @@ fn u64_to_id(n: u64) -> tracing::span::Id {
     tracing::span::Id::from_u64(n)
 }
 
+/// Encode a slab index as the u64 carried by `tracing::span::Id`.
+fn slab_to_tracing(idx: usize) -> u64 {
+    (idx as u64) + 2
+}
+
+/// Decode a tracing id back to a slab index.  Returns `None` for `DISABLED`,
+/// for an actual_id (>= `ID_THRESHOLD`), or for the unused value `0`.
+fn tracing_to_slab(id: u64) -> Option<usize> {
+    if id < 2 || id >= ID_THRESHOLD {
+        None
+    } else {
+        Some((id - 2) as usize)
+    }
+}
+
 /// A `tracing::Subscriber` that holds spans in memory for inspection.
 ///
-/// Open (in-flight) spans live in a `RwLock<HashMap>`.  When a span closes it
-/// moves to a per-thread buffer; the buffer is flushed to the [`Driver`] via a
-/// spillway channel, keeping the hot path free of shared-map write contention.
+/// In-flight spans live in a `RwLock<Slab>`.  When a span closes it moves to
+/// a per-thread buffer; the buffer is flushed to the [`Driver`] via a spillway
+/// channel, keeping the hot path free of shared-map write contention.
 ///
 /// Create with [`SpanCache::new`] or [`SpanCache::with_predicate`]; both return
 /// `(SpanCache, Driver)`.  Spawn the [`Driver`] as a background task to commit
 /// closed spans to the shared readable map.
 pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
-    in_flight: RwLock<HashMap<u64, SpanRecord>>,
+    in_flight: RwLock<Slab<SpanRecord>>,
     map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
-    next_id: AtomicU64,
+    // Generates the actual_id stored in `SpanRecord.id`.  Starts at
+    // `ID_THRESHOLD` so actual ids never collide with slab-encoded tracing ids.
+    next_actual_id: AtomicU64,
     predicate: P,
     capacity: usize,
     sender: spillway::Sender<SpanRecord>,
@@ -144,9 +173,9 @@ impl<P: EnabledPredicate> SpanCache<P> {
         let (sender, receiver) = spillway::channel();
         let map = Arc::new(RwLock::new(BTreeMap::new()));
         let cache = SpanCache {
-            in_flight: RwLock::new(HashMap::new()),
+            in_flight: RwLock::new(Slab::with_capacity(capacity)),
             map: Arc::clone(&map),
-            next_id: AtomicU64::new(10),
+            next_actual_id: AtomicU64::new(ID_THRESHOLD),
             predicate,
             capacity,
             sender,
@@ -155,16 +184,22 @@ impl<P: EnabledPredicate> SpanCache<P> {
         (cache, driver)
     }
 
-    /// Returns a span whether it is still open (in-flight) or already closed
-    /// and visible in the map.
+    /// Returns a span by either its active tracing id (while in-flight, fast
+    /// slab lookup) or its actual id (after closure, BTreeMap lookup).  The
+    /// two id namespaces are disjoint by value, so a single argument works
+    /// for both — see the comment on `ID_THRESHOLD`.
     pub fn get_span(&self, id: u64) -> Option<SpanRecord> {
-        if let Some(r) = self.map.read().unwrap().get(&id).cloned() {
-            return Some(r);
+        if id == DISABLED {
+            return None;
         }
-        self.in_flight.read().unwrap().get(&id).cloned()
+        if id >= ID_THRESHOLD {
+            return self.map.read().unwrap().get(&id).cloned();
+        }
+        let slab_idx = tracing_to_slab(id)?;
+        self.in_flight.read().unwrap().get(slab_idx).cloned()
     }
 
-    /// Returns closed spans in ascending id order.  Open spans are not
+    /// Returns closed spans in ascending actual_id order.  Open spans are not
     /// included; call [`flush_pending`] + [`Driver::drain_sync`] first if you
     /// need just-closed spans to appear.
     pub fn page(&self, after_id: u64, limit: usize) -> Vec<SpanRecord> {
@@ -223,37 +258,49 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         let disabled_id = || u64_to_id(DISABLED);
 
-        // Step A: resolve parent_id; check for DISABLED propagation.
-        let parent_id: Option<u64>;
-        if attrs.is_contextual() {
+        // Step A: validate the parent context using the SPAN_STACK / explicit
+        // parent.  We only have a slab_idx here — translating to the parent's
+        // actual_id needs the in_flight lock, deferred to step D.
+        enum ParentSource {
+            Root,
+            ParentSlab(usize),
+        }
+        let source = if attrs.is_contextual() {
             match stack_top() {
                 None | Some(DISABLED) => return disabled_id(),
-                Some(id) => parent_id = Some(id),
+                Some(top) => match tracing_to_slab(top) {
+                    Some(idx) => ParentSource::ParentSlab(idx),
+                    None => return disabled_id(),
+                },
             }
         } else if attrs.is_root() {
             if stack_top().is_some() {
                 log::warn!("root span created with an active span on the stack; disabling");
                 return disabled_id();
             }
-            parent_id = None;
+            ParentSource::Root
         } else {
             let explicit = id_to_u64(attrs.parent().unwrap());
             if explicit == DISABLED {
                 return disabled_id();
             }
-            parent_id = Some(explicit);
-        }
+            match tracing_to_slab(explicit) {
+                Some(idx) => ParentSource::ParentSlab(idx),
+                None => return disabled_id(),
+            }
+        };
 
         // Step B: predicate check.
         if !self.predicate.new_span_enabled(attrs) {
             return disabled_id();
         }
 
-        // Step C: generate ID; insert into in_flight with capacity guard.
-        let id = self.next_id.fetch_add(1, Relaxed);
+        // Step C: build the record outside the lock so field-visitor work
+        // doesn't extend the critical section.
+        let actual_id = self.next_actual_id.fetch_add(1, Relaxed);
         let mut record = SpanRecord {
-            id,
-            parent_id,
+            id: actual_id,
+            parent_id: None,
             metadata: attrs.metadata(),
             fields: HashMap::new(),
             events: Vec::new(),
@@ -262,7 +309,16 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
         attrs.record(&mut FieldVisitor { fields: &mut record.fields });
 
+        // Step D: single-lock — translate parent's slab_idx to its actual_id,
+        // capacity-check, and insert.
         let mut in_flight = self.in_flight.write().unwrap();
+        record.parent_id = match source {
+            ParentSource::Root => None,
+            ParentSource::ParentSlab(idx) => match in_flight.get(idx) {
+                Some(parent) => Some(parent.id),
+                None => return disabled_id(), // parent vanished — race
+            },
+        };
         if in_flight.len() >= self.capacity {
             log::warn!(
                 "span buffer full; new span disabled. \
@@ -270,17 +326,17 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             );
             return disabled_id();
         }
-        in_flight.insert(id, record);
-        u64_to_id(id)
+        let slab_idx = in_flight.insert(record);
+        u64_to_id(slab_to_tracing(slab_idx))
     }
 
     fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-        let id = id_to_u64(span);
-        if id == DISABLED {
-            return;
-        }
+        let slab_idx = match tracing_to_slab(id_to_u64(span)) {
+            Some(i) => i,
+            None => return,
+        };
         let mut in_flight = self.in_flight.write().unwrap();
-        if let Some(rec) = in_flight.get_mut(&id) {
+        if let Some(rec) = in_flight.get_mut(slab_idx) {
             values.record(&mut FieldVisitor { fields: &mut rec.fields });
         }
     }
@@ -293,8 +349,8 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     }
 
     fn event(&self, event: &tracing::Event<'_>) {
-        let parent_id = event.parent().map(id_to_u64).or_else(stack_top);
-        let parent_id = match parent_id {
+        let parent_top = event.parent().map(id_to_u64).or_else(stack_top);
+        let parent_top = match parent_top {
             Some(id) if id != DISABLED => id,
             Some(_) => {
                 log::debug!("event dropped: parent span is disabled");
@@ -304,6 +360,10 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
                 log::debug!("event dropped: no active span");
                 return;
             }
+        };
+        let parent_idx = match tracing_to_slab(parent_top) {
+            Some(i) => i,
+            None => return,
         };
 
         let mut fields = HashMap::new();
@@ -315,10 +375,10 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
 
         let mut in_flight = self.in_flight.write().unwrap();
-        if let Some(span) = in_flight.get_mut(&parent_id) {
+        if let Some(span) = in_flight.get_mut(parent_idx) {
             span.events.push(record);
         } else {
-            log::debug!("event dropped: parent span {} not in cache", parent_id);
+            log::debug!("event dropped: parent span at slab {} not in cache", parent_idx);
         }
     }
 
@@ -333,15 +393,21 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     }
 
     fn try_close(&self, id: tracing::span::Id) -> bool {
-        let id = id_to_u64(&id);
-        if id == DISABLED {
-            return false;
-        }
+        let slab_idx = match tracing_to_slab(id_to_u64(&id)) {
+            Some(i) => i,
+            None => return false,
+        };
 
-        let record = self.in_flight.write().unwrap().remove(&id).map(|mut r| {
-            r.closed_at = Some(Instant::now());
-            r
-        });
+        let record = {
+            let mut in_flight = self.in_flight.write().unwrap();
+            if in_flight.contains(slab_idx) {
+                let mut r = in_flight.remove(slab_idx);
+                r.closed_at = Some(Instant::now());
+                Some(r)
+            } else {
+                None
+            }
+        };
 
         if let Some(record) = record {
             let should_flush = PENDING.with(|p| {
@@ -497,6 +563,13 @@ mod tests {
         span.id().map(|id| id.into_u64())
     }
 
+    /// Captures the actual_id of an in-flight span — required to look it up
+    /// in the closed-span map after drain (the tracing id and actual id live
+    /// in disjoint namespaces).
+    fn actual_id_of(cache: &Arc<SpanCache>, span: &tracing::Span) -> u64 {
+        cache.get_span(span_id(span).unwrap()).unwrap().id
+    }
+
     struct DisableByName(pub &'static str);
 
     impl EnabledPredicate for DisableByName {
@@ -519,14 +592,14 @@ mod tests {
     #[test]
     fn basic_span_creation_and_retrieval() {
         let (cache, driver) = make_cache(10);
-        let id = run_with_drain(&cache, driver, || {
+        let actual_id = run_with_drain(&cache, driver, || {
             let span = tracing::span!(parent: None, Level::INFO, "root", field = "value");
-            let id = span_id(&span).unwrap();
+            let actual_id = actual_id_of(&cache, &span);
             let _g = span.enter();
-            id
+            actual_id
         });
-        let record = cache.get_span(id).unwrap();
-        assert_eq!(record.id, id);
+        let record = cache.get_span(actual_id).unwrap();
+        assert_eq!(record.id, actual_id);
         assert_eq!(record.metadata.name(), "root");
         assert_eq!(record.fields.get("field").map(String::as_str), Some("value"));
     }
@@ -534,23 +607,24 @@ mod tests {
     #[test]
     fn closed_at_set_after_drop() {
         let (cache, driver) = make_cache(10);
-        let id = run_with_drain(&cache, driver, || {
+        let actual_id = run_with_drain(&cache, driver, || {
             let span = tracing::span!(parent: None, Level::INFO, "root");
-            let id = span_id(&span).unwrap();
+            let tracing_id = span_id(&span).unwrap();
+            let actual_id = cache.get_span(tracing_id).unwrap().id;
             {
                 let _g = span.enter();
             }
-            // Span is alive (not yet dropped): visible via in_flight, closed_at is None.
+            // While alive: lookup by tracing id finds the slab entry, closed_at is None.
             assert!(
-                cache.get_span(id).unwrap().closed_at.is_none(),
+                cache.get_span(tracing_id).unwrap().closed_at.is_none(),
                 "not closed while span is alive"
             );
-            id
+            actual_id
             // span drops here → try_close → PENDING
         });
-        // After drain, span is in the map with closed_at set.
+        // After drain: lookup by actual_id finds the BTreeMap entry.
         assert!(
-            cache.get_span(id).unwrap().closed_at.is_some(),
+            cache.get_span(actual_id).unwrap().closed_at.is_some(),
             "should be closed after Span drops"
         );
     }
@@ -594,27 +668,27 @@ mod tests {
     #[test]
     fn eviction_removes_closed_spans() {
         let (cache, driver) = make_cache(2);
-        let (id_a, id_b, id_c) = run_with_drain(&cache, driver, || {
+        let (a, b, c) = run_with_drain(&cache, driver, || {
             let span_a = tracing::span!(parent: None, Level::INFO, "a");
-            let id_a = span_id(&span_a).unwrap();
+            let a = actual_id_of(&cache, &span_a);
             let span_b = tracing::span!(parent: None, Level::INFO, "b");
-            let id_b = span_b.id().map(|id| id.into_u64()).unwrap();
-            drop(span_a); // closes A → PENDING
-            drop(span_b); // closes B → PENDING
+            let b = actual_id_of(&cache, &span_b);
+            drop(span_a);
+            drop(span_b);
             // in_flight is now empty; C is allowed.
             let span_c = tracing::span!(parent: None, Level::INFO, "c");
-            let id_c = span_id(&span_c).unwrap();
-            assert_ne!(id_c, DISABLED, "C should be enabled");
-            (id_a, id_b, id_c)
+            assert_ne!(span_id(&span_c), Some(DISABLED), "C should be enabled");
+            let c = actual_id_of(&cache, &span_c);
+            (a, b, c)
         });
         // Driver inserted A, B, then C: capacity=2, so A was evicted when C was inserted.
-        assert!(cache.get_span(id_a).is_none(), "A should have been evicted");
-        assert!(cache.get_span(id_b).is_some(), "B should still be in cache");
-        assert!(cache.get_span(id_c).is_some(), "C should be in cache");
+        assert!(cache.get_span(a).is_none(), "A should have been evicted");
+        assert!(cache.get_span(b).is_some(), "B should still be in cache");
+        assert!(cache.get_span(c).is_some(), "C should be in cache");
         let page_ids: Vec<u64> = cache.page(0, 10).iter().map(|s| s.id).collect();
-        assert!(!page_ids.contains(&id_a));
-        assert!(page_ids.contains(&id_b));
-        assert!(page_ids.contains(&id_c));
+        assert!(!page_ids.contains(&a));
+        assert!(page_ids.contains(&b));
+        assert!(page_ids.contains(&c));
     }
 
     #[test]
@@ -639,7 +713,7 @@ mod tests {
             let mut ids = Vec::new();
             for _ in 0..5usize {
                 let span = tracing::span!(parent: None, Level::INFO, "s");
-                ids.push(span_id(&span).unwrap());
+                ids.push(actual_id_of(&cache, &span));
                 // span drops here → closed via try_close → PENDING
             }
             ids
@@ -663,14 +737,14 @@ mod tests {
     #[test]
     fn event_attached_to_current_span() {
         let (cache, driver) = make_cache(10);
-        let id = run_with_drain(&cache, driver, || {
+        let actual_id = run_with_drain(&cache, driver, || {
             let span = tracing::span!(parent: None, Level::INFO, "root");
-            let id = span_id(&span).unwrap();
+            let actual_id = actual_id_of(&cache, &span);
             let _g = span.enter();
             tracing::event!(Level::INFO, "test event happened");
-            id
+            actual_id
         });
-        let record = cache.get_span(id).unwrap();
+        let record = cache.get_span(actual_id).unwrap();
         assert_eq!(record.events.len(), 1);
         assert!(
             record.events[0].fields.contains_key("message"),
@@ -691,7 +765,7 @@ mod tests {
     #[test]
     fn field_capture() {
         let (cache, driver) = make_cache(10);
-        let id = run_with_drain(&cache, driver, || {
+        let actual_id = run_with_drain(&cache, driver, || {
             let span = tracing::span!(
                 parent: None,
                 Level::INFO,
@@ -700,9 +774,9 @@ mod tests {
                 int_field = 42i64,
                 bool_field = true,
             );
-            span_id(&span).unwrap()
+            actual_id_of(&cache, &span)
         });
-        let record = cache.get_span(id).unwrap();
+        let record = cache.get_span(actual_id).unwrap();
         assert_eq!(record.fields.get("str_field").map(String::as_str), Some("hello"));
         assert_eq!(record.fields.get("int_field").map(String::as_str), Some("42"));
         assert_eq!(record.fields.get("bool_field").map(String::as_str), Some("true"));
