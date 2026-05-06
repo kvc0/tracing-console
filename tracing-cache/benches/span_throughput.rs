@@ -208,14 +208,15 @@ fn bench_recursive_async_tasks(c: &mut Criterion) {
         .unwrap();
 
     let name = format!(
-        "recursive_async/{}_tasks_depth_{}",
+        "recursive_async/per_task_in_batch_of_{}_depth_{}",
         RECURSIVE_TASKS, RECURSIVE_DEPTH
     );
     c.bench_function(&name, |b| {
-        // Each criterion iteration spawns RECURSIVE_TASKS tasks and waits for
-        // all to complete.  The unit of measurement is one full fan-out, since
-        // the cost we want to capture is repeated stack push/pop across many
-        // concurrent recursive calls.
+        // Each "iteration" runs one full fan-out of RECURSIVE_TASKS tasks (the
+        // contention shape we want to exercise) but reports per-task amortized
+        // latency: criterion divides total elapsed by `iters`, and we further
+        // divide each iteration's elapsed by RECURSIVE_TASKS, so the reported
+        // time is per recursive task within the fan-out.
         b.to_async(&rt).iter_custom(|iters| async move {
             let start = Instant::now();
             for _ in 0..iters {
@@ -227,7 +228,7 @@ fn bench_recursive_async_tasks(c: &mut Criterion) {
                     h.await.unwrap();
                 }
             }
-            start.elapsed()
+            start.elapsed() / RECURSIVE_TASKS as u32
         });
     });
 }
