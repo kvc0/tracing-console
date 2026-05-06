@@ -11,7 +11,9 @@
 /// 3. **four_async_tasks** — four Tokio tasks on a four-worker-thread runtime,
 ///    each workload wrapped with `.instrument()`.  Shows the extra overhead that
 ///    `tracing_futures::Instrumented` adds on top of the synchronous path.
+use std::future::Future;
 use std::hint::black_box;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Instant;
 
@@ -24,12 +26,14 @@ use tracing_futures::Instrument;
 
 // A single SpanCache set as the global subscriber so all threads (including
 // Tokio worker threads) automatically route through it.  The capacity is large
-// enough that eviction is a minor fraction of each iteration's cost.
+// enough that eviction is a minor fraction of each iteration's cost AND that
+// the recursive benchmark (1000 tasks × ~12 peak spans) fits without disabling
+// new spans.
 //
 // The Driver runs on a dedicated background thread so the benchmark threads
 // never block on a map write lock.
 static CACHE: LazyLock<Arc<SpanCache>> = LazyLock::new(|| {
-    let (cache, driver) = SpanCache::new(4096);
+    let (cache, driver) = SpanCache::new(16384);
     let cache = Arc::new(cache);
     std::thread::spawn(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -74,6 +78,37 @@ async fn two_level_async_spans() {
         .instrument(tracing::span!(Level::INFO, "bench_child"))
         .await);
 }
+
+/// One level of the recursive workload.  `tracing::span!` is invoked at call
+/// time, when the parent's `.instrument` span is on the stack — so the new
+/// span's parent_id is correctly the previous level (or the root for the
+/// outermost call).  `Box::pin` is required because the function refers to
+/// itself.
+fn recursive_level(n: u32) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+    Box::pin(
+        async move {
+            tokio::task::yield_now().await;
+            if n == 0 {
+                return;
+            }
+            recursive_level(n - 1).await;
+        }
+        .instrument(tracing::span!(Level::INFO, "recursive_level")),
+    )
+}
+
+/// Per-task entrypoint: opens a root span so contextual spans created by
+/// `recursive_level` have a parent on the stack.
+async fn recursive_task(n: u32) {
+    async move {
+        recursive_level(n).await;
+    }
+    .instrument(tracing::span!(parent: None, Level::INFO, "recursive_root"))
+    .await;
+}
+
+const RECURSIVE_DEPTH: u32 = 10;
+const RECURSIVE_TASKS: usize = 1000;
 
 // ── Benchmarks ───────────────────────────────────────────────────────────────
 
@@ -164,10 +199,44 @@ fn bench_four_async_tasks(c: &mut Criterion) {
     });
 }
 
+fn bench_recursive_async_tasks(c: &mut Criterion) {
+    init_subscriber();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+
+    let name = format!(
+        "recursive_async/{}_tasks_depth_{}",
+        RECURSIVE_TASKS, RECURSIVE_DEPTH
+    );
+    c.bench_function(&name, |b| {
+        // Each criterion iteration spawns RECURSIVE_TASKS tasks and waits for
+        // all to complete.  The unit of measurement is one full fan-out, since
+        // the cost we want to capture is repeated stack push/pop across many
+        // concurrent recursive calls.
+        b.to_async(&rt).iter_custom(|iters| async move {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut handles = Vec::with_capacity(RECURSIVE_TASKS);
+                for _ in 0..RECURSIVE_TASKS {
+                    handles.push(tokio::spawn(recursive_task(RECURSIVE_DEPTH)));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            }
+            start.elapsed()
+        });
+    });
+}
+
 criterion_group!(
     span_throughput,
     bench_single_thread,
     bench_four_threads,
-    bench_four_async_tasks
+    bench_four_async_tasks,
+    bench_recursive_async_tasks,
 );
 criterion_main!(span_throughput);
