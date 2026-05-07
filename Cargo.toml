@@ -24,3 +24,6 @@ tracing                         = { version = "0" }
 tracing-cache                   = { path = "tracing-cache" }
 tracing-console-host            = { path = "tracing-console-host" }
 tracing-futures                 = { version = "0.2" }
+
+[profile.bench]
+debug = "line-tables-only"
