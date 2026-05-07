@@ -1437,6 +1437,7 @@ dependencies = [
  "protosocket-rpc",
  "ratatui",
  "serde",
+ "serde_json",
  "tokio",
  "tracing-console-host",
 ]
@@ -1446,6 +1447,7 @@ name = "tracing-console-host"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "futures",
  "futures-core",
  "log",
  "protosocket",
