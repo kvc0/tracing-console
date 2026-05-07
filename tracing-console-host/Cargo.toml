@@ -15,3 +15,6 @@ serde                           = { workspace = true }
 tokio                           = { workspace = true }
 tracing                         = { workspace = true }
 tracing-cache                   = { workspace = true }
+
+[dev-dependencies]
+futures                         = { workspace = true }

@@ -164,10 +164,12 @@ fn span_stream<P: EnabledPredicate>(
     }
 }
 
-/// `record_level` is at least as severe as `floor` (per tracing's reversed
-/// `Ord`: ERROR > WARN > INFO > DEBUG > TRACE).  `record_level >= floor`.
+/// True iff `record_level` is at least as severe as `floor`.  In tracing's
+/// reversed `Ord`, lower-severity levels compare *greater* (ERROR < WARN <
+/// INFO < DEBUG < TRACE), so the "at least as severe" relation is `<=`.
+/// E.g. with floor=INFO: INFO/WARN/ERROR pass, DEBUG/TRACE don't.
 fn level_at_least(record_level: &tracing::Level, floor: WireLevel) -> bool {
-    record_level >= &floor.to_tracing()
+    record_level <= &floor.to_tracing()
 }
 
 /// Hash-based sampling so the same root id deterministically passes/fails.
@@ -300,4 +302,249 @@ pub async fn serve<P: EnabledPredicate>(
     )?;
     server.await?;
     Ok(())
+}
+
+// ── Integration tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener as StdTcpListener;
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use protosocket_messagepack::{MessagePackDecoder, MessagePackSerializer};
+    use protosocket_rpc::client::{self, Configuration, RpcClient, TcpStreamConnector};
+    use tracing_cache::SpanCache;
+
+    use crate::protocol::{ResponseBody, WireLevel};
+
+    type ClientCodec = (MessagePackSerializer<Request>, MessagePackDecoder<Response>);
+
+    /// Bind a std listener to ephemeral port, capture the port, drop it.  The
+    /// next bind on this port (by `serve`) reuses it (SO_REUSEADDR is set).
+    /// There's a tiny race window — fine on a developer box and CI.
+    fn pick_addr() -> SocketAddr {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// Build a SpanCache, emit spans by running `f` under it, then synchronously
+    /// drain so the BTreeMap has every closed span before any test assertion.
+    fn cache_with_spans<F>(f: F) -> Arc<SpanCache>
+    where
+        F: FnOnce(),
+    {
+        let (cache, driver) = SpanCache::new(1024);
+        let cache = Arc::new(cache);
+        tracing::subscriber::with_default(Arc::clone(&cache), f);
+        cache.flush_pending();
+        driver.drain_sync();
+        cache
+    }
+
+    /// Spawn `serve` on a free port; return the address and a JoinHandle for
+    /// abort-on-drop semantics.  Briefly retries connect to confirm bind.
+    async fn spawn_server(cache: Arc<SpanCache>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let addr = pick_addr();
+        let server_cache = Arc::clone(&cache);
+        let handle = tokio::spawn(async move {
+            // Discard the result; the test aborts this task at the end.
+            let _ = serve(server_cache, addr).await;
+        });
+        // Wait for the server to actually be listening.
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                return (addr, handle);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("server never came up on {addr}");
+    }
+
+    async fn connect_client(addr: SocketAddr) -> RpcClient<Request, Response> {
+        let cfg = Configuration::new(TcpStreamConnector);
+        let (rpc_client, conn) =
+            client::connect::<ClientCodec, _>(addr, &cfg).await.unwrap();
+        // Drive the connection's I/O loop in the background.
+        tokio::spawn(conn);
+        rpc_client
+    }
+
+    /// Try to receive `n` Span responses from the stream within `total_timeout`.
+    async fn collect_spans(
+        stream: &mut (impl futures::Stream<Item = Result<Response, protosocket_rpc::Error>> + Unpin),
+        n: usize,
+        total_timeout: Duration,
+    ) -> Vec<crate::WireSpan> {
+        let mut out = Vec::with_capacity(n);
+        let deadline = tokio::time::Instant::now() + total_timeout;
+        while out.len() < n {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(resp))) => {
+                    if let ResponseBody::Span(s) = resp.body {
+                        out.push(s);
+                    }
+                }
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    // ── tests ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn start_stream_delivers_closed_spans() {
+        let cache = cache_with_spans(|| {
+            for _ in 0..3 {
+                let span = tracing::span!(parent: None, tracing::Level::INFO, "test_a");
+                let _g = span.enter();
+            }
+        });
+
+        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let client = connect_client(addr).await;
+        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+
+        let received = collect_spans(&mut stream, 3, Duration::from_secs(2)).await;
+        assert_eq!(received.len(), 3);
+        assert!(received.iter().all(|s| s.name == "test_a"));
+        // Times present and consistent.
+        assert!(received.iter().all(|s| s.closed_at_ns.is_some()));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_stream_halts_delivery() {
+        let cache = cache_with_spans(|| {
+            for _ in 0..5 {
+                let span = tracing::span!(parent: None, tracing::Level::INFO, "test_b");
+                let _g = span.enter();
+            }
+        });
+
+        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let client = connect_client(addr).await;
+        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+
+        // Drain at least one span so we know streaming is live.
+        let initial = collect_spans(&mut stream, 1, Duration::from_secs(2)).await;
+        assert_eq!(initial.len(), 1);
+
+        // Send StopStream as a unary RPC, expect Ack.
+        let ack = client
+            .send_unary(Request::new(RequestBody::StopStream))
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(matches!(ack.body, ResponseBody::Ack));
+
+        // Two ticks (50ms each) should be enough for the loop to read
+        // streaming=false. Then ensure no further spans arrive in 300ms.
+        let drained_after_stop = collect_spans(&mut stream, 100, Duration::from_millis(300)).await;
+        // The race window allows up to a single tick's batch in flight; assert
+        // the stream eventually quiesces rather than that exactly zero land.
+        assert!(
+            drained_after_stop.len() < 5,
+            "stream did not stop: got {} more spans after StopStream",
+            drained_after_stop.len()
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn set_level_filters_below_threshold() {
+        let cache = cache_with_spans(|| {
+            // The cache predicate is TRACE so DEBUG is captured; the host's
+            // SetLevel must be the thing that filters DEBUG on the wire.
+            let span_info = tracing::span!(parent: None, tracing::Level::INFO, "info_span");
+            drop(span_info);
+            let span_debug = tracing::span!(parent: None, tracing::Level::DEBUG, "debug_span");
+            drop(span_debug);
+        });
+
+        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let client = connect_client(addr).await;
+
+        let ack = client
+            .send_unary(Request::new(RequestBody::SetLevel(WireLevel::Info)))
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(matches!(ack.body, ResponseBody::Ack));
+
+        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+        let received = collect_spans(&mut stream, 5, Duration::from_millis(500)).await;
+
+        let names: Vec<_> = received.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["info_span"], "got: {names:?}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn set_sampling_rate_zero_drops_all() {
+        let cache = cache_with_spans(|| {
+            for _ in 0..5 {
+                let span = tracing::span!(parent: None, tracing::Level::INFO, "sampled");
+                let _g = span.enter();
+            }
+        });
+
+        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let client = connect_client(addr).await;
+
+        client
+            .send_unary(Request::new(RequestBody::SetSamplingRate(0.0)))
+            .unwrap()
+            .await
+            .unwrap();
+        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+
+        let received = collect_spans(&mut stream, 5, Duration::from_millis(400)).await;
+        assert!(received.is_empty(), "rate=0 should drop everything; got {received:?}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn set_filter_matches_root_and_inherits_to_children() {
+        let cache = cache_with_spans(|| {
+            // Two trees; "alpha" matches the filter, "beta" doesn't.
+            {
+                let root = tracing::span!(parent: None, tracing::Level::INFO, "alpha");
+                let _g = root.enter();
+                let _child = tracing::span!(tracing::Level::INFO, "alpha_child");
+            }
+            {
+                let root = tracing::span!(parent: None, tracing::Level::INFO, "beta");
+                let _g = root.enter();
+                let _child = tracing::span!(tracing::Level::INFO, "beta_child");
+            }
+        });
+
+        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let client = connect_client(addr).await;
+
+        client
+            .send_unary(Request::new(RequestBody::SetFilter(Some("alpha".to_string()))))
+            .unwrap()
+            .await
+            .unwrap();
+        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+
+        let received = collect_spans(&mut stream, 4, Duration::from_millis(500)).await;
+        let mut names: Vec<_> = received.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["alpha".to_string(), "alpha_child".to_string()]);
+
+        server.abort();
+    }
 }
