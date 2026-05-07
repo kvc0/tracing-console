@@ -1,21 +1,17 @@
 [package]
-name = "tracing-console"
+name = "tracing-console-host"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "tracing-console"
-path = "src/main.rs"
-
 [dependencies]
-crossterm                       = { workspace = true }
-futures                         = { workspace = true }
-k-cache                         = { workspace = true }
+async-stream                    = { workspace = true }
+futures-core                    = { workspace = true }
 log                             = { workspace = true }
 protosocket                     = { workspace = true }
 protosocket-messagepack         = { workspace = true }
 protosocket-rpc                 = { workspace = true }
-ratatui                         = { workspace = true }
+protosocket-server              = { workspace = true }
 serde                           = { workspace = true }
 tokio                           = { workspace = true }
-tracing-console-host            = { workspace = true }
+tracing                         = { workspace = true }
+tracing-cache                   = { workspace = true }
