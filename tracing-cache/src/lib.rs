@@ -107,21 +107,35 @@ fn u64_to_id(n: u64) -> tracing::span::Id {
     tracing::span::Id::from_u64(n)
 }
 
+// Number of in_flight shards.  Sequential ids from `next_id.fetch_add(1)`
+// distribute across shards via `id & SHARD_MASK`, so consecutive new_span
+// calls on different threads land on different shards.
+const NUM_SHARDS: usize = 4;
+const SHARD_MASK: u64 = (NUM_SHARDS as u64) - 1;
+
+#[inline]
+fn shard_for(id: u64) -> usize {
+    (id & SHARD_MASK) as usize
+}
+
 /// A `tracing::Subscriber` that holds spans in memory for inspection.
 ///
-/// Open (in-flight) spans live in a `RwLock<HashMap>`.  When a span closes it
-/// moves to a per-thread buffer; the buffer is flushed to the [`Driver`] via a
-/// spillway channel, keeping the hot path free of shared-map write contention.
+/// Open (in-flight) spans live in a sharded `[RwLock<HashMap>; NUM_SHARDS]`,
+/// keyed by `id & SHARD_MASK` — sequential ids from a single AtomicU64 spray
+/// across shards, so concurrent `new_span` calls rarely contend on the same
+/// lock.  When a span closes it moves to a per-thread buffer; the buffer is
+/// flushed to the [`Driver`] via a spillway channel.
 ///
 /// Create with [`SpanCache::new`] or [`SpanCache::with_predicate`]; both return
 /// `(SpanCache, Driver)`.  Spawn the [`Driver`] as a background task to commit
 /// closed spans to the shared readable map.
 pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
-    in_flight: RwLock<HashMap<u64, SpanRecord>>,
+    in_flight: [RwLock<HashMap<u64, SpanRecord>>; NUM_SHARDS],
     map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
     next_id: AtomicU64,
     predicate: P,
-    capacity: usize,
+    // Per-shard capacity.  Total open-span budget is capacity * NUM_SHARDS.
+    shard_capacity: usize,
     sender: spillway::Sender<SpanRecord>,
 }
 
@@ -143,12 +157,13 @@ impl<P: EnabledPredicate> SpanCache<P> {
     pub fn with_predicate(capacity: usize, predicate: P) -> (Self, Driver) {
         let (sender, receiver) = spillway::channel();
         let map = Arc::new(RwLock::new(BTreeMap::new()));
+        let shard_capacity = capacity.div_ceil(NUM_SHARDS);
         let cache = SpanCache {
-            in_flight: RwLock::new(HashMap::new()),
+            in_flight: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             map: Arc::clone(&map),
             next_id: AtomicU64::new(10),
             predicate,
-            capacity,
+            shard_capacity,
             sender,
         };
         let driver = Driver { map, receiver, capacity };
@@ -161,7 +176,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
         if let Some(r) = self.map.read().unwrap().get(&id).cloned() {
             return Some(r);
         }
-        self.in_flight.read().unwrap().get(&id).cloned()
+        self.in_flight[shard_for(id)].read().unwrap().get(&id).cloned()
     }
 
     /// Returns closed spans in ascending id order.  Open spans are not
@@ -262,10 +277,10 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
         attrs.record(&mut FieldVisitor { fields: &mut record.fields });
 
-        let mut in_flight = self.in_flight.write().unwrap();
-        if in_flight.len() >= self.capacity {
+        let mut in_flight = self.in_flight[shard_for(id)].write().unwrap();
+        if in_flight.len() >= self.shard_capacity {
             log::warn!(
-                "span buffer full; new span disabled. \
+                "span shard full; new span disabled. \
                  Increase capacity or reduce span rate."
             );
             return disabled_id();
@@ -279,7 +294,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         if id == DISABLED {
             return;
         }
-        let mut in_flight = self.in_flight.write().unwrap();
+        let mut in_flight = self.in_flight[shard_for(id)].write().unwrap();
         if let Some(rec) = in_flight.get_mut(&id) {
             values.record(&mut FieldVisitor { fields: &mut rec.fields });
         }
@@ -314,7 +329,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             recorded_at: Instant::now(),
         };
 
-        let mut in_flight = self.in_flight.write().unwrap();
+        let mut in_flight = self.in_flight[shard_for(parent_id)].write().unwrap();
         if let Some(span) = in_flight.get_mut(&parent_id) {
             span.events.push(record);
         } else {
@@ -338,7 +353,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             return false;
         }
 
-        let record = self.in_flight.write().unwrap().remove(&id).map(|mut r| {
+        let record = self.in_flight[shard_for(id)].write().unwrap().remove(&id).map(|mut r| {
             r.closed_at = Some(Instant::now());
             r
         });
@@ -619,15 +634,21 @@ mod tests {
 
     #[test]
     fn eviction_full_of_open_spans_returns_disabled() {
+        // Sharded in_flight: per-shard cap is capacity.div_ceil(NUM_SHARDS).
+        // With capacity=2 and 4 shards, each shard holds 1 span.  Sequential
+        // ids 10..=13 fill all four shards (one each), so id 14 lands on the
+        // same shard as id 10 and is disabled.
         let (cache, driver) = make_cache(2);
         tracing::subscriber::with_default(Arc::clone(&cache), || {
-            let span_a = tracing::span!(parent: None, Level::INFO, "a");
-            let span_b = tracing::span!(parent: None, Level::INFO, "b");
-            assert_ne!(span_id(&span_a), Some(DISABLED));
-            assert_ne!(span_id(&span_b), Some(DISABLED));
-            // Both are in in_flight; capacity reached → C is disabled.
-            let span_c = tracing::span!(parent: None, Level::INFO, "c");
-            assert_eq!(span_id(&span_c), Some(DISABLED));
+            let _spans: Vec<_> = (0..4)
+                .map(|i| {
+                    let s = tracing::span!(parent: None, Level::INFO, "s");
+                    assert_ne!(span_id(&s), Some(DISABLED), "span {i} should be enabled");
+                    s
+                })
+                .collect();
+            let overflow = tracing::span!(parent: None, Level::INFO, "overflow");
+            assert_eq!(span_id(&overflow), Some(DISABLED));
         });
         drop(driver);
     }
