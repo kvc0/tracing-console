@@ -124,15 +124,63 @@ impl Default for CacheConfig {
     }
 }
 
+// SAFETY rationale for SPAN_STACK and PENDING using `UnsafeCell` rather than
+// `RefCell`: every access goes through one of the helpers below, each of
+// which constructs a temporary `&` or `&mut` to the inner Vec for a single
+// leaf operation (push / pop / drain / read len) and lets it die before the
+// helper returns.  No subscriber-method dispatch happens while one of these
+// references is alive:
+//   * push / pop / last-copy do no callbacks at all.
+//   * `pending_drain` calls `spillway::Sender::send` per element — that's a
+//     non-reentrant Mutex push that does not invoke tracing on this thread.
+//   * `enabled` / `new_span` consult predicates only AFTER releasing the
+//     SPAN_STACK borrow (`stack_top` returns `Option<u64>` by value).
+// Concurrent access can't happen — the cells are thread-local.
 thread_local! {
-    // Active span ids on this thread — includes DISABLED entries.
-    static SPAN_STACK: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
-    // Closed spans waiting to be sent to the driver via spillway.
-    static PENDING: std::cell::RefCell<Vec<SpanRecord>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Active tracing ids on this thread — includes DISABLED sentinels.
+    static SPAN_STACK: std::cell::UnsafeCell<Vec<u64>> =
+        const { std::cell::UnsafeCell::new(Vec::new()) };
+    /// Closed spans waiting to be sent to the driver via spillway.
+    static PENDING: std::cell::UnsafeCell<Vec<SpanRecord>> =
+        const { std::cell::UnsafeCell::new(Vec::new()) };
 }
 
+#[inline]
 fn stack_top() -> Option<u64> {
-    SPAN_STACK.with(|s| s.borrow().last().copied())
+    SPAN_STACK.with(|c| unsafe { (*c.get()).last().copied() })
+}
+
+#[inline]
+fn stack_push(id: u64) {
+    SPAN_STACK.with(|c| unsafe { (*c.get()).push(id) });
+}
+
+#[inline]
+fn stack_pop() {
+    SPAN_STACK.with(|c| unsafe {
+        (*c.get()).pop();
+    });
+}
+
+/// Push a closed span onto PENDING and return the new length.
+#[inline]
+fn pending_push(record: SpanRecord) -> usize {
+    PENDING.with(|c| unsafe {
+        let v = &mut *c.get();
+        v.push(record);
+        v.len()
+    })
+}
+
+/// Drain PENDING in place (preserving the Vec's capacity), invoking `f` on
+/// each record.  `f` must not call back into tracing on this thread.
+#[inline]
+fn pending_drain<F: FnMut(SpanRecord)>(mut f: F) {
+    PENDING.with(|c| unsafe {
+        for record in (*c.get()).drain(..) {
+            f(record);
+        }
+    });
 }
 
 fn id_to_u64(id: &tracing::span::Id) -> u64 {
@@ -335,10 +383,8 @@ impl<P: EnabledPredicate> SpanCache<P> {
     /// Must be called before [`Driver::drain_sync`] in tests to ensure all
     /// recently-closed spans are delivered.
     pub fn flush_pending(&self) {
-        PENDING.with(|p| {
-            for record in p.borrow_mut().drain(..) {
-                let _ = self.sender.send(record);
-            }
+        pending_drain(|record| {
+            let _ = self.sender.send(record);
         });
     }
 }
@@ -501,13 +547,11 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     }
 
     fn enter(&self, span: &tracing::span::Id) {
-        SPAN_STACK.with(|s| s.borrow_mut().push(id_to_u64(span)));
+        stack_push(id_to_u64(span));
     }
 
     fn exit(&self, _span: &tracing::span::Id) {
-        SPAN_STACK.with(|s| {
-            s.borrow_mut().pop();
-        });
+        stack_pop();
     }
 
     fn try_close(&self, id: tracing::span::Id) -> bool {
@@ -528,12 +572,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
 
         if let Some(record) = record {
-            let should_flush = PENDING.with(|p| {
-                let mut p = p.borrow_mut();
-                p.push(record);
-                p.len() >= self.pending_batch
-            });
-            if should_flush {
+            if pending_push(record) >= self.pending_batch {
                 self.flush_pending();
             }
             true
