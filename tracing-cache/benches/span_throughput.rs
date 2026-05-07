@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use tracing::Level;
-use tracing_cache::SpanCache;
+use tracing_cache::{LevelPredicate, SpanCache};
 use tracing_futures::Instrument;
 
 // ── Shared subscriber ────────────────────────────────────────────────────────
@@ -32,8 +32,12 @@ use tracing_futures::Instrument;
 //
 // The Driver runs on a dedicated background thread so the benchmark threads
 // never block on a map write lock.
+// Predicate set to INFO so DEBUG callsites get `Interest::Never` and exercise
+// the tracing fast-path for disabled spans (used by `nested_async/disabled`).
+// Existing benches all use INFO and remain enabled.
 static CACHE: LazyLock<Arc<SpanCache>> = LazyLock::new(|| {
-    let (cache, driver) = SpanCache::new(16384);
+    let (cache, driver) =
+        SpanCache::with_predicate(16384, LevelPredicate::new(Level::INFO));
     let cache = Arc::new(cache);
     std::thread::spawn(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -109,6 +113,97 @@ async fn recursive_task(n: u32) {
 
 const RECURSIVE_DEPTH: u32 = 10;
 const RECURSIVE_TASKS: usize = 1000;
+
+/// One nested level for the "fields + events" workload.  Each level creates a
+/// span carrying three fields and emits two events around a yield point.  The
+/// chain is `NESTED_DEPTH + 1` spans deep (root + recursive levels).
+///
+/// Two near-identical variants (info / debug) so the same hot-path shape can
+/// be benchmarked at a level the cache predicate enables (`info`) and at a
+/// level it disables (`debug` is below the `INFO` predicate threshold so all
+/// `span!` / `event!` callsites become `Interest::Never`).
+fn nested_info(depth: u32) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+    Box::pin(
+        async move {
+            tracing::event!(
+                Level::INFO,
+                kind = "before_yield",
+                level = depth,
+                retry = false,
+            );
+            tokio::task::yield_now().await;
+            tracing::event!(
+                Level::INFO,
+                kind = "after_yield",
+                level = depth,
+                retry = false,
+            );
+            if depth == 0 {
+                return;
+            }
+            nested_info(depth - 1).await;
+        }
+        .instrument(tracing::span!(
+            Level::INFO,
+            "nested",
+            depth_label = depth,
+            kind = "work",
+            phase = "active",
+        )),
+    )
+}
+
+fn nested_debug(depth: u32) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+    Box::pin(
+        async move {
+            tracing::event!(
+                Level::DEBUG,
+                kind = "before_yield",
+                level = depth,
+                retry = false,
+            );
+            tokio::task::yield_now().await;
+            tracing::event!(
+                Level::DEBUG,
+                kind = "after_yield",
+                level = depth,
+                retry = false,
+            );
+            if depth == 0 {
+                return;
+            }
+            nested_debug(depth - 1).await;
+        }
+        .instrument(tracing::span!(
+            Level::DEBUG,
+            "nested",
+            depth_label = depth,
+            kind = "work",
+            phase = "active",
+        )),
+    )
+}
+
+async fn nested_task_info(depth: u32) {
+    async move {
+        nested_info(depth).await;
+    }
+    .instrument(tracing::span!(parent: None, Level::INFO, "nested_root"))
+    .await;
+}
+
+async fn nested_task_debug(depth: u32) {
+    async move {
+        nested_debug(depth).await;
+    }
+    .instrument(tracing::span!(parent: None, Level::DEBUG, "nested_root"))
+    .await;
+}
+
+/// `NESTED_DEPTH = 3` ⇒ four nested level spans (depth 3, 2, 1, 0) under the
+/// root span — "four levels of spans" per the benchmark name.
+const NESTED_DEPTH: u32 = 3;
+const NESTED_TASKS: usize = 4;
 
 // ── Benchmarks ───────────────────────────────────────────────────────────────
 
@@ -239,5 +334,65 @@ criterion_group!(
     bench_four_threads,
     bench_four_async_tasks,
     bench_recursive_async_tasks,
+    bench_nested_async_enabled,
+    bench_nested_async_disabled,
 );
 criterion_main!(span_throughput);
+
+fn bench_nested_async_enabled(c: &mut Criterion) {
+    init_subscriber();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+
+    let name = format!(
+        "nested_async_4t/four_levels_enabled_per_task_in_batch_of_{}",
+        NESTED_TASKS
+    );
+    c.bench_function(&name, |b| {
+        b.to_async(&rt).iter_custom(|iters| async move {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut handles = Vec::with_capacity(NESTED_TASKS);
+                for _ in 0..NESTED_TASKS {
+                    handles.push(tokio::spawn(nested_task_info(NESTED_DEPTH)));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            }
+            start.elapsed() / NESTED_TASKS as u32
+        });
+    });
+}
+
+fn bench_nested_async_disabled(c: &mut Criterion) {
+    init_subscriber();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+
+    let name = format!(
+        "nested_async_4t/four_levels_disabled_per_task_in_batch_of_{}",
+        NESTED_TASKS
+    );
+    c.bench_function(&name, |b| {
+        b.to_async(&rt).iter_custom(|iters| async move {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut handles = Vec::with_capacity(NESTED_TASKS);
+                for _ in 0..NESTED_TASKS {
+                    handles.push(tokio::spawn(nested_task_debug(NESTED_DEPTH)));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            }
+            start.elapsed() / NESTED_TASKS as u32
+        });
+    });
+}
