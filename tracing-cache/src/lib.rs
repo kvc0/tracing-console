@@ -821,6 +821,168 @@ mod tests {
         assert_eq!(record.fields.get("bool_field").map(String::as_str), Some("true"));
     }
 
+    // ── API-handler-shape coverage ────────────────────────────────────────────
+
+    #[test]
+    fn record_updates_span_fields_after_creation() {
+        // Common API-handler pattern: span!(...) declares a field with no value
+        // up front, then span.record() fills it in once the operation finishes.
+        let (cache, driver) = make_cache(10);
+        let actual_id = run_with_drain(&cache, driver, || {
+            let span = tracing::span!(
+                parent: None,
+                Level::INFO,
+                "op",
+                initial = "ready",
+                status = tracing::field::Empty,
+            );
+            let actual_id = actual_id_of(&cache, &span);
+            span.record("status", "success");
+            actual_id
+        });
+        let record = cache.get_span(actual_id).unwrap();
+        assert_eq!(record.fields.get("initial").map(String::as_str), Some("ready"));
+        assert_eq!(record.fields.get("status").map(String::as_str), Some("success"));
+    }
+
+    #[test]
+    fn multiple_events_recorded_in_order() {
+        let (cache, driver) = make_cache(10);
+        let actual_id = run_with_drain(&cache, driver, || {
+            let span = tracing::span!(parent: None, Level::INFO, "op");
+            let actual_id = actual_id_of(&cache, &span);
+            let _g = span.enter();
+            tracing::event!(Level::INFO, step = "first");
+            tracing::event!(Level::INFO, step = "second", note = "middle");
+            tracing::event!(Level::INFO, step = "third");
+            actual_id
+        });
+        let record = cache.get_span(actual_id).unwrap();
+        assert_eq!(record.events.len(), 3);
+        let steps: Vec<&str> = record
+            .events
+            .iter()
+            .map(|e| e.fields.get("step").unwrap().as_str())
+            .collect();
+        assert_eq!(steps, vec!["first", "second", "third"]);
+        assert_eq!(
+            record.events[1].fields.get("note").map(String::as_str),
+            Some("middle"),
+        );
+        // Timestamps monotonically non-decreasing.
+        assert!(record.events[0].recorded_at <= record.events[1].recorded_at);
+        assert!(record.events[1].recorded_at <= record.events[2].recorded_at);
+    }
+
+    #[test]
+    fn sibling_spans_share_parent_actual_id() {
+        let (cache, driver) = make_cache(10);
+        let (root_id, sibling_ids) = run_with_drain(&cache, driver, || {
+            let root = tracing::span!(parent: None, Level::INFO, "root");
+            let root_id = actual_id_of(&cache, &root);
+            let _g = root.enter();
+            let mut ids = Vec::new();
+            for _ in 0..3 {
+                let sib = tracing::span!(Level::INFO, "child");
+                ids.push(actual_id_of(&cache, &sib));
+                // sib drops at end of loop iteration → close
+            }
+            (root_id, ids)
+        });
+        for (i, &sid) in sibling_ids.iter().enumerate() {
+            let s = cache.get_span(sid).unwrap();
+            assert_eq!(s.parent_id, Some(root_id), "sibling #{i} parent_id");
+            assert_eq!(s.metadata.name(), "child");
+        }
+    }
+
+    #[test]
+    fn level_predicate_filters_below_threshold() {
+        let (inner, driver) = SpanCache::with_predicate(10, LevelPredicate::new(Level::INFO));
+        let cache = Arc::new(inner);
+        tracing::subscriber::with_default(Arc::clone(&cache), || {
+            // INFO is at the threshold — enabled.
+            let info_span = tracing::span!(parent: None, Level::INFO, "info_op");
+            assert!(info_span.id().is_some(), "INFO at INFO threshold");
+            // ERROR is more severe — enabled.
+            let error_span = tracing::span!(parent: None, Level::ERROR, "error_op");
+            assert!(error_span.id().is_some(), "ERROR at INFO threshold");
+            // DEBUG is below the threshold; tracing's macro short-circuits when
+            // callsite_enabled returns Never, so the Span has no id.
+            let debug_span = tracing::span!(parent: None, Level::DEBUG, "debug_op");
+            assert!(debug_span.id().is_none(), "DEBUG filtered at INFO threshold");
+        });
+        drop(driver);
+    }
+
+    #[test]
+    fn api_handler_lifecycle() {
+        // The whole reason the cache exists, expressed as a test: a request
+        // root span with a deferred field, two sibling child spans (one with
+        // its own field, one with two events), a deferred record() on the
+        // root once everything finishes.
+        let (cache, driver) = make_cache(20);
+        let request_id = run_with_drain(&cache, driver, || {
+            let request = tracing::span!(
+                parent: None,
+                Level::INFO,
+                "request",
+                method = "GET",
+                path = "/users/42",
+                status = tracing::field::Empty,
+            );
+            let request_id = actual_id_of(&cache, &request);
+            let _g = request.enter();
+
+            {
+                let validate = tracing::span!(Level::INFO, "validate", ok = true);
+                let _v = validate.enter();
+                tracing::event!(Level::INFO, message = "validation passed");
+            }
+
+            {
+                let query = tracing::span!(Level::INFO, "db_query", table = "users");
+                let _q = query.enter();
+                tracing::event!(Level::INFO, message = "query started");
+                tracing::event!(Level::INFO, message = "query finished", rows = 1u64);
+            }
+
+            request.record("status", "200");
+            request_id
+        });
+
+        let pages = cache.page(0, 100);
+        assert_eq!(pages.len(), 3, "request, validate, db_query all present");
+
+        let request = cache.get_span(request_id).unwrap();
+        assert_eq!(request.metadata.name(), "request");
+        assert_eq!(request.parent_id, None);
+        assert_eq!(request.fields.get("method").map(String::as_str), Some("GET"));
+        assert_eq!(request.fields.get("path").map(String::as_str), Some("/users/42"));
+        assert_eq!(request.fields.get("status").map(String::as_str), Some("200"));
+
+        let validate = pages.iter().find(|s| s.metadata.name() == "validate").unwrap();
+        assert_eq!(validate.parent_id, Some(request_id));
+        assert_eq!(validate.fields.get("ok").map(String::as_str), Some("true"));
+        assert_eq!(validate.events.len(), 1);
+        assert_eq!(
+            validate.events[0].fields.get("message").map(String::as_str),
+            Some("validation passed"),
+        );
+
+        let query = pages.iter().find(|s| s.metadata.name() == "db_query").unwrap();
+        assert_eq!(query.parent_id, Some(request_id));
+        assert_eq!(query.fields.get("table").map(String::as_str), Some("users"));
+        assert_eq!(query.events.len(), 2);
+        let messages: Vec<&str> = query
+            .events
+            .iter()
+            .map(|e| e.fields.get("message").unwrap().as_str())
+            .collect();
+        assert_eq!(messages, vec!["query started", "query finished"]);
+        assert_eq!(query.events[1].fields.get("rows").map(String::as_str), Some("1"));
+    }
+
     // ── async overlap test ────────────────────────────────────────────────────
 
     #[test]
