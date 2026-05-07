@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 k-cache                         = { workspace = true }
 log                             = { workspace = true }
+slab                            = { workspace = true }
 spillway                        = { workspace = true }
 tokio                           = { workspace = true }
 tracing                         = { workspace = true }
