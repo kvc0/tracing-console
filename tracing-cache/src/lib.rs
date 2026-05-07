@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -137,8 +137,12 @@ impl Default for CacheConfig {
 //     SPAN_STACK borrow (`stack_top` returns `Option<u64>` by value).
 // Concurrent access can't happen — the cells are thread-local.
 thread_local! {
-    /// Active tracing ids on this thread — includes DISABLED sentinels.
-    static SPAN_STACK: std::cell::UnsafeCell<Vec<u64>> =
+    /// Active span entries on this thread.  Each entry pairs the encoded
+    /// tracing id (so `exit` can pop) with the span's `actual_id` (so a
+    /// contextual `new_span` can read its parent's `actual_id` without
+    /// locking the parent's slab).  DISABLED entries carry
+    /// `tracing_id = DISABLED, actual_id = 0`.
+    static SPAN_STACK: std::cell::UnsafeCell<Vec<StackedSpan>> =
         const { std::cell::UnsafeCell::new(Vec::new()) };
     /// Closed spans waiting to be sent to the driver via spillway.
     static PENDING: std::cell::UnsafeCell<Vec<SpanRecord>> =
@@ -146,13 +150,13 @@ thread_local! {
 }
 
 #[inline]
-fn stack_top() -> Option<u64> {
+fn stack_top() -> Option<StackedSpan> {
     SPAN_STACK.with(|c| unsafe { (*c.get()).last().copied() })
 }
 
 #[inline]
-fn stack_push(id: u64) {
-    SPAN_STACK.with(|c| unsafe { (*c.get()).push(id) });
+fn stack_push(entry: StackedSpan) {
+    SPAN_STACK.with(|c| unsafe { (*c.get()).push(entry) });
 }
 
 #[inline]
@@ -191,17 +195,45 @@ fn u64_to_id(n: u64) -> tracing::span::Id {
     tracing::span::Id::from_u64(n)
 }
 
-// In-flight slab shards are picked by a thread-local counter.  Each shard is
-// its own slab guarded by `Mutex`, so concurrent new_span / try_close on
-// different threads almost always land on different shards.  Lane count is
-// runtime-configurable via [`CacheConfig::lane_count`].
-
-// Reserved tracing-id values.
+// ── Tracing-id encoding ──────────────────────────────────────────────────────
+//
+// The u64 carried in `tracing::span::Id` encodes (shard, slab_idx) only:
+//
+//     top    `shard_bits`        bits  → shard index (0 .. lane_count)
+//     bottom `64 - shard_bits`   bits  → slab_idx + SLAB_OFFSET
+//
+// `DISABLED = 1` is reserved.  Slab indices encode as `slab_idx + 2` so
+// shard 0 / slab_idx 0 doesn't collide with DISABLED.
+//
+// `actual_id` is **not** in the encoded id; it lives in the per-shard
+// sidecar `actual_ids: Box<[AtomicU64]>` (see `ShardLane`).  `new_span`
+// writes it when it inserts into the slab; `enter` reads it lock-free and
+// pushes a `StackedSpan { tracing_id, actual_id }` onto SPAN_STACK so that
+// a contextual `new_span` later can read its parent's actual_id directly
+// from the stack without locking the parent's slab.
 const DISABLED: u64 = 1;
-// Slab indices start at 0; encoded as (slab_idx + SLAB_OFFSET) in the
-// low-bits portion of the tracing id, so DISABLED=1 stays unique against
-// shard 0 / slab 0.
 const SLAB_OFFSET: u64 = 2;
+
+/// One entry on the per-thread SPAN_STACK.  Carries both the encoded tracing
+/// id (so `exit` can pop it back) and the parent-side `actual_id` so that
+/// `new_span`'s contextual-parent path can read the parent's `SpanRecord.id`
+/// without acquiring the parent-shard's mutex.  For DISABLED entries
+/// `actual_id` is 0 and is never read.
+#[derive(Clone, Copy, Debug)]
+struct StackedSpan {
+    tracing_id: u64,
+    actual_id: u64,
+}
+
+/// One slab shard plus a parallel sidecar of actual_ids that's readable
+/// without locking the slab.  The sidecar is sized to `shard_capacity` (the
+/// slab's growth bound) and indexed by `slab_idx`.  `new_span` writes the
+/// new span's actual_id with `Release` ordering before publishing the
+/// resulting tracing id; `enter` reads with `Acquire` to see that value.
+struct ShardLane {
+    slab: Mutex<Slab<SpanRecord>>,
+    actual_ids: Box<[AtomicU64]>,
+}
 
 /// Global counter that hands out a stable shard key to each thread the
 /// first time it touches `pick_shard`.  Cheap, monotonic, and only paid
@@ -251,7 +283,7 @@ thread_local! {
 /// (custom batch sizes & lane count).  Each returns `(SpanCache, Driver)`;
 /// spawn the [`Driver`] as a background task to commit closed spans.
 pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
-    in_flight: Box<[Mutex<Slab<SpanRecord>>]>,
+    in_flight: Box<[ShardLane]>,
     map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
     // Generates SpanRecord.id (the actual_id, BTreeMap key).  Disjoint from
     // the encoded tracing id space.
@@ -263,7 +295,7 @@ pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
     // Knobs derived from CacheConfig.
     pending_batch: usize,
     shard_mask: u64,  // lane_count - 1
-    shard_shift: u32, // 64 - log2(lane_count)
+    shard_shift: u32, // 64 - log2(lane_count); encodes shard at the top of the id
 }
 
 /// Background task that receives closed spans from the spillway and writes
@@ -303,16 +335,22 @@ impl<P: EnabledPredicate> SpanCache<P> {
         // Silently clamp to [1, 256] and round up to the next power of two.
         let lane_count = config.lane_count.clamp(1, 256).next_power_of_two();
         let shard_bits = lane_count.trailing_zeros();
-        let shard_mask = (lane_count as u64) - 1; // 0 when lane_count == 1
+        let shard_mask = (lane_count as u64) - 1;
         // Reserve at least one bit at the top so `(shard as u64) << shift` is
-        // well-defined even when lane_count == 1 (where shard_bits == 0).
+        // well-defined even when lane_count == 1.
         let shard_shift = 64 - shard_bits.max(1);
 
         let (sender, receiver) = spillway::channel();
         let map = Arc::new(RwLock::new(BTreeMap::new()));
         let shard_capacity = capacity.div_ceil(lane_count);
-        let in_flight: Box<[Mutex<Slab<SpanRecord>>]> = (0..lane_count)
-            .map(|_| Mutex::new(Slab::with_capacity(shard_capacity)))
+        let in_flight: Box<[ShardLane]> = (0..lane_count)
+            .map(|_| ShardLane {
+                slab: Mutex::new(Slab::with_capacity(shard_capacity)),
+                actual_ids: (0..shard_capacity)
+                    .map(|_| AtomicU64::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
@@ -379,6 +417,14 @@ impl<P: EnabledPredicate> SpanCache<P> {
         Some((shard, (raw - SLAB_OFFSET) as usize))
     }
 
+    /// Read a slab slot's `actual_id` from the lock-free sidecar.  `Acquire`
+    /// pairs with the `Release` store in `new_span` so the value is visible
+    /// once the encoded tracing id has been published to the caller.
+    #[inline]
+    fn load_actual_id(&self, shard: usize, slab_idx: usize) -> u64 {
+        self.in_flight[shard].actual_ids[slab_idx].load(Ordering::Acquire)
+    }
+
     /// Returns a closed span by its actual_id (`SpanRecord.id`).  This is the
     /// id stored in `parent_id` and used as the BTreeMap key.  For in-flight
     /// spans, use [`get_active_span`].
@@ -391,7 +437,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
     /// closed it is reachable only via [`get_span`] using its `actual_id`.
     pub fn get_active_span(&self, tracing_id: u64) -> Option<SpanRecord> {
         let (shard, slab_idx) = self.decode_tracing_id(tracing_id)?;
-        self.in_flight[shard].lock().unwrap().get(slab_idx).cloned()
+        self.in_flight[shard].slab.lock().unwrap().get(slab_idx).cloned()
     }
 
     /// Returns closed spans in ascending actual_id order.  Open spans are not
@@ -450,7 +496,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     }
 
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        if stack_top() == Some(DISABLED) {
+        if matches!(stack_top(), Some(s) if s.tracing_id == DISABLED) {
             return false;
         }
         self.predicate.enabled(metadata)
@@ -463,29 +509,31 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         let disabled_id = || u64_to_id(DISABLED);
 
-        // Step A: validate parent context.  We only have a tracing id here;
-        // the parent's actual_id has to be read out of its slab in step D.
-        enum ParentSource {
-            Root,
-            ParentTracing(u64), // tracing id of the parent
-        }
-        let source = if attrs.is_contextual() {
+        // Step A: resolve parent's actual_id from a side-channel — no slab
+        // lock.  Contextual: the parent's `actual_id` is right there on the
+        // SPAN_STACK entry.  Explicit: the parent's tracing id encodes its
+        // actual_id in the bottom 40 bits.
+        let parent_actual_id: Option<u64> = if attrs.is_contextual() {
             match stack_top() {
-                None | Some(DISABLED) => return disabled_id(),
-                Some(top) => ParentSource::ParentTracing(top),
+                None => return disabled_id(),
+                Some(top) if top.tracing_id == DISABLED => return disabled_id(),
+                Some(top) => Some(top.actual_id),
             }
         } else if attrs.is_root() {
             if stack_top().is_some() {
                 log::warn!("root span created with an active span on the stack; disabling");
                 return disabled_id();
             }
-            ParentSource::Root
+            None
         } else {
             let explicit = id_to_u64(attrs.parent().unwrap());
-            if explicit == DISABLED {
-                return disabled_id();
+            match self.decode_tracing_id(explicit) {
+                // Lock-free read from the sidecar: the parent's actual_id was
+                // published by a `Release` store before the parent's tracing
+                // id was returned to the caller, so this `Acquire` load sees it.
+                Some((p_shard, p_slab)) => Some(self.load_actual_id(p_shard, p_slab)),
+                None => return disabled_id(),
             }
-            ParentSource::ParentTracing(explicit)
         };
 
         // Step B: predicate check.
@@ -498,7 +546,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         let actual_id = self.next_actual_id.fetch_add(1, Relaxed);
         let mut record = SpanRecord {
             id: actual_id,
-            parent_id: None,
+            parent_id: parent_actual_id,
             metadata: attrs.metadata(),
             fields: HashMap::new(),
             events: Vec::new(),
@@ -507,32 +555,23 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
         attrs.record(&mut FieldVisitor { fields: &mut record.fields });
 
-        // Step D: resolve parent's actual_id (needs a read of its slab) then
-        // pick our own shard via the thread-local counter and insert.
-        record.parent_id = match source {
-            ParentSource::Root => None,
-            ParentSource::ParentTracing(parent_tracing) => {
-                let (p_shard, p_slab) = match self.decode_tracing_id(parent_tracing) {
-                    Some(t) => t,
-                    None => return disabled_id(),
-                };
-                match self.in_flight[p_shard].lock().unwrap().get(p_slab) {
-                    Some(parent) => Some(parent.id),
-                    None => return disabled_id(), // parent vanished — race
-                }
-            }
-        };
-
+        // Step D: pick our shard, capacity-check, insert into the slab, and
+        // publish actual_id into the sidecar (Release) so a future contextual
+        // child sees it via the Acquire load above (or `enter`'s lookup).
         let shard = self.pick_shard();
-        let mut shard_lock = self.in_flight[shard].lock().unwrap();
-        if shard_lock.len() >= self.shard_capacity {
+        let lane = &self.in_flight[shard];
+        let mut slab = lane.slab.lock().unwrap();
+        if slab.len() >= self.shard_capacity {
             log::warn!(
                 "span shard {shard} full; new span disabled. \
                  Increase capacity or reduce span rate."
             );
             return disabled_id();
         }
-        let slab_idx = shard_lock.insert(record);
+        let slab_idx = slab.insert(record);
+        // The sidecar is sized to `shard_capacity` and indexed by slab_idx,
+        // which is bounded by capacity per the check above.
+        lane.actual_ids[slab_idx].store(actual_id, Ordering::Release);
         u64_to_id(self.encode_tracing_id(shard, slab_idx))
     }
 
@@ -541,7 +580,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             Some(t) => t,
             None => return,
         };
-        let mut shard_lock = self.in_flight[shard].lock().unwrap();
+        let mut shard_lock = self.in_flight[shard].slab.lock().unwrap();
         if let Some(rec) = shard_lock.get_mut(slab_idx) {
             values.record(&mut FieldVisitor { fields: &mut rec.fields });
         }
@@ -555,18 +594,23 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     }
 
     fn event(&self, event: &tracing::Event<'_>) {
-        let parent_id = event.parent().map(id_to_u64).or_else(stack_top);
-        let parent_id = match parent_id {
-            Some(id) if id != DISABLED => id,
-            Some(_) => {
-                log::debug!("event dropped: parent span is disabled");
-                return;
-            }
-            None => {
-                log::debug!("event dropped: no active span");
-                return;
-            }
+        // Parent: explicit parent on the event, else the current span on the
+        // SPAN_STACK.  Either way we want a tracing id (the actual_id sitting
+        // on the stack entry isn't useful here — we need the slab address).
+        let parent_id = match event.parent().map(id_to_u64) {
+            Some(id) => id,
+            None => match stack_top() {
+                Some(top) => top.tracing_id,
+                None => {
+                    log::debug!("event dropped: no active span");
+                    return;
+                }
+            },
         };
+        if parent_id == DISABLED {
+            log::debug!("event dropped: parent span is disabled");
+            return;
+        }
 
         let mut fields = HashMap::new();
         event.record(&mut FieldVisitor { fields: &mut fields });
@@ -580,7 +624,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             Some(t) => t,
             None => return,
         };
-        let mut shard_lock = self.in_flight[shard].lock().unwrap();
+        let mut shard_lock = self.in_flight[shard].slab.lock().unwrap();
         if let Some(span) = shard_lock.get_mut(slab_idx) {
             span.events.push(record);
         } else {
@@ -589,7 +633,15 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     }
 
     fn enter(&self, span: &tracing::span::Id) {
-        stack_push(id_to_u64(span));
+        // Resolve actual_id once, lock-free, and stash it on the stack so
+        // a contextual `new_span` underneath can read its parent's actual_id
+        // without locking the parent's slab.
+        let tracing_id = id_to_u64(span);
+        let actual_id = match self.decode_tracing_id(tracing_id) {
+            Some((shard, slab_idx)) => self.load_actual_id(shard, slab_idx),
+            None => 0, // DISABLED entry — actual_id is never read.
+        };
+        stack_push(StackedSpan { tracing_id, actual_id });
     }
 
     fn exit(&self, _span: &tracing::span::Id) {
@@ -603,7 +655,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
 
         let record = {
-            let mut shard_lock = self.in_flight[shard].lock().unwrap();
+            let mut shard_lock = self.in_flight[shard].slab.lock().unwrap();
             if shard_lock.contains(slab_idx) {
                 let mut r = shard_lock.remove(slab_idx);
                 r.closed_at = Some(Instant::now());
