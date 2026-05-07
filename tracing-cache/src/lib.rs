@@ -203,12 +203,19 @@ const DISABLED: u64 = 1;
 // shard 0 / slab 0.
 const SLAB_OFFSET: u64 = 2;
 
+/// Global counter that hands out a stable shard key to each thread the
+/// first time it touches `pick_shard`.  Cheap, monotonic, and only paid
+/// once per thread.
+static NEXT_THREAD_KEY: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
-    /// Per-thread counter that picks which shard `new_span` writes to.  Each
-    /// new_span on this thread bumps the counter and uses `counter & shard_mask`.
-    /// The counter is shared across all `SpanCache`s that ever run on this
-    /// thread; each cache applies its own mask.
-    static SHARD_COUNTER: Cell<u64> = const { Cell::new(0) };
+    /// Stable per-thread shard key, lazily assigned from `NEXT_THREAD_KEY`
+    /// on first use.  Each cache derives its actual shard via
+    /// `key & shard_mask`, so a given thread always lands on the same shard
+    /// within a given cache (lock affinity for the slab cache lines).
+    /// `u64::MAX` is the "not assigned yet" sentinel (the global counter
+    /// can't realistically reach it).
+    static THREAD_SHARD_KEY: Cell<u64> = const { Cell::new(u64::MAX) };
 }
 
 /// A `tracing::Subscriber` that holds spans in memory for inspection.
@@ -282,8 +289,10 @@ impl<P: EnabledPredicate> SpanCache<P> {
         // Silently clamp to [1, 256] and round up to the next power of two.
         let lane_count = config.lane_count.clamp(1, 256).next_power_of_two();
         let shard_bits = lane_count.trailing_zeros();
-        let shard_mask = (lane_count as u64) - 1;
-        let shard_shift = 64 - shard_bits;
+        let shard_mask = (lane_count as u64) - 1; // 0 when lane_count == 1
+        // Reserve at least one bit at the top so `(shard as u64) << shift` is
+        // well-defined even when lane_count == 1 (where shard_bits == 0).
+        let shard_shift = 64 - shard_bits.max(1);
 
         let (sender, receiver) = spillway::channel();
         let map = Arc::new(RwLock::new(BTreeMap::new()));
@@ -321,11 +330,18 @@ impl<P: EnabledPredicate> SpanCache<P> {
 
     #[inline]
     fn pick_shard(&self) -> usize {
-        SHARD_COUNTER.with(|c| {
-            let n = c.get();
-            c.set(n.wrapping_add(1));
-            (n & self.shard_mask) as usize
-        })
+        let key = THREAD_SHARD_KEY.with(|c| {
+            let v = c.get();
+            if v == u64::MAX {
+                // First new_span on this thread — claim a stable key.
+                let assigned = NEXT_THREAD_KEY.fetch_add(1, Relaxed);
+                c.set(assigned);
+                assigned
+            } else {
+                v
+            }
+        });
+        (key & self.shard_mask) as usize
     }
 
     #[inline]
@@ -824,7 +840,15 @@ mod tests {
 
     #[test]
     fn eviction_removes_closed_spans() {
-        let (cache, driver) = make_cache(2);
+        // Single-lane so capacity=2 means "2 in-flight", not "2 lanes × 1
+        // each".  With thread-id sharding all spans on this thread go to the
+        // same shard, so a multi-lane setup with capacity=2 could only fit 1
+        // in-flight per thread — not what this test wants to verify.
+        let (cache, driver) = SpanCache::with_config(
+            2,
+            CacheConfig { lane_count: 1, ..CacheConfig::default() },
+        );
+        let cache = Arc::new(cache);
         let (a, b, c) = run_with_drain(&cache, driver, || {
             let span_a = tracing::span!(parent: None, Level::INFO, "a");
             let a = actual_id_of(&cache, &span_a);
@@ -850,31 +874,24 @@ mod tests {
 
     #[test]
     fn eviction_full_of_open_spans_returns_disabled() {
-        // Sharded in_flight: per-shard cap is capacity.div_ceil(lane_count).
-        // With capacity=2 and the default 16 lanes each shard holds 1 span.
-        // The thread-local SHARD_COUNTER ticks 0,1,…,(lanes-1) across new_span
-        // calls, so `lanes` spans fill exactly one slot per shard and the
-        // next one lands on the same shard as the first → disabled.
+        // With thread-id sharding, all spans on this thread land on a single
+        // shard.  capacity=2 spread over 16 lanes → per-shard cap = 1, so
+        // creating two simultaneously-alive spans on this thread fills the
+        // shard's slot and the second is DISABLED.
         let (cache, driver) = make_cache(2);
-        let lanes = cache.lane_count();
         tracing::subscriber::with_default(Arc::clone(&cache), || {
-            let _spans: Vec<_> = (0..lanes)
-                .map(|i| {
-                    let s = tracing::span!(parent: None, Level::INFO, "s");
-                    assert_ne!(span_id(&s), Some(DISABLED), "span {i} should be enabled");
-                    s
-                })
-                .collect();
-            let overflow = tracing::span!(parent: None, Level::INFO, "overflow");
-            assert_eq!(span_id(&overflow), Some(DISABLED));
+            let _s1 = tracing::span!(parent: None, Level::INFO, "s1");
+            let s2 = tracing::span!(parent: None, Level::INFO, "s2");
+            assert_eq!(span_id(&s2), Some(DISABLED));
         });
         drop(driver);
     }
 
     #[test]
     fn custom_lane_count_is_respected() {
-        // 4 lanes, total capacity 4 → per-shard cap 1.  Hold all 4 spans live
-        // so they fill every shard before the overflow attempt.
+        // 4 lanes, capacity 4 → per-shard cap 1.  With thread-id sharding,
+        // this thread always picks one shard, so the 2nd simultaneously-alive
+        // span on that shard is DISABLED.
         let (cache, driver) = SpanCache::with_config(
             4,
             CacheConfig { lane_count: 4, ..CacheConfig::default() },
@@ -882,16 +899,57 @@ mod tests {
         let cache = Arc::new(cache);
         assert_eq!(cache.lane_count(), 4);
         tracing::subscriber::with_default(Arc::clone(&cache), || {
-            let _spans: Vec<_> = (0..4)
-                .map(|i| {
-                    let s = tracing::span!(parent: None, Level::INFO, "s");
-                    assert_ne!(span_id(&s), Some(DISABLED), "span {i} should be enabled");
-                    s
-                })
-                .collect();
-            let overflow = tracing::span!(parent: None, Level::INFO, "overflow");
-            assert_eq!(span_id(&overflow), Some(DISABLED));
+            let _s1 = tracing::span!(parent: None, Level::INFO, "s1");
+            let s2 = tracing::span!(parent: None, Level::INFO, "s2");
+            assert_eq!(span_id(&s2), Some(DISABLED));
         });
+        drop(driver);
+    }
+
+    #[test]
+    fn separate_threads_get_distinct_keys() {
+        // Each thread's first new_span claims a fresh slot from the global
+        // NEXT_THREAD_KEY counter, so independent threads don't all collide
+        // on a single shard.  The exact mapping is implementation-defined
+        // (depends on counter state from prior tests), so we assert the
+        // weakest interesting property: when we run a handful of threads
+        // against a wide cache, at least two distinct shards are exercised.
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        // Wide enough that test interleaving doesn't pin everyone on one shard.
+        let (cache, driver) = SpanCache::with_config(
+            64 * 16,
+            CacheConfig { lane_count: 16, ..CacheConfig::default() },
+        );
+        let cache = Arc::new(cache);
+        let observed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let observed = Arc::clone(&observed);
+            handles.push(std::thread::spawn(move || {
+                tracing::subscriber::with_default(cache, || {
+                    let s = tracing::span!(parent: None, Level::INFO, "tt");
+                    let id = span_id(&s).unwrap();
+                    observed.lock().unwrap().push(id);
+                    // Hold the span alive briefly so other threads observe a
+                    // populated slab if they happen to land on the same shard.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                });
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let ids = observed.lock().unwrap().clone();
+        let shards: HashSet<u64> = ids.iter().map(|id| id >> 60).collect();
+        assert!(
+            shards.len() >= 2,
+            "expected ≥2 distinct shards across 8 threads, got {shards:?}",
+        );
         drop(driver);
     }
 
@@ -1053,7 +1111,9 @@ mod tests {
 
     #[test]
     fn sibling_spans_share_parent_actual_id() {
-        let (cache, driver) = make_cache(10);
+        // 4 spans alive simultaneously on one thread (root + 3 siblings).
+        // With 16 lanes that needs per-shard cap ≥ 4, so capacity ≥ 64.
+        let (cache, driver) = make_cache(64);
         let (root_id, sibling_ids) = run_with_drain(&cache, driver, || {
             let root = tracing::span!(parent: None, Level::INFO, "root");
             let root_id = actual_id_of(&cache, &root);
@@ -1166,7 +1226,10 @@ mod tests {
     fn async_instrumented_tasks_with_overlapping_spans() {
         use tracing_futures::Instrument;
 
-        let (cache, driver) = make_cache(20);
+        // Up to 4 spans (root_a, root_b, acquire, release) are simultaneously
+        // alive on the current_thread runtime — all on this thread's shard
+        // under thread-id sharding.  capacity=64 / 16 lanes → per-shard cap 4.
+        let (cache, driver) = make_cache(64);
 
         tracing::subscriber::with_default(Arc::clone(&cache), || {
             tokio::runtime::Builder::new_current_thread()
