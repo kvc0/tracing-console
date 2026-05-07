@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use slab::Slab;
@@ -159,7 +159,7 @@ fn decode_tracing_id(id: u64) -> Option<(usize, usize)> {
 
 /// A `tracing::Subscriber` that holds spans in memory for inspection.
 ///
-/// Open spans live in a sharded `[RwLock<Slab<SpanRecord>>; 16]`.  The shard
+/// Open spans live in a sharded `[Mutex<Slab<SpanRecord>>; 16]`.  The shard
 /// is picked by a thread-local counter; the slab gives an O(1) cache-friendly
 /// index, and the user-facing `tracing::span::Id` packs `(shard, slab_idx+2)`
 /// into a single u64 so SPAN_STACK push/pop and trait-method dispatch don't
@@ -173,7 +173,7 @@ fn decode_tracing_id(id: u64) -> Option<(usize, usize)> {
 /// `(SpanCache, Driver)`.  Spawn the [`Driver`] as a background task to commit
 /// closed spans to the shared readable map.
 pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
-    in_flight: [RwLock<Slab<SpanRecord>>; NUM_SHARDS],
+    in_flight: [Mutex<Slab<SpanRecord>>; NUM_SHARDS],
     map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
     // Generates SpanRecord.id (the actual_id, BTreeMap key).  Disjoint from
     // the encoded tracing id space.
@@ -204,7 +204,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
         let map = Arc::new(RwLock::new(BTreeMap::new()));
         let shard_capacity = capacity.div_ceil(NUM_SHARDS);
         let cache = SpanCache {
-            in_flight: std::array::from_fn(|_| RwLock::new(Slab::with_capacity(shard_capacity))),
+            in_flight: std::array::from_fn(|_| Mutex::new(Slab::with_capacity(shard_capacity))),
             map: Arc::clone(&map),
             next_actual_id: AtomicU64::new(10),
             predicate,
@@ -227,7 +227,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
     /// closed it is reachable only via [`get_span`] using its `actual_id`.
     pub fn get_active_span(&self, tracing_id: u64) -> Option<SpanRecord> {
         let (shard, slab_idx) = decode_tracing_id(tracing_id)?;
-        self.in_flight[shard].read().unwrap().get(slab_idx).cloned()
+        self.in_flight[shard].lock().unwrap().get(slab_idx).cloned()
     }
 
     /// Returns closed spans in ascending actual_id order.  Open spans are not
@@ -342,7 +342,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
                     Some(t) => t,
                     None => return disabled_id(),
                 };
-                match self.in_flight[p_shard].read().unwrap().get(p_slab) {
+                match self.in_flight[p_shard].lock().unwrap().get(p_slab) {
                     Some(parent) => Some(parent.id),
                     None => return disabled_id(), // parent vanished — race
                 }
@@ -350,7 +350,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
 
         let shard = pick_shard();
-        let mut shard_lock = self.in_flight[shard].write().unwrap();
+        let mut shard_lock = self.in_flight[shard].lock().unwrap();
         if shard_lock.len() >= self.shard_capacity {
             log::warn!(
                 "span shard {shard} full; new span disabled. \
@@ -367,7 +367,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             Some(t) => t,
             None => return,
         };
-        let mut shard_lock = self.in_flight[shard].write().unwrap();
+        let mut shard_lock = self.in_flight[shard].lock().unwrap();
         if let Some(rec) = shard_lock.get_mut(slab_idx) {
             values.record(&mut FieldVisitor { fields: &mut rec.fields });
         }
@@ -406,7 +406,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             Some(t) => t,
             None => return,
         };
-        let mut shard_lock = self.in_flight[shard].write().unwrap();
+        let mut shard_lock = self.in_flight[shard].lock().unwrap();
         if let Some(span) = shard_lock.get_mut(slab_idx) {
             span.events.push(record);
         } else {
@@ -431,7 +431,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
 
         let record = {
-            let mut shard_lock = self.in_flight[shard].write().unwrap();
+            let mut shard_lock = self.in_flight[shard].lock().unwrap();
             if shard_lock.contains(slab_idx) {
                 let mut r = shard_lock.remove(slab_idx);
                 r.closed_at = Some(Instant::now());
