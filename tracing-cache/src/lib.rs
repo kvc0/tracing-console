@@ -84,8 +84,45 @@ pub struct SpanRecord {
 
 // ── SpanCache & Driver ───────────────────────────────────────────────────────
 
-// Flush the thread-local PENDING buffer to the spillway after this many closes.
-const PENDING_BATCH: usize = 32;
+/// Default number of in-flight slab shards (must be a power of two).
+pub const DEFAULT_LANE_COUNT: usize = 16;
+
+/// Optional knobs for the cache + driver.  Pass to
+/// [`SpanCache::with_config`] / [`SpanCache::with_predicate_and_config`]; the
+/// no-config constructors use [`CacheConfig::default`].
+#[derive(Debug, Clone)]
+pub struct CacheConfig {
+    /// Number of in-flight slab shards.  Silently clamped to `[1, 256]` and
+    /// rounded up to the next power of two (so `3` becomes `4`, `200`
+    /// becomes `256`, `1000` is capped at `256`).  More lanes = more
+    /// concurrent writers without contention; each lane adds a
+    /// `Mutex<Slab<SpanRecord>>` plus consumes one more bit of the encoded
+    /// `tracing::span::Id` for shard selection.
+    /// Default: [`DEFAULT_LANE_COUNT`].
+    pub lane_count: usize,
+    /// Flush the thread-local PENDING buffer to the spillway after this many
+    /// span closures on a single thread.  Smaller = lower visibility latency
+    /// for low-traffic threads at the cost of more spillway sends.  Default: 32.
+    pub pending_batch: usize,
+    /// Flush the driver's accumulated batch into the shared map after this
+    /// many spans have been received.  Smaller = lower visibility latency at
+    /// the cost of more map write-lock acquisitions.  Default: 600.
+    pub driver_batch: usize,
+    /// Upper bound on how long the driver will wait before flushing whatever
+    /// it has, even if `driver_batch` hasn't been reached.  Default: 1 second.
+    pub driver_interval: std::time::Duration,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            lane_count: DEFAULT_LANE_COUNT,
+            pending_batch: 32,
+            driver_batch: 600,
+            driver_interval: std::time::Duration::from_secs(1),
+        }
+    }
+}
 
 thread_local! {
     // Active span ids on this thread — includes DISABLED entries.
@@ -106,82 +143,58 @@ fn u64_to_id(n: u64) -> tracing::span::Id {
     tracing::span::Id::from_u64(n)
 }
 
-// 16 in-flight shards picked by a thread-local counter.  Each shard is its
-// own slab guarded by RwLock, so concurrent new_span / try_close on different
-// threads almost always land on different shards.
-const NUM_SHARDS: usize = 16;
-const SHARD_MASK: u64 = 0xF;
-const SHARD_SHIFT: u32 = 60;
+// In-flight slab shards are picked by a thread-local counter.  Each shard is
+// its own slab guarded by `Mutex`, so concurrent new_span / try_close on
+// different threads almost always land on different shards.  Lane count is
+// runtime-configurable via [`CacheConfig::lane_count`].
 
 // Reserved tracing-id values.
 const DISABLED: u64 = 1;
-// Slab indices start at 0; encoded as (slab_idx + SLAB_OFFSET) in the bottom
-// 60 bits of the tracing id, so DISABLED=1 stays unique against shard 0.
+// Slab indices start at 0; encoded as (slab_idx + SLAB_OFFSET) in the
+// low-bits portion of the tracing id, so DISABLED=1 stays unique against
+// shard 0 / slab 0.
 const SLAB_OFFSET: u64 = 2;
-// The bottom 60 bits hold the encoded slab index.
-const SLAB_MASK: u64 = (1u64 << SHARD_SHIFT) - 1;
 
 thread_local! {
     /// Per-thread counter that picks which shard `new_span` writes to.  Each
-    /// new_span on this thread bumps the counter and uses `counter & 0xF`.
+    /// new_span on this thread bumps the counter and uses `counter & shard_mask`.
+    /// The counter is shared across all `SpanCache`s that ever run on this
+    /// thread; each cache applies its own mask.
     static SHARD_COUNTER: Cell<u64> = const { Cell::new(0) };
-}
-
-#[inline]
-fn pick_shard() -> usize {
-    SHARD_COUNTER.with(|c| {
-        let n = c.get();
-        c.set(n.wrapping_add(1));
-        (n & SHARD_MASK) as usize
-    })
-}
-
-/// Encode a (shard, slab_idx) into the u64 carried by `tracing::span::Id`.
-#[inline]
-fn encode_tracing_id(shard: usize, slab_idx: usize) -> u64 {
-    ((shard as u64) << SHARD_SHIFT) | ((slab_idx as u64) + SLAB_OFFSET)
-}
-
-/// Decode a tracing id back into (shard, slab_idx).  Returns `None` for
-/// `DISABLED` or anything else not produced by `encode_tracing_id`.
-#[inline]
-fn decode_tracing_id(id: u64) -> Option<(usize, usize)> {
-    if id == DISABLED {
-        return None;
-    }
-    let raw = id & SLAB_MASK;
-    if raw < SLAB_OFFSET {
-        return None;
-    }
-    let shard = ((id >> SHARD_SHIFT) & SHARD_MASK) as usize;
-    Some((shard, (raw - SLAB_OFFSET) as usize))
 }
 
 /// A `tracing::Subscriber` that holds spans in memory for inspection.
 ///
-/// Open spans live in a sharded `[Mutex<Slab<SpanRecord>>; 16]`.  The shard
-/// is picked by a thread-local counter; the slab gives an O(1) cache-friendly
-/// index, and the user-facing `tracing::span::Id` packs `(shard, slab_idx+2)`
-/// into a single u64 so SPAN_STACK push/pop and trait-method dispatch don't
-/// need a separate lookup.  When a span closes it moves to a per-thread buffer
-/// and is flushed to the [`Driver`] via a spillway channel.
+/// Open spans live in a sharded `Box<[Mutex<Slab<SpanRecord>>]>`, with the
+/// lane count set by [`CacheConfig::lane_count`] (default
+/// [`DEFAULT_LANE_COUNT`]).  The shard is picked by a thread-local counter;
+/// the slab gives an O(1) cache-friendly index, and the user-facing
+/// `tracing::span::Id` packs `(shard, slab_idx+2)` into a single u64 so
+/// SPAN_STACK push/pop and trait-method dispatch don't need a separate
+/// lookup.  When a span closes it moves to a per-thread buffer and is
+/// flushed to the [`Driver`] via a spillway channel.
 ///
 /// `SpanRecord.id` is a monotonic `actual_id` (separate from the tracing id)
 /// that serves as the BTreeMap key, since slab indices are reused.
 ///
-/// Create with [`SpanCache::new`] or [`SpanCache::with_predicate`]; both return
-/// `(SpanCache, Driver)`.  Spawn the [`Driver`] as a background task to commit
-/// closed spans to the shared readable map.
+/// Create with [`SpanCache::new`] / [`SpanCache::with_predicate`] (defaults)
+/// or [`SpanCache::with_config`] / [`SpanCache::with_predicate_and_config`]
+/// (custom batch sizes & lane count).  Each returns `(SpanCache, Driver)`;
+/// spawn the [`Driver`] as a background task to commit closed spans.
 pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
-    in_flight: [Mutex<Slab<SpanRecord>>; NUM_SHARDS],
+    in_flight: Box<[Mutex<Slab<SpanRecord>>]>,
     map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
     // Generates SpanRecord.id (the actual_id, BTreeMap key).  Disjoint from
     // the encoded tracing id space.
     next_actual_id: AtomicU64,
     predicate: P,
-    // Per-shard capacity.  Total open-span budget is shard_capacity * NUM_SHARDS.
+    // Per-shard capacity.  Total open-span budget is shard_capacity * lane_count.
     shard_capacity: usize,
     sender: spillway::Sender<SpanRecord>,
+    // Knobs derived from CacheConfig.
+    pending_batch: usize,
+    shard_mask: u64,  // lane_count - 1
+    shard_shift: u32, // 64 - log2(lane_count)
 }
 
 /// Background task that receives closed spans from the spillway and writes
@@ -190,29 +203,102 @@ pub struct Driver {
     map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
     receiver: spillway::Receiver<SpanRecord>,
     capacity: usize,
+    batch_size: usize,
+    tick_interval: std::time::Duration,
 }
 
 impl SpanCache<LevelPredicate> {
+    /// Default predicate (TRACE), default config.
     pub fn new(capacity: usize) -> (Self, Driver) {
         Self::with_predicate(capacity, LevelPredicate::new(Level::TRACE))
+    }
+
+    /// Default predicate (TRACE) with a custom [`CacheConfig`].
+    pub fn with_config(capacity: usize, config: CacheConfig) -> (Self, Driver) {
+        Self::with_predicate_and_config(capacity, LevelPredicate::new(Level::TRACE), config)
     }
 }
 
 impl<P: EnabledPredicate> SpanCache<P> {
+    /// Custom predicate, default [`CacheConfig`].
     pub fn with_predicate(capacity: usize, predicate: P) -> (Self, Driver) {
+        Self::with_predicate_and_config(capacity, predicate, CacheConfig::default())
+    }
+
+    /// Custom predicate and custom [`CacheConfig`].
+    pub fn with_predicate_and_config(
+        capacity: usize,
+        predicate: P,
+        config: CacheConfig,
+    ) -> (Self, Driver) {
+        // Silently clamp to [1, 256] and round up to the next power of two.
+        let lane_count = config.lane_count.clamp(1, 256).next_power_of_two();
+        let shard_bits = lane_count.trailing_zeros();
+        let shard_mask = (lane_count as u64) - 1;
+        let shard_shift = 64 - shard_bits;
+
         let (sender, receiver) = spillway::channel();
         let map = Arc::new(RwLock::new(BTreeMap::new()));
-        let shard_capacity = capacity.div_ceil(NUM_SHARDS);
+        let shard_capacity = capacity.div_ceil(lane_count);
+        let in_flight: Box<[Mutex<Slab<SpanRecord>>]> = (0..lane_count)
+            .map(|_| Mutex::new(Slab::with_capacity(shard_capacity)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         let cache = SpanCache {
-            in_flight: std::array::from_fn(|_| Mutex::new(Slab::with_capacity(shard_capacity))),
+            in_flight,
             map: Arc::clone(&map),
             next_actual_id: AtomicU64::new(10),
             predicate,
             shard_capacity,
             sender,
+            pending_batch: config.pending_batch,
+            shard_mask,
+            shard_shift,
         };
-        let driver = Driver { map, receiver, capacity };
+        let driver = Driver {
+            map,
+            receiver,
+            capacity,
+            batch_size: config.driver_batch,
+            tick_interval: config.driver_interval,
+        };
         (cache, driver)
+    }
+
+    /// Number of in-flight slab shards this cache uses.
+    pub fn lane_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    #[inline]
+    fn pick_shard(&self) -> usize {
+        SHARD_COUNTER.with(|c| {
+            let n = c.get();
+            c.set(n.wrapping_add(1));
+            (n & self.shard_mask) as usize
+        })
+    }
+
+    #[inline]
+    fn encode_tracing_id(&self, shard: usize, slab_idx: usize) -> u64 {
+        ((shard as u64) << self.shard_shift) | ((slab_idx as u64) + SLAB_OFFSET)
+    }
+
+    /// Decode a tracing id into `(shard, slab_idx)`.  Returns `None` for
+    /// `DISABLED` or anything outside the encoding scheme.
+    #[inline]
+    fn decode_tracing_id(&self, id: u64) -> Option<(usize, usize)> {
+        if id == DISABLED {
+            return None;
+        }
+        let slab_mask = (1u64 << self.shard_shift) - 1;
+        let raw = id & slab_mask;
+        if raw < SLAB_OFFSET {
+            return None;
+        }
+        let shard = ((id >> self.shard_shift) & self.shard_mask) as usize;
+        Some((shard, (raw - SLAB_OFFSET) as usize))
     }
 
     /// Returns a closed span by its actual_id (`SpanRecord.id`).  This is the
@@ -226,7 +312,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
     /// `tracing::span::Id`).  Returns `None` if the span has closed; once
     /// closed it is reachable only via [`get_span`] using its `actual_id`.
     pub fn get_active_span(&self, tracing_id: u64) -> Option<SpanRecord> {
-        let (shard, slab_idx) = decode_tracing_id(tracing_id)?;
+        let (shard, slab_idx) = self.decode_tracing_id(tracing_id)?;
         self.in_flight[shard].lock().unwrap().get(slab_idx).cloned()
     }
 
@@ -338,7 +424,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         record.parent_id = match source {
             ParentSource::Root => None,
             ParentSource::ParentTracing(parent_tracing) => {
-                let (p_shard, p_slab) = match decode_tracing_id(parent_tracing) {
+                let (p_shard, p_slab) = match self.decode_tracing_id(parent_tracing) {
                     Some(t) => t,
                     None => return disabled_id(),
                 };
@@ -349,7 +435,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             }
         };
 
-        let shard = pick_shard();
+        let shard = self.pick_shard();
         let mut shard_lock = self.in_flight[shard].lock().unwrap();
         if shard_lock.len() >= self.shard_capacity {
             log::warn!(
@@ -359,11 +445,11 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             return disabled_id();
         }
         let slab_idx = shard_lock.insert(record);
-        u64_to_id(encode_tracing_id(shard, slab_idx))
+        u64_to_id(self.encode_tracing_id(shard, slab_idx))
     }
 
     fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-        let (shard, slab_idx) = match decode_tracing_id(id_to_u64(span)) {
+        let (shard, slab_idx) = match self.decode_tracing_id(id_to_u64(span)) {
             Some(t) => t,
             None => return,
         };
@@ -402,7 +488,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             recorded_at: Instant::now(),
         };
 
-        let (shard, slab_idx) = match decode_tracing_id(parent_id) {
+        let (shard, slab_idx) = match self.decode_tracing_id(parent_id) {
             Some(t) => t,
             None => return,
         };
@@ -425,7 +511,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     }
 
     fn try_close(&self, id: tracing::span::Id) -> bool {
-        let (shard, slab_idx) = match decode_tracing_id(id_to_u64(&id)) {
+        let (shard, slab_idx) = match self.decode_tracing_id(id_to_u64(&id)) {
             Some(t) => t,
             None => return false,
         };
@@ -445,7 +531,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             let should_flush = PENDING.with(|p| {
                 let mut p = p.borrow_mut();
                 p.push(record);
-                p.len() >= PENDING_BATCH
+                p.len() >= self.pending_batch
             });
             if should_flush {
                 self.flush_pending();
@@ -465,8 +551,8 @@ impl Driver {
     ///
     /// Terminates when all `Sender` clones are dropped (spillway channel closed).
     pub async fn run(self) {
-        let Driver { map, mut receiver, capacity } = self;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let Driver { map, mut receiver, capacity, batch_size, tick_interval } = self;
+        let mut tick = tokio::time::interval(tick_interval);
         let mut batch: Vec<SpanRecord> = Vec::new();
 
         loop {
@@ -475,7 +561,7 @@ impl Driver {
                     match record {
                         Some(r) => {
                             batch.push(r);
-                            if batch.len() >= 600 {
+                            if batch.len() >= batch_size {
                                 Self::flush_batch(&map, capacity, &mut batch);
                             }
                         }
@@ -496,7 +582,7 @@ impl Driver {
     /// Synchronously drains all spans currently available in the spillway and
     /// flushes them into the map.  Use in tests after [`SpanCache::flush_pending`].
     pub fn drain_sync(self) {
-        let Driver { map, mut receiver, capacity } = self;
+        let Driver { map, mut receiver, capacity, .. } = self;
         let mut batch = Vec::new();
         while let Some(record) = receiver.try_next() {
             batch.push(record);
@@ -725,14 +811,15 @@ mod tests {
 
     #[test]
     fn eviction_full_of_open_spans_returns_disabled() {
-        // Sharded in_flight: per-shard cap is capacity.div_ceil(NUM_SHARDS).
-        // With capacity=2 and 16 shards each shard holds 1 span.  The
-        // thread-local SHARD_COUNTER ticks 0,1,…,15 across new_span calls, so
-        // 16 spans fill exactly one slot per shard and the 17th lands on the
-        // same shard as the 1st and is disabled.
+        // Sharded in_flight: per-shard cap is capacity.div_ceil(lane_count).
+        // With capacity=2 and the default 16 lanes each shard holds 1 span.
+        // The thread-local SHARD_COUNTER ticks 0,1,…,(lanes-1) across new_span
+        // calls, so `lanes` spans fill exactly one slot per shard and the
+        // next one lands on the same shard as the first → disabled.
         let (cache, driver) = make_cache(2);
+        let lanes = cache.lane_count();
         tracing::subscriber::with_default(Arc::clone(&cache), || {
-            let _spans: Vec<_> = (0..NUM_SHARDS)
+            let _spans: Vec<_> = (0..lanes)
                 .map(|i| {
                     let s = tracing::span!(parent: None, Level::INFO, "s");
                     assert_ne!(span_id(&s), Some(DISABLED), "span {i} should be enabled");
@@ -743,6 +830,57 @@ mod tests {
             assert_eq!(span_id(&overflow), Some(DISABLED));
         });
         drop(driver);
+    }
+
+    #[test]
+    fn custom_lane_count_is_respected() {
+        // 4 lanes, total capacity 4 → per-shard cap 1.  Hold all 4 spans live
+        // so they fill every shard before the overflow attempt.
+        let (cache, driver) = SpanCache::with_config(
+            4,
+            CacheConfig { lane_count: 4, ..CacheConfig::default() },
+        );
+        let cache = Arc::new(cache);
+        assert_eq!(cache.lane_count(), 4);
+        tracing::subscriber::with_default(Arc::clone(&cache), || {
+            let _spans: Vec<_> = (0..4)
+                .map(|i| {
+                    let s = tracing::span!(parent: None, Level::INFO, "s");
+                    assert_ne!(span_id(&s), Some(DISABLED), "span {i} should be enabled");
+                    s
+                })
+                .collect();
+            let overflow = tracing::span!(parent: None, Level::INFO, "overflow");
+            assert_eq!(span_id(&overflow), Some(DISABLED));
+        });
+        drop(driver);
+    }
+
+    #[test]
+    fn lane_count_is_clamped_and_rounded_to_power_of_two() {
+        // Out-of-range / non-power-of-two values are silently normalised to
+        // the next power of two within [1, 256].
+        let cases = [
+            (0_usize, 1_usize),     // zero → minimum lane count of 1
+            (1, 1),
+            (3, 4),                 // round up
+            (5, 8),
+            (16, 16),               // already a power of two
+            (200, 256),             // round up to ceiling
+            (256, 256),
+            (1000, 256),            // capped at 256
+        ];
+        for (input, expected) in cases {
+            let (cache, _driver) = SpanCache::with_config(
+                64,
+                CacheConfig { lane_count: input, ..CacheConfig::default() },
+            );
+            assert_eq!(
+                cache.lane_count(),
+                expected,
+                "lane_count({input}) should normalise to {expected}",
+            );
+        }
     }
 
     #[test]
