@@ -216,6 +216,20 @@ thread_local! {
     /// `u64::MAX` is the "not assigned yet" sentinel (the global counter
     /// can't realistically reach it).
     static THREAD_SHARD_KEY: Cell<u64> = const { Cell::new(u64::MAX) };
+
+    /// Per-thread `spillway::Sender` clone, lazily initialised on first
+    /// `flush_pending`.  Spillway's design is per-clone-lock-free: each
+    /// `Sender::clone()` gets its own queue slot, so threads pushing to
+    /// their own clone do not contend on spillway's internal mutex.  We
+    /// stash the source-cache's sender address alongside the clone so a
+    /// thread that switches between two `SpanCache` instances notices the
+    /// switch and re-clones.
+    /// SAFETY rationale matches `SPAN_STACK` / `PENDING`: the cell is
+    /// thread-local, every access is wrapped in a single short scope by
+    /// `flush_pending`, and `spillway::Sender::send` is non-reentrant w.r.t.
+    /// tracing on this thread.
+    static THREAD_SENDER: std::cell::UnsafeCell<Option<(usize, spillway::Sender<SpanRecord>)>>
+        = const { std::cell::UnsafeCell::new(None) };
 }
 
 /// A `tracing::Subscriber` that holds spans in memory for inspection.
@@ -399,8 +413,20 @@ impl<P: EnabledPredicate> SpanCache<P> {
     /// Must be called before [`Driver::drain_sync`] in tests to ensure all
     /// recently-closed spans are delivered.
     pub fn flush_pending(&self) {
-        pending_drain(|record| {
-            let _ = self.sender.send(record);
+        THREAD_SENDER.with(|sc| {
+            // SAFETY: cell is thread-local and we only hold the &mut for the
+            // duration of this closure; nothing inside re-enters THREAD_SENDER.
+            let slot = unsafe { &mut *sc.get() };
+            let sender_ptr = &self.sender as *const _ as usize;
+            let needs_init = !matches!(slot, Some((p, _)) if *p == sender_ptr);
+            if needs_init {
+                *slot = Some((sender_ptr, self.sender.clone()));
+            }
+            // SAFETY: `slot` was just guaranteed to be `Some`.
+            let sender = unsafe { &slot.as_ref().unwrap_unchecked().1 };
+            pending_drain(|record| {
+                let _ = sender.send(record);
+            });
         });
     }
 }
