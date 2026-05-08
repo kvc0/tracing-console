@@ -240,6 +240,16 @@ struct ShardLane {
 /// once per thread.
 static NEXT_THREAD_KEY: AtomicU64 = AtomicU64::new(0);
 
+/// Number of `actual_id`s a thread reserves in a single bump of the
+/// per-cache `id_high_water` counter.  Power of two so the in-batch
+/// position is `cursor & (ID_BATCH - 1)` and refill is signalled by that
+/// being zero — lets the per-thread reservation be a single u64 cursor.
+/// Larger batch ⇒ fewer `fetch_add` hits on the shared atomic ⇒ less
+/// cross-thread contention, at the cost of `actual_id`s no longer being
+/// globally monotonic — they're monotonic within a thread's batch, but
+/// interleave across threads.
+const ID_BATCH: u64 = 1024;
+
 thread_local! {
     /// Stable per-thread shard key, lazily assigned from `NEXT_THREAD_KEY`
     /// on first use.  Each cache derives its actual shard via
@@ -262,6 +272,18 @@ thread_local! {
     /// tracing on this thread.
     static THREAD_SENDER: std::cell::UnsafeCell<Option<(usize, spillway::Sender<SpanRecord>)>>
         = const { std::cell::UnsafeCell::new(None) };
+
+    /// Per-thread `actual_id` cursor: the next id to hand out from the
+    /// current `ID_BATCH`-sized reservation.  `cursor & (ID_BATCH - 1) == 0`
+    /// (including the initial `0`) means the batch is exhausted and the
+    /// next call must refill via `id_high_water.fetch_add(ID_BATCH)`.
+    /// Since `id_high_water` is initialised to a multiple of `ID_BATCH`,
+    /// every fetched start is batch-aligned, so the mask check is
+    /// sufficient.  Process-level (not per-cache): in production there's
+    /// one cache, and our tests never emit enough spans on one thread to
+    /// trigger a refill, so cross-cache leakage of cursor state is
+    /// harmless in practice.
+    static ID_CURSOR: Cell<u64> = const { Cell::new(0) };
 }
 
 /// A `tracing::Subscriber` that holds spans in memory for inspection.
@@ -275,8 +297,11 @@ thread_local! {
 /// lookup.  When a span closes it moves to a per-thread buffer and is
 /// flushed to the [`Driver`] via a spillway channel.
 ///
-/// `SpanRecord.id` is a monotonic `actual_id` (separate from the tracing id)
-/// that serves as the BTreeMap key, since slab indices are reused.
+/// `SpanRecord.id` is an `actual_id` (separate from the tracing id) that
+/// serves as the BTreeMap key, since slab indices are reused.  IDs are
+/// monotonic within a thread's `ID_BATCH`-sized reservation; across
+/// threads they interleave, so BTreeMap order reflects allocation order
+/// per-thread but not strict global creation order.
 ///
 /// Create with [`SpanCache::new`] / [`SpanCache::with_predicate`] (defaults)
 /// or [`SpanCache::with_config`] / [`SpanCache::with_predicate_and_config`]
@@ -285,9 +310,12 @@ thread_local! {
 pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
     in_flight: Box<[ShardLane]>,
     map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
-    // Generates SpanRecord.id (the actual_id, BTreeMap key).  Disjoint from
-    // the encoded tracing id space.
-    next_actual_id: AtomicU64,
+    // High-water mark for the `actual_id` space (the `SpanRecord.id` /
+    // BTreeMap key, disjoint from the encoded tracing id space).  Threads
+    // claim `ID_BATCH`-sized slices via `fetch_add` and hand IDs out from
+    // a thread-local reservation, so this counter is touched roughly
+    // once per `ID_BATCH` spans rather than once per span.
+    id_high_water: AtomicU64,
     predicate: P,
     // Per-shard capacity.  Total open-span budget is shard_capacity * lane_count.
     shard_capacity: usize,
@@ -357,7 +385,10 @@ impl<P: EnabledPredicate> SpanCache<P> {
         let cache = SpanCache {
             in_flight,
             map: Arc::clone(&map),
-            next_actual_id: AtomicU64::new(10),
+            // Initialise to ID_BATCH so every `fetch_add(ID_BATCH)` returns
+            // a batch-aligned start; that's what makes the mask-based
+            // "cursor at boundary ⇒ refill" check work in `allocate_actual_id`.
+            id_high_water: AtomicU64::new(ID_BATCH),
             predicate,
             shard_capacity,
             sender,
@@ -394,6 +425,26 @@ impl<P: EnabledPredicate> SpanCache<P> {
             }
         });
         (key & self.shard_mask) as usize
+    }
+
+    /// Claim the next `actual_id` from this thread's reservation against
+    /// `id_high_water`, refilling via `fetch_add(ID_BATCH)` when the
+    /// reservation is exhausted (`cursor & (ID_BATCH - 1) == 0`).
+    /// Touches the shared atomic ~once per `ID_BATCH` spans rather than
+    /// once per span.
+    #[inline]
+    fn allocate_actual_id(&self) -> u64 {
+        ID_CURSOR.with(|cell| {
+            let cursor = cell.get();
+            if (cursor & (ID_BATCH - 1)) != 0 {
+                cell.set(cursor + 1);
+                cursor
+            } else {
+                let start = self.id_high_water.fetch_add(ID_BATCH, Relaxed);
+                cell.set(start + 1);
+                start
+            }
+        })
     }
 
     #[inline]
@@ -543,7 +594,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
 
         // Step C: build record outside the lock so field-visitor work doesn't
         // extend the critical section.
-        let actual_id = self.next_actual_id.fetch_add(1, Relaxed);
+        let actual_id = self.allocate_actual_id();
         let mut record = SpanRecord {
             id: actual_id,
             parent_id: parent_actual_id,
