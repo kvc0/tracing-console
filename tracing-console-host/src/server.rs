@@ -21,8 +21,18 @@ type ServerCodec = (
 );
 
 // Tunables — kept inline since this is the only place they're used.
-const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(50);
+//
+// Polling adapts toward `STREAM_TARGET_BATCH` spans per poll: each tick the
+// interval is scaled by `target / observed`, then clamped to ±20% of the
+// previous interval and bounded by `STREAM_MIN_INTERVAL` / `STREAM_MAX_INTERVAL`.
+// `STREAM_BATCH` is the per-page cap fed to `cache.page()`; it must exceed
+// the target so observed counts above target signal a real backlog.
+const STREAM_POLL_INTERVAL_INITIAL: Duration = Duration::from_millis(50);
 const STREAM_BATCH: usize = 256;
+const STREAM_TARGET_BATCH: usize = 10;
+const STREAM_MIN_INTERVAL: Duration = Duration::from_micros(1);
+const STREAM_MAX_INTERVAL: Duration = Duration::from_millis(250);
+const STREAM_ADJUST_RATIO: f64 = 0.2; // ±20% per tick
 
 /// Per-connection mutable state.  Read by the streaming RPC, mutated by the
 /// `Set*` RPCs and `StartStream` / `StopStream`.
@@ -129,9 +139,9 @@ fn span_stream<P: EnabledPredicate>(
 ) -> impl futures_core::Stream<Item = Response> {
     async_stream::stream! {
         let mut cursor: u64 = 0;
-        let mut tick = tokio::time::interval(STREAM_POLL_INTERVAL);
+        let mut interval = STREAM_POLL_INTERVAL_INITIAL;
         loop {
-            tick.tick().await;
+            tokio::time::sleep(interval).await;
             // Snapshot the streaming flag + filter under the lock, then drop
             // it before paging the cache so the page isn't holding two locks.
             let (streaming, min_level, sampling_rate, root_filter) = {
@@ -139,12 +149,12 @@ fn span_stream<P: EnabledPredicate>(
                 (s.streaming, s.min_level, s.sampling_rate, s.root_filter.clone())
             };
             if !streaming {
+                // Don't adapt while paused — `count == 0` here means the
+                // client said stop, not "nothing was produced".
                 continue;
             }
             let batch = cache.page(cursor, STREAM_BATCH);
-            if batch.is_empty() {
-                continue;
-            }
+            let count = batch.len();
             for record in batch {
                 cursor = record.id;
                 if let Some(min) = min_level {
@@ -160,8 +170,23 @@ fn span_stream<P: EnabledPredicate>(
                 }
                 yield Response::span(span_to_wire(&record, base));
             }
+            interval = adjust_interval(interval, count);
         }
     }
+}
+
+/// Scale `current` toward yielding `STREAM_TARGET_BATCH` spans on the next
+/// poll, capped at ±`STREAM_ADJUST_RATIO` per call and clamped to
+/// `[STREAM_MIN_INTERVAL, STREAM_MAX_INTERVAL]`.  An observation of zero
+/// spans treats the ratio as if `count = 1` (i.e., grow by the maximum
+/// allowed amount).
+fn adjust_interval(current: Duration, count: usize) -> Duration {
+    let ratio = STREAM_TARGET_BATCH as f64 / count.max(1) as f64;
+    let raw = current.mul_f64(ratio);
+    let max_up = current.mul_f64(1.0 + STREAM_ADJUST_RATIO);
+    let min_down = current.mul_f64(1.0 - STREAM_ADJUST_RATIO);
+    let clamped = raw.clamp(min_down, max_up);
+    clamped.clamp(STREAM_MIN_INTERVAL, STREAM_MAX_INTERVAL)
 }
 
 /// True iff `record_level` is at least as severe as `floor`.  In tracing's
@@ -320,6 +345,72 @@ mod tests {
     use crate::protocol::{ResponseBody, WireLevel};
 
     type ClientCodec = (MessagePackSerializer<Request>, MessagePackDecoder<Response>);
+
+    // ── adjust_interval unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn adjust_interval_holds_steady_at_target() {
+        let i = Duration::from_millis(50);
+        // count == target: ratio == 1.0, no change.
+        assert_eq!(adjust_interval(i, STREAM_TARGET_BATCH), i);
+    }
+
+    #[test]
+    fn adjust_interval_speeds_up_when_over_target_capped_at_20pct() {
+        let i = Duration::from_millis(100);
+        // count >> target: raw ratio < 0.8, so clamped to 0.8 × current.
+        let next = adjust_interval(i, STREAM_TARGET_BATCH * 100);
+        assert_eq!(next, Duration::from_millis(80));
+    }
+
+    #[test]
+    fn adjust_interval_slows_down_when_under_target_capped_at_20pct() {
+        let i = Duration::from_millis(100);
+        // count << target (or zero): raw ratio > 1.2, so clamped to 1.2 × current.
+        let next_zero = adjust_interval(i, 0);
+        assert_eq!(next_zero, Duration::from_millis(120));
+        let next_one = adjust_interval(i, 1);
+        assert_eq!(next_one, Duration::from_millis(120));
+    }
+
+    #[test]
+    fn adjust_interval_takes_ratio_when_inside_20pct_band() {
+        // count == 11, target == 10: ratio = 10/11 ≈ 0.909, within [0.8, 1.2].
+        let i = Duration::from_millis(110);
+        let next = adjust_interval(i, 11);
+        // 110 ms × 10/11 = 100 ms exactly.
+        assert_eq!(next, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn adjust_interval_clamps_to_min_floor() {
+        // Already at the floor and observing huge counts: stays at floor.
+        let i = STREAM_MIN_INTERVAL;
+        let next = adjust_interval(i, STREAM_TARGET_BATCH * 100);
+        assert_eq!(next, STREAM_MIN_INTERVAL);
+    }
+
+    #[test]
+    fn adjust_interval_clamps_to_max_ceiling() {
+        // Already at the ceiling and observing zero spans: stays at ceiling.
+        let i = STREAM_MAX_INTERVAL;
+        let next = adjust_interval(i, 0);
+        assert_eq!(next, STREAM_MAX_INTERVAL);
+    }
+
+    #[test]
+    fn adjust_interval_reaches_min_in_bounded_steps_under_overload() {
+        // Sustained overload: each step shrinks by exactly 20%.  From 50 ms
+        // down to STREAM_MIN_INTERVAL (1 µs) takes ~log_0.8(2e-5) ≈ 49 steps.
+        let mut i = Duration::from_millis(50);
+        let mut steps = 0;
+        while i > STREAM_MIN_INTERVAL && steps < 1000 {
+            i = adjust_interval(i, STREAM_TARGET_BATCH * 1000);
+            steps += 1;
+        }
+        assert_eq!(i, STREAM_MIN_INTERVAL);
+        assert!(steps < 60, "took {steps} steps to reach floor");
+    }
 
     /// Bind a std listener to ephemeral port, capture the port, drop it.  The
     /// next bind on this port (by `serve`) reuses it (SO_REUSEADDR is set).
