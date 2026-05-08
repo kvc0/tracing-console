@@ -44,7 +44,9 @@ static CACHE: LazyLock<Arc<SpanCache>> = LazyLock::new(|| {
             .enable_time()
             .build()
             .unwrap()
-            .block_on(driver.run())
+            .block_on(driver.run());
+        // it's a bug if the driver exits
+        std::process::exit(333);
     });
     cache
 });

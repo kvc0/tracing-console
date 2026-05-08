@@ -179,11 +179,9 @@ fn pending_push(record: SpanRecord) -> usize {
 /// Drain PENDING in place (preserving the Vec's capacity), invoking `f` on
 /// each record.  `f` must not call back into tracing on this thread.
 #[inline]
-fn pending_drain<F: FnMut(SpanRecord)>(mut f: F) {
+fn pending_drain<F: FnMut(std::vec::Drain<'_, SpanRecord>)>(mut f: F) {
     PENDING.with(|c| unsafe {
-        for record in (*c.get()).drain(..) {
-            f(record);
-        }
+        f((*c.get()).drain(..));
     });
 }
 
@@ -521,8 +519,8 @@ impl<P: EnabledPredicate> SpanCache<P> {
             }
             // SAFETY: `slot` was just guaranteed to be `Some`.
             let sender = unsafe { &slot.as_ref().unwrap_unchecked().1 };
-            pending_drain(|record| {
-                let _ = sender.send(record);
+            pending_drain(|records| {
+                let _ = sender.send_many(records);
             });
         });
     }
@@ -736,28 +734,16 @@ impl Driver {
     /// Terminates when all `Sender` clones are dropped (spillway channel closed).
     pub async fn run(self) {
         let Driver { map, mut receiver, capacity, batch_size, tick_interval } = self;
-        let mut tick = tokio::time::interval(tick_interval);
-        let mut batch: Vec<SpanRecord> = Vec::new();
 
         loop {
-            tokio::select! {
-                record = receiver.next() => {
-                    match record {
-                        Some(r) => {
-                            batch.push(r);
-                            if batch.len() >= batch_size {
-                                Self::flush_batch(&map, capacity, &mut batch);
-                            }
-                        }
-                        None => {
-                            // All senders dropped; flush remaining and exit.
-                            Self::flush_batch(&map, capacity, &mut batch);
-                            break;
-                        }
-                    }
+            let delivery_batch = receiver.next_batch().await;
+            match delivery_batch {
+                Some(delivery_batch) => {
+                    Self::flush_batch(&map, capacity, delivery_batch);
                 }
-                _ = tick.tick() => {
-                    Self::flush_batch(&map, capacity, &mut batch);
+                None => {
+                    // All senders dropped
+                    break;
                 }
             }
         }
@@ -771,26 +757,29 @@ impl Driver {
         while let Some(record) = receiver.try_next() {
             batch.push(record);
         }
-        Self::flush_batch(&map, capacity, &mut batch);
+        Self::flush_batch(&map, capacity, batch.into_iter());
     }
 
     fn flush_batch(
         map: &RwLock<BTreeMap<u64, SpanRecord>>,
         capacity: usize,
-        batch: &mut Vec<SpanRecord>,
+        batch: impl ExactSizeIterator<Item = SpanRecord>,
     ) {
-        if batch.is_empty() {
+        if batch.len() == 0 {
             return;
         }
         // Only closed spans are ever sent to the driver, so all entries in the
         // map are already closed — pop_first() always evicts a finished span.
         let mut m = map.write().unwrap();
-        for record in batch.drain(..) {
-            if m.len() >= capacity {
+        if capacity <= batch.len() {
+            m.clear();
+        } else {
+            while capacity < m.len() + batch.len() {
                 m.pop_first();
             }
-            m.insert(record.id, record);
         }
+        let skip = batch.len().saturating_sub(capacity);
+        m.extend(batch.skip(skip).map(|s| (s.id, s)));
     }
 }
 
