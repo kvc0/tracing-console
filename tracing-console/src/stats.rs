@@ -218,16 +218,14 @@ impl StatsAccumulator {
             return;
         }
 
-        // Sort rows by stack name for stable output.
+        // Sort rows by stack so that DFS-order siblings are adjacent —
+        // tree-prefix rendering relies on this.
         let mut rows: Vec<(Vec<String>, StackStats)> = by_stack.into_iter().collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let stack_width = rows
-            .iter()
-            .map(|(s, _)| stack_label(s).chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(20);
+        // Pre-compute one tree-shaped label per row.
+        let labels: Vec<String> = (0..rows.len()).map(|i| tree_label(&rows, i)).collect();
+        let stack_width = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(20);
 
         println!(
             "  {stack:<sw$}  {n:>7}  │ {tlbl:^25} │ {slbl:^25}",
@@ -237,10 +235,10 @@ impl StatsAccumulator {
             slbl = "self  (min · avg · max)",
             sw = stack_width,
         );
-        for (stack, st) in &rows {
+        for (i, (_stack, st)) in rows.iter().enumerate() {
             println!(
                 "  {label:<sw$}  {n:>7}  │ {tmin:>7} {tavg:>7} {tmax:>7} │ {smin:>7} {savg:>7} {smax:>7}",
-                label = stack_label(stack),
+                label = labels[i],
                 n = st.count,
                 tmin = fmt_ns(st.total_min_ns),
                 tavg = fmt_ns((st.total_sum_ns / st.count as u128) as u64),
@@ -279,8 +277,62 @@ impl StatsAccumulator {
     }
 }
 
-fn stack_label(stack: &[String]) -> String {
-    stack.join("/")
+/// Render row `i`'s leaf with a Unicode tree prefix derived from its
+/// neighbours in the (DFS-sorted) row list.  Roots have no prefix; every
+/// other row gets one prefix segment per ancestor depth.
+fn tree_label(rows: &[(Vec<String>, StackStats)], i: usize) -> String {
+    let stack = &rows[i].0;
+    let n = stack.len();
+    if n == 0 {
+        return String::new();
+    }
+    if n == 1 {
+        return stack[0].clone();
+    }
+    let mut prefix = String::with_capacity(3 * (n - 1));
+    for d in 2..=n {
+        let has_sibling = has_sibling_after(rows, i, d);
+        if d < n {
+            prefix.push_str(if has_sibling { "│  " } else { "   " });
+        } else {
+            prefix.push_str(if has_sibling { "├─ " } else { "└─ " });
+        }
+    }
+    prefix.push_str(&stack[n - 1]);
+    prefix
+}
+
+/// Is there a row after `i` whose path matches `rows[i].0[..d-1]` and
+/// differs at index `d-1`?  In other words, does the ancestor at depth
+/// `d-1` (1-indexed) have a sibling that comes after this row?
+fn has_sibling_after(rows: &[(Vec<String>, StackStats)], i: usize, d: usize) -> bool {
+    let s = &rows[i].0;
+    if d == 0 || d > s.len() {
+        return false;
+    }
+    let prefix_len = d - 1;
+    let prefix = &s[..prefix_len];
+    let needle = &s[d - 1];
+    for (_, sj) in rows.iter().enumerate().skip(i + 1).map(|(j, r)| (j, &r.0)) {
+        // Sort order guarantees: once a row's `prefix_len` slice doesn't
+        // match `prefix`, no later row will either (we've left this
+        // ancestor's subtree).
+        if sj.len() < prefix_len {
+            return false;
+        }
+        if &sj[..prefix_len] != prefix {
+            return false;
+        }
+        if sj.len() < d {
+            // sj is the parent itself — not a sibling at depth d-1.
+            // Stack uniqueness prevents this from re-occurring, but be safe.
+            continue;
+        }
+        if &sj[d - 1] != needle {
+            return true;
+        }
+    }
+    false
 }
 
 fn fmt_ns(ns: u64) -> String {
