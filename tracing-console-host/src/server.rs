@@ -28,7 +28,17 @@ type ServerCodec = (
 // `STREAM_BATCH` is the per-page cap fed to `cache.page()`; it must exceed
 // the target so observed counts above target signal a real backlog.
 const STREAM_POLL_INTERVAL_INITIAL: Duration = Duration::from_millis(50);
-const STREAM_BATCH: usize = 256;
+// Per-poll page cap.  Sets the maximum throughput the loop can move per
+// tick — at high arrival rates the adaptive interval bottoms out near
+// the timer granularity (~1 ms on macOS, ~10–100 µs on Linux), so the
+// per-tick cap times the timer rate is the throughput ceiling.  Set big
+// enough that a single tick can drain the typical inter-tick backlog.
+const STREAM_BATCH: usize = 4096;
+// Target spans per poll.  Adaptive controller scales the interval to
+// keep observed batch ≈ target — small target = low visibility latency
+// at typical loads.  Under sustained overload the interval bottoms out
+// at `STREAM_MIN_INTERVAL` and the per-tick `STREAM_BATCH` cap takes
+// over as the throughput limit.
 const STREAM_TARGET_BATCH: usize = 10;
 const STREAM_MIN_INTERVAL: Duration = Duration::from_micros(1);
 const STREAM_MAX_INTERVAL: Duration = Duration::from_millis(250);

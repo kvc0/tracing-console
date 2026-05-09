@@ -16,6 +16,7 @@
 //! once this skeleton is happy.
 
 mod model;
+mod stats;
 
 use std::io::Stdout;
 use std::time::Duration;
@@ -54,30 +55,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move { run_network(args.addr, tx).await });
     }
 
-    if args.dump_states {
-        run_states(rx).await
-    } else {
-        run_tui(tx, rx).await
+    match args.mode {
+        Mode::States => run_states(rx).await,
+        Mode::Stats(hz) => stats::run_stats(rx, hz).await,
+        Mode::Tui => run_tui(tx, rx).await,
     }
+}
+
+enum Mode {
+    Tui,
+    States,
+    Stats(f64),
 }
 
 // ── argv ─────────────────────────────────────────────────────────────────────
 
 struct Args {
     addr: std::net::SocketAddr,
-    /// Hidden flag: skip TUI and instead print every Update as JSON to stdout.
-    /// Used by integration tests that assert on the model's update stream
-    /// without running a terminal.
-    dump_states: bool,
+    mode: Mode,
 }
 
 impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Self {
         let mut addr_arg: Option<String> = None;
-        let mut dump_states = false;
-        for a in args {
+        let mut mode = Mode::Tui;
+        let mut iter = args.peekable();
+        while let Some(a) = iter.next() {
             match a.as_str() {
-                "--states" => dump_states = true,
+                "--states" => mode = Mode::States,
+                "--stats" => {
+                    let val = iter.next().unwrap_or_else(|| {
+                        eprintln!("--stats expects a Hz argument (e.g. --stats 1, --stats 0.1)");
+                        std::process::exit(2);
+                    });
+                    let hz: f64 = val.parse().unwrap_or_else(|_| {
+                        eprintln!("--stats: invalid Hz value {val:?}");
+                        std::process::exit(2);
+                    });
+                    if !hz.is_finite() || hz <= 0.0 {
+                        eprintln!("--stats: Hz must be > 0, got {hz}");
+                        std::process::exit(2);
+                    }
+                    mode = Mode::Stats(hz);
+                }
                 other if !other.starts_with("--") => addr_arg = Some(other.to_string()),
                 other => eprintln!("ignoring unknown flag: {other}"),
             }
@@ -86,7 +106,7 @@ impl Args {
         let addr = addr_str
             .parse()
             .unwrap_or_else(|e| panic!("invalid address {addr_str:?}: {e}"));
-        Args { addr, dump_states }
+        Args { addr, mode }
     }
 }
 

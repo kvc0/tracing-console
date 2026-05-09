@@ -27,3 +27,6 @@ tracing-futures                 = { version = "0.2" }
 
 [profile.bench]
 debug = "line-tables-only"
+
+[profile.release]
+debug = "line-tables-only"
