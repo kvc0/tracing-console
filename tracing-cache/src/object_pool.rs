@@ -1,19 +1,23 @@
 //! Per-type buffer pool with try-only locking semantics.
 //!
-//! [`ObjectPool`] holds N shards (`Vec<Arc<Pool<T>>>`); the hot path picks
-//! a shard via the same per-thread key the rest of the cache uses, then
-//! attempts to pop a pre-reset `T` from that shard's `Mutex<Vec<T>>`.  If
-//! the `try_lock` fails (another thread is currently mid-acquire or
-//! mid-return on that shard), we don't wait — we allocate a fresh
-//! `T::default()` and mark the resulting [`ReuseRef`] as *unattached*.
+//! [`ObjectPool`] holds N shards (`Vec<Arc<Pool<T>>>`); the hot path
+//! picks a shard via the same per-thread key the rest of the cache
+//! uses, then attempts to pop a pre-reset `Box<T>` from that shard's
+//! `Mutex<Vec<Box<T>>>`.
+//!
+//! The pool starts **empty**.  It grows under load:
+//!   * acquire: `try_lock` the shard.  Success → pop the next ready
+//!     box; or, if the shard is empty, allocate `Box::new(T::default())`.
+//!     `try_lock` fail (contended) → still allocate a fresh box.
+//!   * Every `ReuseRef` is attached to its source shard regardless of
+//!     whether the acquire try-lock succeeded.  On drop the ref tries
+//!     to hand its box back; that's how the pool fills up.
 //!
 //! On `ReuseRef::drop`:
-//!   * If the ref is unattached, drop the boxed value.
-//!   * Otherwise try-lock the source shard.  On success, if there's
-//!     room (`len < capacity`), `reset()` the value and push it back.
-//!     If the shard is full or `try_lock` fails, drop the value.
+//!   * `try_lock` the source shard.  Success + room (`len < capacity`)
+//!     → `reset()` and push back.  Full or contended → drop the box.
 //!
-//! Every step is bounded: no thread ever blocks on the pool's lock.
+//! No thread ever blocks on the pool's lock.
 
 use std::sync::{Arc, Mutex};
 
@@ -37,25 +41,26 @@ pub struct Pool<T: Resettable + Default + Send + 'static> {
 impl<T: Resettable + Default + Send + 'static> Pool<T> {
     fn new(capacity: usize) -> Self {
         Self {
-            items: Mutex::new(Vec::with_capacity(capacity.min(64))),
+            // Don't pre-allocate.  The pool grows from empty as
+            // ReuseRefs drop and hand boxes back.
+            items: Mutex::new(Vec::new()),
             capacity,
         }
     }
 
-    /// Try to take a ready boxed item.  Returns `(boxed, attached)` —
-    /// `attached` is `true` if we successfully interacted with this
-    /// shard's lock (so the resulting `ReuseRef` should try to return
-    /// on drop).  If `try_lock` failed we allocate a fresh
-    /// `Box<T::default()>` and mark the ref as unattached so its drop
-    /// doesn't bounce off this shard.
-    fn try_take(self: &Arc<Self>) -> (Box<T>, bool) {
-        match self.items.try_lock() {
-            Ok(mut guard) => match guard.pop() {
-                Some(b) => (b, true),
-                None => (Box::new(T::default()), true),
-            },
-            Err(_) => (Box::new(T::default()), false),
+    /// Try to take a ready boxed item.  Always returns a `Box<T>` —
+    /// pops from the shard if its `try_lock` succeeds and an item is
+    /// available, otherwise allocates `Box::new(T::default())`.  In
+    /// either case the resulting `ReuseRef` is attached and will
+    /// attempt to hand the box back on drop, which is how the pool
+    /// grows.
+    fn try_take(self: &Arc<Self>) -> Box<T> {
+        if let Ok(mut guard) = self.items.try_lock() {
+            if let Some(b) = guard.pop() {
+                return b;
+            }
         }
+        Box::new(T::default())
     }
 
     /// Push a (reset) boxed value back into the shard, dropping it if
@@ -95,42 +100,33 @@ impl<T: Resettable + Default + Send + 'static> ObjectPool<T> {
     }
 
     /// Acquire a `ReuseRef<T>` from this thread's shard.  Always
-    /// succeeds — falls back to `Box::new(T::default())` if the shard
-    /// is contended (in which case the resulting ref is unattached and
-    /// will drop directly rather than try the pool again).
+    /// succeeds; if the shard is empty or its `try_lock` is contended,
+    /// falls back to `Box::new(T::default())`.  Either way the ref is
+    /// attached to the shard — on drop it will try to hand the box
+    /// back, which is how the pool grows.
     pub fn acquire(&self) -> ReuseRef<T> {
         let key = ensure_thread_shard_key();
         let shard = &self.shards[(key & self.shard_mask) as usize];
-        let (boxed, attached) = shard.try_take();
+        let boxed = shard.try_take();
         ReuseRef {
             value: Some(boxed),
-            pool: if attached { Some(Arc::clone(shard)) } else { None },
+            pool: Arc::clone(shard),
         }
     }
 }
 
 /// A pool-backed owned reference.  `Deref` / `DerefMut` give access to
-/// the inner `T`; on drop the value is reset and returned to the source
-/// shard if possible, otherwise dropped.
+/// the inner `T`; on drop the value is reset and handed back to the
+/// source shard if room is available and `try_lock` succeeds —
+/// otherwise dropped.
 ///
-/// `Clone` allocates a fresh standalone copy (not pool-attached) so that
-/// external clones via `cache.get_span()` etc. don't muddy the pool's
-/// ownership.  Hot-path insertion and pipeline transit pay no clone.
+/// `Clone` allocates a fresh box backed by the same shard.  External
+/// clones (e.g. `cache.get_span()`) pay one heap allocation; the clone
+/// hands its box back into the same pool on drop, just like the
+/// original.
 pub struct ReuseRef<T: Resettable + Default + Send + 'static> {
     value: Option<Box<T>>,
-    /// `Some` only if the acquire's `try_lock` succeeded — we'll try to
-    /// return to this shard on drop.  `None` means "unattached", drop
-    /// the value directly.
-    pool: Option<Arc<Pool<T>>>,
-}
-
-impl<T: Resettable + Default + Send + 'static> ReuseRef<T> {
-    /// Standalone (not pool-attached) wrapper around a default-constructed
-    /// `T`.  Useful for tests and for cloning paths that don't have a pool
-    /// handle in scope.
-    pub fn standalone() -> Self {
-        Self { value: Some(Box::new(T::default())), pool: None }
-    }
+    pool: Arc<Pool<T>>,
 }
 
 impl<T: Resettable + Default + Send + 'static> std::ops::Deref for ReuseRef<T> {
@@ -152,13 +148,13 @@ impl<T: Resettable + Default + Send + 'static> std::ops::DerefMut for ReuseRef<T
 
 impl<T: Resettable + Default + Send + 'static + Clone> Clone for ReuseRef<T> {
     fn clone(&self) -> Self {
-        // External clones don't take from the pool — they hand out a
-        // standalone Box that just gets dropped at end of life.  This
-        // preserves the invariant that each pool-attached value is
-        // owned by exactly one ReuseRef.
+        // Allocate a fresh box for the clone; share the source shard.
+        // On drop the clone tries to hand its box back the same way as
+        // any other acquire — that's how clones round-trip through the
+        // pool just like fresh acquires under contention.
         ReuseRef {
             value: Some(Box::new((**self).clone())),
-            pool: None,
+            pool: Arc::clone(&self.pool),
         }
     }
 }
@@ -166,9 +162,8 @@ impl<T: Resettable + Default + Send + 'static + Clone> Clone for ReuseRef<T> {
 impl<T: Resettable + Default + Send + 'static> Drop for ReuseRef<T> {
     fn drop(&mut self) {
         let Some(mut boxed) = self.value.take() else { return };
-        let Some(pool) = self.pool.take() else { return };
         boxed.reset();
-        pool.try_return(boxed);
+        self.pool.try_return(boxed);
     }
 }
 
@@ -210,6 +205,21 @@ mod tests {
     }
 
     #[test]
+    fn pool_starts_empty_and_grows() {
+        // Fresh pool: items vec is empty until something gets returned.
+        let pool = ObjectPool::<Buf>::new(1, 4);
+        let shard = &pool.shards[0];
+        assert_eq!(shard.items.lock().unwrap().len(), 0);
+
+        {
+            let mut r = pool.acquire();
+            r.bytes.extend_from_slice(b"x");
+        }
+        // After one acquire/drop the shard has exactly one entry.
+        assert_eq!(shard.items.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn acquire_then_drop_returns_to_shard() {
         let pool = ObjectPool::<Buf>::new(1, 4);
         let counter = Arc::new(AtomicUsize::new(0));
@@ -219,7 +229,7 @@ mod tests {
             r.bytes.extend_from_slice(b"hello");
             assert_eq!(r.bytes, b"hello");
         }
-        // First drop returned to the shard — no Buf dropped.
+        // Box was returned — no Buf dropped.
         assert_eq!(counter.load(Ordering::Relaxed), 0);
         // Re-acquiring should hand back the same allocation (cleared).
         let r = pool.acquire();
@@ -240,19 +250,21 @@ mod tests {
     }
 
     #[test]
-    fn unattached_drops_directly() {
-        // Build a Pool, grab its lock with `lock()`, then try_take while
-        // the lock is held — should return an unattached value.
-        let pool = Arc::new(Pool::<Buf>::new(4));
-        let _guard = pool.items.lock().unwrap();
-        let (value, attached) = pool.try_take();
-        assert!(!attached);
-        drop(value);
-    }
-
-    #[test]
-    fn standalone_does_not_touch_pool() {
-        let r: ReuseRef<Buf> = ReuseRef::standalone();
+    fn contended_acquire_still_returns_on_drop() {
+        // Hold the shard's lock; an acquire while contended should
+        // still produce a working ReuseRef (allocated on the fly),
+        // and dropping it (after the lock is released) should add it
+        // to the shard, growing the pool.
+        let pool = ObjectPool::<Buf>::new(1, 4);
+        let shard = Arc::clone(&pool.shards[0]);
+        let r;
+        {
+            let _guard = shard.items.lock().unwrap();
+            r = pool.acquire();
+            // Lock guard drops here; r is still alive.
+        }
+        // Drop r now that lock is free — should add to pool.
         drop(r);
+        assert_eq!(shard.items.lock().unwrap().len(), 1);
     }
 }
