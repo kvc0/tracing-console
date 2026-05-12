@@ -1,12 +1,12 @@
 //! Thread-local state used on the subscriber hot path.
 //!
-//! SAFETY rationale for `SPAN_STACK`, `PENDING`, and `THREAD_SENDER` using
-//! `UnsafeCell` rather than `RefCell`: every access goes through one of
-//! the helpers below, each of which constructs a temporary `&` or `&mut`
-//! to the inner Vec / Option for a single leaf operation (push / pop /
-//! drain / read len) and lets it die before the helper returns.  No
-//! subscriber-method dispatch happens while one of these references is
-//! alive:
+//! SAFETY rationale for `SPAN_STACK`, `PENDING_*`, and `THREAD_SENDERS`
+//! using `UnsafeCell` rather than `RefCell`: every access goes through
+//! one of the helpers below, each of which constructs a temporary `&`
+//! or `&mut` to the inner Vec / Option for a single leaf operation
+//! (push / pop / drain / read len) and lets it die before the helper
+//! returns.  No subscriber-method dispatch happens while one of these
+//! references is alive:
 //!
 //! * push / pop / last-copy do no callbacks at all.
 //! * `pending_drain` calls `spillway::Sender::send_many` — that's a
@@ -19,7 +19,8 @@
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use crate::driver::DriverMsg;
+use crate::driver::EventMessage;
+use crate::record::SpanRecord;
 
 /// Number of `actual_id`s a thread reserves in a single bump of the
 /// per-cache `id_high_water` counter.  Power of two so the in-batch
@@ -47,17 +48,27 @@ pub(crate) struct StackedSpan {
     pub actual_id: u64,
 }
 
+/// Per-thread cache of spillway sender clones, keyed by the source
+/// cache's address.  Holds both senders (span + event) so a thread
+/// switching between caches re-clones both atomically.
+pub(crate) struct ThreadSenders {
+    pub(crate) cache_addr: usize,
+    pub(crate) span: spillway::Sender<SpanRecord>,
+    pub(crate) event: spillway::Sender<EventMessage>,
+}
+
 thread_local! {
     /// Active span entries on this thread.  DISABLED entries carry
     /// `tracing_id = DISABLED, actual_id = 0`.
     pub(crate) static SPAN_STACK: UnsafeCell<Vec<StackedSpan>> =
         const { UnsafeCell::new(Vec::new()) };
 
-    /// Closed spans + emitted events waiting to be sent to the driver
-    /// via spillway.  The unified `DriverMsg` lets `try_close` and
-    /// `event` share one batch path; the driver attaches events to
-    /// their parent span on receipt.
-    pub(crate) static PENDING: UnsafeCell<Vec<DriverMsg>> =
+    /// Closed spans waiting to be sent to the driver's span channel.
+    pub(crate) static PENDING_SPAN: UnsafeCell<Vec<SpanRecord>> =
+        const { UnsafeCell::new(Vec::new()) };
+
+    /// Emitted events waiting to be sent to the driver's event channel.
+    pub(crate) static PENDING_EVENT: UnsafeCell<Vec<EventMessage>> =
         const { UnsafeCell::new(Vec::new()) };
 
     /// Stable per-thread shard key, lazily assigned from `NEXT_THREAD_KEY`
@@ -68,14 +79,13 @@ thread_local! {
     /// can't realistically reach it).
     pub(crate) static THREAD_SHARD_KEY: Cell<u64> = const { Cell::new(u64::MAX) };
 
-    /// Per-thread `spillway::Sender` clone, lazily initialised on first
+    /// Per-thread spillway sender clones, lazily initialised on first
     /// `flush_pending`.  Spillway's design is per-clone-lock-free: each
     /// `Sender::clone()` gets its own queue slot, so threads pushing to
-    /// their own clone do not contend on spillway's internal mutex.  We
-    /// stash the source-cache's sender address alongside the clone so a
-    /// thread that switches between two `SpanCache` instances notices the
-    /// switch and re-clones.
-    pub(crate) static THREAD_SENDER: UnsafeCell<Option<(usize, spillway::Sender<DriverMsg>)>>
+    /// their own clone do not contend on spillway's internal mutex.
+    /// `cache_addr` lets a thread that switches between two `SpanCache`
+    /// instances notice the switch and re-clone both senders.
+    pub(crate) static THREAD_SENDERS: UnsafeCell<Option<ThreadSenders>>
         = const { UnsafeCell::new(None) };
 
     /// Per-thread `actual_id` cursor: the next id to hand out from the
@@ -108,23 +118,40 @@ pub(crate) fn stack_pop() {
     });
 }
 
-/// Push a driver message (closed span or emitted event) onto PENDING
-/// and return the new length.
+/// Push a closed span onto the span PENDING buffer; return the new length.
 #[inline]
-pub(crate) fn pending_push(msg: DriverMsg) -> usize {
-    PENDING.with(|c| unsafe {
+pub(crate) fn pending_push_span(record: SpanRecord) -> usize {
+    PENDING_SPAN.with(|c| unsafe {
+        let v = &mut *c.get();
+        v.push(record);
+        v.len()
+    })
+}
+
+/// Push an emitted event onto the event PENDING buffer; return the new length.
+#[inline]
+pub(crate) fn pending_push_event(msg: EventMessage) -> usize {
+    PENDING_EVENT.with(|c| unsafe {
         let v = &mut *c.get();
         v.push(msg);
         v.len()
     })
 }
 
-/// Drain PENDING in place (preserving the Vec's capacity), invoking `f`
-/// once with the resulting `Drain` iterator.  `f` must not call back
-/// into tracing on this thread.
+/// Drain PENDING_SPAN in place, invoking `f` once with the resulting
+/// `Drain` iterator.  `f` must not call back into tracing on this thread.
 #[inline]
-pub(crate) fn pending_drain<F: FnMut(std::vec::Drain<'_, DriverMsg>)>(mut f: F) {
-    PENDING.with(|c| unsafe {
+pub(crate) fn pending_drain_spans<F: FnMut(std::vec::Drain<'_, SpanRecord>)>(mut f: F) {
+    PENDING_SPAN.with(|c| unsafe {
+        f((*c.get()).drain(..));
+    });
+}
+
+/// Drain PENDING_EVENT in place, invoking `f` once with the resulting
+/// `Drain` iterator.
+#[inline]
+pub(crate) fn pending_drain_events<F: FnMut(std::vec::Drain<'_, EventMessage>)>(mut f: F) {
+    PENDING_EVENT.with(|c| unsafe {
         f((*c.get()).drain(..));
     });
 }

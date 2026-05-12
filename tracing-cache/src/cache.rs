@@ -17,14 +17,15 @@ use tracing::metadata::LevelFilter;
 use tracing::{Level, Metadata};
 
 use crate::config::CacheConfig;
-use crate::driver::{Driver, DriverMsg};
+use crate::driver::{Driver, EventMessage};
 use crate::id_encoding::{disabled_id, id_to_u64, u64_to_id, DISABLED, SLAB_OFFSET};
 use crate::object_pool::ObjectPool;
 use crate::predicate::{EnabledPredicate, Interest, LevelPredicate};
 use crate::record::{EventRecord, FieldList, FieldVisitor, SpanRecord};
 use crate::thread_state::{
-    ensure_thread_shard_key, pending_drain, pending_push, stack_pop, stack_push, stack_top,
-    StackedSpan, ID_BATCH, ID_CURSOR, THREAD_SENDER,
+    ensure_thread_shard_key, pending_drain_events, pending_drain_spans, pending_push_event,
+    pending_push_span, stack_pop, stack_push, stack_top, StackedSpan, ThreadSenders, ID_BATCH,
+    ID_CURSOR, THREAD_SENDERS,
 };
 
 /// One slab shard plus a parallel sidecar of `actual_id`s that's readable
@@ -73,7 +74,8 @@ pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
     /// Per-shard capacity.  Total open-span budget is
     /// `shard_capacity * lane_count`.
     pub(crate) shard_capacity: usize,
-    pub(crate) sender: spillway::Sender<DriverMsg>,
+    pub(crate) span_sender: spillway::Sender<SpanRecord>,
+    pub(crate) event_sender: spillway::Sender<EventMessage>,
     pub(crate) pending_batch: usize,
     pub(crate) shard_mask: u64,  // lane_count - 1
     pub(crate) shard_shift: u32, // 64 - log2(lane_count); shard at top of id
@@ -118,7 +120,8 @@ impl<P: EnabledPredicate> SpanCache<P> {
         // is well-defined even when lane_count == 1.
         let shard_shift = 64 - shard_bits.max(1);
 
-        let (sender, receiver) = spillway::channel();
+        let (span_sender, span_receiver) = spillway::channel();
+        let (event_sender, event_receiver) = spillway::channel();
         let map = Arc::new(RwLock::new(BTreeMap::new()));
         let shard_capacity = capacity.div_ceil(lane_count);
         let in_flight: Box<[ShardLane]> = (0..lane_count)
@@ -148,7 +151,8 @@ impl<P: EnabledPredicate> SpanCache<P> {
             id_high_water: AtomicU64::new(ID_BATCH),
             predicate,
             shard_capacity,
-            sender,
+            span_sender,
+            event_sender,
             pending_batch: config.pending_batch,
             shard_mask,
             shard_shift,
@@ -156,7 +160,8 @@ impl<P: EnabledPredicate> SpanCache<P> {
         };
         let driver = Driver {
             map,
-            receiver,
+            span_receiver,
+            event_receiver,
             capacity,
             batch_size: config.driver_batch,
             tick_interval: config.driver_interval,
@@ -256,24 +261,39 @@ impl<P: EnabledPredicate> SpanCache<P> {
         }
     }
 
-    /// Drains the calling thread's PENDING buffer into the spillway
-    /// channel.  Must be called before [`Driver::drain_sync`] in tests
-    /// to ensure all recently-closed spans are delivered.
+    /// Drains the calling thread's two PENDING buffers (spans + events)
+    /// into their respective spillway channels.  Must be called before
+    /// [`Driver::drain_sync`] in tests to ensure all recently-closed
+    /// spans and emitted events are delivered.
     pub fn flush_pending(&self) {
-        THREAD_SENDER.with(|sc| {
+        THREAD_SENDERS.with(|sc| {
             // SAFETY: cell is thread-local and we only hold the &mut for
             // the duration of this closure; nothing inside re-enters
-            // THREAD_SENDER.
+            // THREAD_SENDERS.
             let slot = unsafe { &mut *sc.get() };
-            let sender_ptr = &self.sender as *const _ as usize;
-            let needs_init = !matches!(slot, Some((p, _)) if *p == sender_ptr);
+            let cache_addr = self as *const _ as usize;
+            let needs_init = !matches!(slot, Some(t) if t.cache_addr == cache_addr);
             if needs_init {
-                *slot = Some((sender_ptr, self.sender.clone()));
+                *slot = Some(ThreadSenders {
+                    cache_addr,
+                    span: self.span_sender.clone(),
+                    event: self.event_sender.clone(),
+                });
             }
             // SAFETY: `slot` was just guaranteed to be `Some`.
-            let sender = unsafe { &slot.as_ref().unwrap_unchecked().1 };
-            pending_drain(|records| {
-                let _ = sender.send_many(records);
+            let senders = unsafe { slot.as_ref().unwrap_unchecked() };
+            // Avoid send_many on empty drains — spillway's chute
+            // invariant rejects sender clones that publish without
+            // having ever held content.
+            pending_drain_events(|events| {
+                if events.len() > 0 {
+                    let _ = senders.event.send_many(events);
+                }
+            });
+            pending_drain_spans(|spans| {
+                if spans.len() > 0 {
+                    let _ = senders.span.send_many(spans);
+                }
             });
         });
     }
@@ -432,11 +452,11 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         record.fields.clear();
         event.record(&mut FieldVisitor { fields: &mut record.fields });
 
-        // Hand off to the driver via PENDING — no slab lock here.  The
-        // driver attaches the event to its parent's `events` vec (or
-        // buffers it if the parent hasn't been inserted into the map
-        // yet).
-        if pending_push(DriverMsg::Event { parent_actual_id, record }) >= self.pending_batch {
+        // Hand off to the driver via the event PENDING — no slab lock
+        // here.  The driver attaches to the parent's `events` vec
+        // (directly if the parent's already in the map, or via the
+        // side buffer if the event raced ahead of the span).
+        if pending_push_event(EventMessage { parent_actual_id, record }) >= self.pending_batch {
             self.flush_pending();
         }
     }
@@ -475,7 +495,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
 
         if let Some(record) = record {
-            if pending_push(DriverMsg::Span(record)) >= self.pending_batch {
+            if pending_push_span(record) >= self.pending_batch {
                 self.flush_pending();
             }
             true
