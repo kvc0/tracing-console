@@ -40,11 +40,11 @@ static CACHE: LazyLock<Arc<SpanCache>> = LazyLock::new(|| {
         SpanCache::with_predicate(16384, LevelPredicate::new(Level::INFO));
     let cache = Arc::new(cache);
     std::thread::spawn(|| {
-        tokio::runtime::Builder::new_current_thread()
+        let _ = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap()
-            .block_on(driver.run());
+            .block_on(async move { tokio::spawn(driver.run()).await });
         // it's a bug if the driver exits
         std::process::exit(333);
     });

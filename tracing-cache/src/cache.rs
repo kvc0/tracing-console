@@ -376,21 +376,26 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
         attrs.record(&mut FieldVisitor { fields: &mut record.fields });
 
-        // Step D: pick our shard, capacity-check, insert into the slab,
-        // and publish actual_id into the sidecar (Release) so a future
-        // contextual child sees it via the Acquire load above (or
-        // `enter`'s lookup).
+        // Step D: pick our shard, capacity-check + slab.insert under the
+        // Mutex, then drop the guard before the sidecar store and the
+        // pure-arithmetic id encoding.  The sidecar is a separate atomic
+        // and the Release/Acquire pair on `actual_ids[slab_idx]` is its
+        // own happens-before — nobody can observe this slot until we
+        // return the tracing id below, so the store doesn't need to be
+        // sequenced under the slab Mutex.
         let shard = self.pick_shard();
         let lane = &self.in_flight[shard];
-        let mut slab = lane.slab.lock().unwrap();
-        if slab.len() >= self.shard_capacity {
-            log::warn!(
-                "span shard {shard} full; new span disabled. \
-                 Increase capacity or reduce span rate."
-            );
-            return disabled_id();
-        }
-        let slab_idx = slab.insert(record);
+        let slab_idx = {
+            let mut slab = lane.slab.lock().unwrap();
+            if slab.len() >= self.shard_capacity {
+                log::warn!(
+                    "span shard {shard} full; new span disabled. \
+                     Increase capacity or reduce span rate."
+                );
+                return disabled_id();
+            }
+            slab.insert(record)
+        };
         // The sidecar is sized to `shard_capacity` and indexed by
         // slab_idx, which is bounded by capacity per the check above.
         lane.actual_ids[slab_idx].store(actual_id, Ordering::Release);
@@ -483,18 +488,13 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             None => return false,
         };
 
-        let record = {
-            let mut shard_lock = self.in_flight[shard].slab.lock().unwrap();
-            if shard_lock.contains(slab_idx) {
-                let mut r = shard_lock.remove(slab_idx);
-                r.closed_at = Some(Instant::now());
-                Some(r)
-            } else {
-                None
-            }
-        };
+        // Single slab lookup via `try_remove` (no contains-then-remove
+        // double hash), and `Instant::now()` lives outside the critical
+        // section — only paid on the success path.
+        let record = self.in_flight[shard].slab.lock().unwrap().try_remove(slab_idx);
 
-        if let Some(record) = record {
+        if let Some(mut record) = record {
+            record.closed_at = Some(Instant::now());
             if pending_push_span(record) >= self.pending_batch {
                 self.flush_pending();
             }
