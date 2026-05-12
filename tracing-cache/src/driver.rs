@@ -144,7 +144,11 @@ impl Driver {
             return;
         }
         let mut m = map.write().unwrap();
-        for EventMessage { parent_actual_id, record } in batch {
+        for EventMessage {
+            parent_actual_id,
+            record,
+        } in batch
+        {
             if let Some(span) = m.get_mut(&parent_actual_id) {
                 span.events.push(record);
             } else if side_events.len() < capacity {

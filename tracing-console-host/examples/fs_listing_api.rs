@@ -100,7 +100,9 @@ fn walk_body(path: &Path) {
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let p = entry.path();
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if file_type.is_dir() {
             walk_recursive(&p);
         } else if file_type.is_file() {

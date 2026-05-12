@@ -26,7 +26,9 @@ fn field_to_wire(value: &FieldValue) -> WireFieldValue {
 pub struct TimeBase(pub Instant);
 
 impl TimeBase {
-    pub fn now() -> Self { Self(Instant::now()) }
+    pub fn now() -> Self {
+        Self(Instant::now())
+    }
 
     fn ns(self, t: Instant) -> u64 {
         // `Instant` arithmetic saturates at zero — fine: events captured
@@ -48,7 +50,11 @@ pub fn span_to_wire(record: &SpanRecord, base: TimeBase) -> WireSpan {
             .iter()
             .map(|(k, v)| ((*k).to_string(), field_to_wire(v)))
             .collect(),
-        events: record.events.iter().map(|e| event_to_wire(e, base)).collect(),
+        events: record
+            .events
+            .iter()
+            .map(|e| event_to_wire(e, base))
+            .collect(),
         opened_at_ns: base.ns(record.opened_at),
         closed_at_ns: record.closed_at.map(|t| base.ns(t)),
     }

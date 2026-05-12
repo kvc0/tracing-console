@@ -11,14 +11,11 @@ use protosocket_rpc::server::{ConnectionService, RpcResponder, SocketRpcServer, 
 use tracing_cache::{EnabledPredicate, SpanCache, SpanRecord};
 
 use crate::protocol::{Request, RequestBody, Response, WireLevel};
-use crate::wire::{span_to_wire, TimeBase};
+use crate::wire::{TimeBase, span_to_wire};
 
 // One messagepack frame per direction:
 //   server reads `Request`, writes `Response`.
-type ServerCodec = (
-    MessagePackSerializer<Response>,
-    MessagePackDecoder<Request>,
-);
+type ServerCodec = (MessagePackSerializer<Response>, MessagePackDecoder<Request>);
 
 // Tunables — kept inline since this is the only place they're used.
 //
@@ -283,7 +280,10 @@ impl<P: EnabledPredicate> SocketService for Service<P> {
     type SocketListener = TcpSocketListener;
 
     fn codec(&self) -> Self::Codec {
-        (MessagePackSerializer::default(), MessagePackDecoder::default())
+        (
+            MessagePackSerializer::default(),
+            MessagePackDecoder::default(),
+        )
     }
 
     fn new_stream_service(
@@ -310,10 +310,14 @@ impl std::fmt::Display for ServeError {
 }
 impl std::error::Error for ServeError {}
 impl From<std::io::Error> for ServeError {
-    fn from(e: std::io::Error) -> Self { ServeError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        ServeError::Io(e)
+    }
 }
 impl From<protosocket_rpc::Error> for ServeError {
-    fn from(e: protosocket_rpc::Error) -> Self { ServeError::Rpc(e) }
+    fn from(e: protosocket_rpc::Error) -> Self {
+        ServeError::Rpc(e)
+    }
 }
 
 /// Bind to `addr` and serve the console RPC protocol against `cache`.
@@ -327,7 +331,10 @@ pub async fn serve<P: EnabledPredicate>(
     // listen(addr, listen_backlog, accept_timeout) — last two are optional knobs.
     let listener = TcpSocketListener::listen(addr, 1024, None)?;
 
-    let service = Service { cache, base: TimeBase::now() };
+    let service = Service {
+        cache,
+        base: TimeBase::now(),
+    };
     let server: SocketRpcServer<Service<P>, _> = SocketRpcServer::new(
         listener,
         service,
@@ -467,8 +474,7 @@ mod tests {
 
     async fn connect_client(addr: SocketAddr) -> RpcClient<Request, Response> {
         let cfg = Configuration::new(TcpStreamConnector);
-        let (rpc_client, conn) =
-            client::connect::<ClientCodec, _>(addr, &cfg).await.unwrap();
+        let (rpc_client, conn) = client::connect::<ClientCodec, _>(addr, &cfg).await.unwrap();
         // Drive the connection's I/O loop in the background.
         tokio::spawn(conn);
         rpc_client
@@ -510,7 +516,9 @@ mod tests {
 
         let (addr, server) = spawn_server(Arc::clone(&cache)).await;
         let client = connect_client(addr).await;
-        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+        let mut stream = client
+            .send_streaming(Request::new(RequestBody::StartStream))
+            .unwrap();
 
         let received = collect_spans(&mut stream, 3, Duration::from_secs(2)).await;
         assert_eq!(received.len(), 3);
@@ -532,7 +540,9 @@ mod tests {
 
         let (addr, server) = spawn_server(Arc::clone(&cache)).await;
         let client = connect_client(addr).await;
-        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+        let mut stream = client
+            .send_streaming(Request::new(RequestBody::StartStream))
+            .unwrap();
 
         // Drain at least one span so we know streaming is live.
         let initial = collect_spans(&mut stream, 1, Duration::from_secs(2)).await;
@@ -581,7 +591,9 @@ mod tests {
             .unwrap();
         assert!(matches!(ack.body, ResponseBody::Ack));
 
-        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+        let mut stream = client
+            .send_streaming(Request::new(RequestBody::StartStream))
+            .unwrap();
         let received = collect_spans(&mut stream, 5, Duration::from_millis(500)).await;
 
         let names: Vec<_> = received.iter().map(|s| s.name.as_str()).collect();
@@ -607,10 +619,15 @@ mod tests {
             .unwrap()
             .await
             .unwrap();
-        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+        let mut stream = client
+            .send_streaming(Request::new(RequestBody::StartStream))
+            .unwrap();
 
         let received = collect_spans(&mut stream, 5, Duration::from_millis(400)).await;
-        assert!(received.is_empty(), "rate=0 should drop everything; got {received:?}");
+        assert!(
+            received.is_empty(),
+            "rate=0 should drop everything; got {received:?}"
+        );
 
         server.abort();
     }
@@ -635,11 +652,15 @@ mod tests {
         let client = connect_client(addr).await;
 
         client
-            .send_unary(Request::new(RequestBody::SetFilter(Some("alpha".to_string()))))
+            .send_unary(Request::new(RequestBody::SetFilter(Some(
+                "alpha".to_string(),
+            ))))
             .unwrap()
             .await
             .unwrap();
-        let mut stream = client.send_streaming(Request::new(RequestBody::StartStream)).unwrap();
+        let mut stream = client
+            .send_streaming(Request::new(RequestBody::StartStream))
+            .unwrap();
 
         let received = collect_spans(&mut stream, 4, Duration::from_millis(500)).await;
         let mut names: Vec<_> = received.iter().map(|s| s.name.clone()).collect();

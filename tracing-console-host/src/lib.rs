@@ -13,5 +13,7 @@ pub mod protocol;
 pub mod server;
 pub mod wire;
 
-pub use protocol::{Request, RequestBody, Response, ResponseBody, WireEvent, WireLevel, WireSpan};
+pub use protocol::{
+    Request, RequestBody, Response, ResponseBody, WireEvent, WireFieldValue, WireLevel, WireSpan,
+};
 pub use server::serve;

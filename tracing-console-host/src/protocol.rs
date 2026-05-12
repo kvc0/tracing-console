@@ -161,21 +161,37 @@ pub struct Request {
 
 impl Request {
     pub fn new(body: RequestBody) -> Self {
-        Self { id: 0, control: ProtosocketControlCode::Normal.as_u8(), body }
+        Self {
+            id: 0,
+            control: ProtosocketControlCode::Normal.as_u8(),
+            body,
+        }
     }
 }
 
 impl Message for Request {
-    fn message_id(&self) -> u64 { self.id }
+    fn message_id(&self) -> u64 {
+        self.id
+    }
     fn control_code(&self) -> ProtosocketControlCode {
         ProtosocketControlCode::from_u8(self.control)
     }
-    fn set_message_id(&mut self, id: u64) { self.id = id }
+    fn set_message_id(&mut self, id: u64) {
+        self.id = id
+    }
     fn cancelled(id: u64) -> Self {
-        Self { id, control: ProtosocketControlCode::Cancel.as_u8(), body: RequestBody::Noop }
+        Self {
+            id,
+            control: ProtosocketControlCode::Cancel.as_u8(),
+            body: RequestBody::Noop,
+        }
     }
     fn ended(id: u64) -> Self {
-        Self { id, control: ProtosocketControlCode::End.as_u8(), body: RequestBody::Noop }
+        Self {
+            id,
+            control: ProtosocketControlCode::End.as_u8(),
+            body: RequestBody::Noop,
+        }
     }
 }
 
@@ -203,23 +219,45 @@ pub struct Response {
 
 impl Response {
     pub fn new(body: ResponseBody) -> Self {
-        Self { id: 0, control: ProtosocketControlCode::Normal.as_u8(), body }
+        Self {
+            id: 0,
+            control: ProtosocketControlCode::Normal.as_u8(),
+            body,
+        }
     }
-    pub fn ack() -> Self { Self::new(ResponseBody::Ack) }
-    pub fn error(msg: impl Into<String>) -> Self { Self::new(ResponseBody::Error(msg.into())) }
-    pub fn span(s: WireSpan) -> Self { Self::new(ResponseBody::Span(s)) }
+    pub fn ack() -> Self {
+        Self::new(ResponseBody::Ack)
+    }
+    pub fn error(msg: impl Into<String>) -> Self {
+        Self::new(ResponseBody::Error(msg.into()))
+    }
+    pub fn span(s: WireSpan) -> Self {
+        Self::new(ResponseBody::Span(s))
+    }
 }
 
 impl Message for Response {
-    fn message_id(&self) -> u64 { self.id }
+    fn message_id(&self) -> u64 {
+        self.id
+    }
     fn control_code(&self) -> ProtosocketControlCode {
         ProtosocketControlCode::from_u8(self.control)
     }
-    fn set_message_id(&mut self, id: u64) { self.id = id }
+    fn set_message_id(&mut self, id: u64) {
+        self.id = id
+    }
     fn cancelled(id: u64) -> Self {
-        Self { id, control: ProtosocketControlCode::Cancel.as_u8(), body: ResponseBody::Noop }
+        Self {
+            id,
+            control: ProtosocketControlCode::Cancel.as_u8(),
+            body: ResponseBody::Noop,
+        }
     }
     fn ended(id: u64) -> Self {
-        Self { id, control: ProtosocketControlCode::End.as_u8(), body: ResponseBody::Noop }
+        Self {
+            id,
+            control: ProtosocketControlCode::End.as_u8(),
+            body: ResponseBody::Noop,
+        }
     }
 }

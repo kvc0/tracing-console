@@ -189,7 +189,10 @@ impl tracing::field::Visit for FieldVisitor<'_> {
         // `Str(&'static str)` variant is reserved for synthetic
         // constructions by tests / non-Visit callers that know the
         // lifetime statically.
-        self.set(field.name(), FieldValue::SmallString(CompactString::from(value)));
+        self.set(
+            field.name(),
+            FieldValue::SmallString(CompactString::from(value)),
+        );
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {

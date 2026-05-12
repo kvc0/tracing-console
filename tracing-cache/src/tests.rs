@@ -18,7 +18,9 @@ use crate::record::{EventRecord, FieldValue, SpanRecord};
 
 /// Print the named field of a `SpanRecord` to a `String`, or `None` if absent.
 fn span_field(record: &SpanRecord, name: &str) -> Option<String> {
-    record.field(name).map(|v| v.to_display_string().to_string())
+    record
+        .field(name)
+        .map(|v| v.to_display_string().to_string())
 }
 
 /// Same, for events.
@@ -127,7 +129,11 @@ fn child_of_disabled_is_disabled() {
     let cache = Arc::new(cache_inner);
     tracing::subscriber::with_default(Arc::clone(&cache), || {
         let parent = tracing::span!(parent: None, Level::INFO, "bad_parent");
-        assert_eq!(span_id(&parent), Some(DISABLED), "predicate disables this span");
+        assert_eq!(
+            span_id(&parent),
+            Some(DISABLED),
+            "predicate disables this span"
+        );
         let _g = parent.enter(); // pushes DISABLED onto thread-local stack
         let child = tracing::span!(Level::INFO, "child");
         assert_eq!(child.id(), None, "child of DISABLED is a tracing no-op");
@@ -165,7 +171,10 @@ fn eviction_removes_closed_spans() {
     // in-flight per thread — not what this test wants to verify.
     let (cache, driver) = SpanCache::with_config(
         2,
-        CacheConfig { lane_count: 1, ..CacheConfig::default() },
+        CacheConfig {
+            lane_count: 1,
+            ..CacheConfig::default()
+        },
     );
     let cache = Arc::new(cache);
     let (a, b, c) = run_with_drain(&cache, driver, || {
@@ -213,7 +222,10 @@ fn custom_lane_count_is_respected() {
     // span on that shard is DISABLED.
     let (cache, driver) = SpanCache::with_config(
         4,
-        CacheConfig { lane_count: 4, ..CacheConfig::default() },
+        CacheConfig {
+            lane_count: 4,
+            ..CacheConfig::default()
+        },
     );
     let cache = Arc::new(cache);
     assert_eq!(cache.lane_count(), 4);
@@ -239,7 +251,10 @@ fn separate_threads_get_distinct_keys() {
     // Wide enough that test interleaving doesn't pin everyone on one shard.
     let (cache, driver) = SpanCache::with_config(
         64 * 16,
-        CacheConfig { lane_count: 16, ..CacheConfig::default() },
+        CacheConfig {
+            lane_count: 16,
+            ..CacheConfig::default()
+        },
     );
     let cache = Arc::new(cache);
     let observed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -277,19 +292,22 @@ fn lane_count_is_clamped_and_rounded_to_power_of_two() {
     // Out-of-range / non-power-of-two values are silently normalised to
     // the next power of two within [1, 256].
     let cases = [
-        (0_usize, 1_usize),     // zero → minimum lane count of 1
+        (0_usize, 1_usize), // zero → minimum lane count of 1
         (1, 1),
-        (3, 4),                 // round up
+        (3, 4), // round up
         (5, 8),
-        (16, 16),               // already a power of two
-        (200, 256),             // round up to ceiling
+        (16, 16),   // already a power of two
+        (200, 256), // round up to ceiling
         (256, 256),
-        (1000, 256),            // capped at 256
+        (1000, 256), // capped at 256
     ];
     for (input, expected) in cases {
         let (cache, _driver) = SpanCache::with_config(
             64,
-            CacheConfig { lane_count: input, ..CacheConfig::default() },
+            CacheConfig {
+                lane_count: input,
+                ..CacheConfig::default()
+            },
         );
         assert_eq!(
             cache.lane_count(),
@@ -466,7 +484,10 @@ fn level_predicate_filters_below_threshold() {
         // DEBUG is below the threshold; tracing's macro short-circuits when
         // callsite_enabled returns Never, so the Span has no id.
         let debug_span = tracing::span!(parent: None, Level::DEBUG, "debug_op");
-        assert!(debug_span.id().is_none(), "DEBUG filtered at INFO threshold");
+        assert!(
+            debug_span.id().is_none(),
+            "DEBUG filtered at INFO threshold"
+        );
     });
     drop(driver);
 }
@@ -517,7 +538,10 @@ fn api_handler_lifecycle() {
     assert_eq!(span_field(&request, "path").as_deref(), Some("/users/42"));
     assert_eq!(span_field(&request, "status").as_deref(), Some("200"));
 
-    let validate = pages.iter().find(|s| s.metadata.name() == "validate").unwrap();
+    let validate = pages
+        .iter()
+        .find(|s| s.metadata.name() == "validate")
+        .unwrap();
     assert_eq!(validate.parent_id, Some(request_id));
     assert_eq!(span_field(validate, "ok").as_deref(), Some("true"));
     assert_eq!(validate.events.len(), 1);
@@ -526,7 +550,10 @@ fn api_handler_lifecycle() {
         Some("validation passed"),
     );
 
-    let query = pages.iter().find(|s| s.metadata.name() == "db_query").unwrap();
+    let query = pages
+        .iter()
+        .find(|s| s.metadata.name() == "db_query")
+        .unwrap();
     assert_eq!(query.parent_id, Some(request_id));
     assert_eq!(span_field(query, "table").as_deref(), Some("users"));
     assert_eq!(query.events.len(), 2);
@@ -548,10 +575,10 @@ fn api_handler_lifecycle() {
 #[test]
 fn public_api_reexports_are_reachable() {
     use crate::{
-        CacheConfig as ReexportedConfig, Driver as ReexportedDriver,
+        CacheConfig as ReexportedConfig, DEFAULT_LANE_COUNT, Driver as ReexportedDriver,
         EventRecord as ReexportedEventRecord, Interest as ReexportedInterest,
         LevelPredicate as ReexportedLevelPredicate, SpanCache as ReexportedSpanCache,
-        SpanRecord as ReexportedSpanRecord, DEFAULT_LANE_COUNT,
+        SpanRecord as ReexportedSpanRecord,
     };
     // EnabledPredicate is re-exported (used as an associated trait object in
     // `with_predicate`); the line below confirms it's reachable as a path.
@@ -571,7 +598,8 @@ fn public_api_reexports_are_reachable() {
         actual_id_of(&cache, &s)
     });
     let pages: Vec<ReexportedSpanRecord> = cache.page(0, 4);
-    let _: Option<&ReexportedEventRecord> = pages.first().and_then(|s| s.events.first().map(|e| &**e));
+    let _: Option<&ReexportedEventRecord> =
+        pages.first().and_then(|s| s.events.first().map(|e| &**e));
 }
 
 // ── async overlap test ────────────────────────────────────────────────────
@@ -629,7 +657,10 @@ fn async_instrumented_tasks_with_overlapping_spans() {
 
     let all = cache.page(0, 20);
     assert_eq!(all.len(), 4, "task_a, acquire, task_b, release");
-    assert!(all.iter().all(|s| s.closed_at.is_some()), "all spans must close");
+    assert!(
+        all.iter().all(|s| s.closed_at.is_some()),
+        "all spans must close"
+    );
 
     let find = |name: &str| all.iter().find(|s| s.metadata.name() == name).unwrap();
     let task_a = find("task_a");
@@ -637,8 +668,16 @@ fn async_instrumented_tasks_with_overlapping_spans() {
     let acquire = find("acquire");
     let release = find("release");
 
-    assert_eq!(acquire.parent_id, Some(task_a.id), "acquire is child of task_a");
-    assert_eq!(release.parent_id, Some(task_b.id), "release is child of task_b");
+    assert_eq!(
+        acquire.parent_id,
+        Some(task_a.id),
+        "acquire is child of task_a"
+    );
+    assert_eq!(
+        release.parent_id,
+        Some(task_b.id),
+        "release is child of task_b"
+    );
 
     assert!(
         acquire.opened_at < release.closed_at.unwrap(),

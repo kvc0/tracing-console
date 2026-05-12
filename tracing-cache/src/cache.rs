@@ -18,14 +18,14 @@ use tracing::{Level, Metadata};
 
 use crate::config::CacheConfig;
 use crate::driver::{Driver, EventMessage};
-use crate::id_encoding::{disabled_id, id_to_u64, u64_to_id, DISABLED, SLAB_OFFSET};
+use crate::id_encoding::{DISABLED, SLAB_OFFSET, disabled_id, id_to_u64, u64_to_id};
 use crate::object_pool::ObjectPool;
 use crate::predicate::{EnabledPredicate, Interest, LevelPredicate};
 use crate::record::{EventRecord, FieldList, FieldVisitor, SpanRecord};
 use crate::thread_state::{
-    ensure_thread_shard_key, pending_drain_events, pending_drain_spans, pending_push_event,
-    pending_push_span, stack_pop, stack_push, stack_top, StackedSpan, ThreadSenders, ID_BATCH,
-    ID_CURSOR, THREAD_SENDERS,
+    ID_BATCH, ID_CURSOR, StackedSpan, THREAD_SENDERS, ThreadSenders, ensure_thread_shard_key,
+    pending_drain_events, pending_drain_spans, pending_push_event, pending_push_span, stack_pop,
+    stack_push, stack_top,
 };
 
 /// One slab shard plus a parallel sidecar of `actual_id`s that's readable
@@ -128,14 +128,10 @@ impl<P: EnabledPredicate> SpanCache<P> {
         // Concurrency matches `lane_count` so each lane's threads tend to
         // land on their own chute and contend less with peers (spillway's
         // chute count caps useful per-clone parallelism).
-        let (span_sender, span_receiver) = spillway::channel_with_capacity_and_concurrency(
-            config.channel_capacity,
-            lane_count,
-        );
-        let (event_sender, event_receiver) = spillway::channel_with_capacity_and_concurrency(
-            config.channel_capacity,
-            lane_count,
-        );
+        let (span_sender, span_receiver) =
+            spillway::channel_with_capacity_and_concurrency(config.channel_capacity, lane_count);
+        let (event_sender, event_receiver) =
+            spillway::channel_with_capacity_and_concurrency(config.channel_capacity, lane_count);
         let map = Arc::new(RwLock::new(BTreeMap::new()));
         let shard_capacity = capacity.div_ceil(lane_count);
         let in_flight: Box<[ShardLane]> = (0..lane_count)
@@ -304,23 +300,15 @@ impl<P: EnabledPredicate> SpanCache<P> {
             // returning the EventRecord allocation to the pool).
             pending_drain_events(|events| {
                 if events.len() > 0 {
-                    if let Err(spillway::Error::Full(_dropped)) =
-                        senders.event.send_many(events)
-                    {
-                        log::debug!(
-                            "event channel full; dropping a batch — driver is behind"
-                        );
+                    if let Err(spillway::Error::Full(_dropped)) = senders.event.send_many(events) {
+                        log::debug!("event channel full; dropping a batch — driver is behind");
                     }
                 }
             });
             pending_drain_spans(|spans| {
                 if spans.len() > 0 {
-                    if let Err(spillway::Error::Full(_dropped)) =
-                        senders.span.send_many(spans)
-                    {
-                        log::debug!(
-                            "span channel full; dropping a batch — driver is behind"
-                        );
+                    if let Err(spillway::Error::Full(_dropped)) = senders.span.send_many(spans) {
+                        log::debug!("span channel full; dropping a batch — driver is behind");
                     }
                 }
             });
@@ -403,7 +391,9 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             opened_at: Instant::now(),
             closed_at: None,
         };
-        attrs.record(&mut FieldVisitor { fields: &mut record.fields });
+        attrs.record(&mut FieldVisitor {
+            fields: &mut record.fields,
+        });
 
         // Step D: pick our shard, capacity-check + slab.insert under the
         // Mutex, then drop the guard before the sidecar store and the
@@ -438,16 +428,13 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
         let mut shard_lock = self.in_flight[shard].slab.lock().unwrap();
         if let Some(rec) = shard_lock.get_mut(slab_idx) {
-            values.record(&mut FieldVisitor { fields: &mut rec.fields });
+            values.record(&mut FieldVisitor {
+                fields: &mut rec.fields,
+            });
         }
     }
 
-    fn record_follows_from(
-        &self,
-        _span: &tracing::span::Id,
-        _follows: &tracing::span::Id,
-    ) {
-    }
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
 
     fn event(&self, event: &tracing::Event<'_>) {
         // Resolve the parent's `actual_id` lock-free.  Contextual events
@@ -484,13 +471,19 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         record.metadata = Some(event.metadata());
         record.recorded_at = Some(Instant::now());
         record.fields.clear();
-        event.record(&mut FieldVisitor { fields: &mut record.fields });
+        event.record(&mut FieldVisitor {
+            fields: &mut record.fields,
+        });
 
         // Hand off to the driver via the event PENDING — no slab lock
         // here.  The driver attaches to the parent's `events` vec
         // (directly if the parent's already in the map, or via the
         // side buffer if the event raced ahead of the span).
-        if pending_push_event(EventMessage { parent_actual_id, record }) >= self.pending_batch {
+        if pending_push_event(EventMessage {
+            parent_actual_id,
+            record,
+        }) >= self.pending_batch
+        {
             self.flush_pending();
         }
     }
@@ -504,7 +497,10 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             Some((shard, slab_idx)) => self.load_actual_id(shard, slab_idx),
             None => 0, // DISABLED entry — actual_id is never read.
         };
-        stack_push(StackedSpan { tracing_id, actual_id });
+        stack_push(StackedSpan {
+            tracing_id,
+            actual_id,
+        });
     }
 
     fn exit(&self, _span: &tracing::span::Id) {
@@ -520,7 +516,11 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         // Single slab lookup via `try_remove` (no contains-then-remove
         // double hash), and `Instant::now()` lives outside the critical
         // section — only paid on the success path.
-        let record = self.in_flight[shard].slab.lock().unwrap().try_remove(slab_idx);
+        let record = self.in_flight[shard]
+            .slab
+            .lock()
+            .unwrap()
+            .try_remove(slab_idx);
 
         if let Some(mut record) = record {
             record.closed_at = Some(Instant::now());

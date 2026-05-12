@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Instant;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use tracing::Level;
 use tracing_cache::{LevelPredicate, SpanCache};
 use tracing_futures::Instrument;
@@ -36,8 +36,7 @@ use tracing_futures::Instrument;
 // the tracing fast-path for disabled spans (used by `nested_async/disabled`).
 // Existing benches all use INFO and remain enabled.
 static CACHE: LazyLock<Arc<SpanCache>> = LazyLock::new(|| {
-    let (cache, driver) =
-        SpanCache::with_predicate(16384, LevelPredicate::new(Level::INFO));
+    let (cache, driver) = SpanCache::with_predicate(16384, LevelPredicate::new(Level::INFO));
     let cache = Arc::new(cache);
     std::thread::spawn(|| {
         let _ = tokio::runtime::Builder::new_current_thread()
@@ -80,9 +79,11 @@ fn two_level_spans() {
 /// the root span is already on the thread-local stack and is recorded as its
 /// parent.
 async fn two_level_async_spans() {
-    black_box(async { black_box(()) }
-        .instrument(tracing::span!(Level::INFO, "bench_child"))
-        .await);
+    black_box(
+        async { black_box(()) }
+            .instrument(tracing::span!(Level::INFO, "bench_child"))
+            .await,
+    );
 }
 
 /// One level of the recursive workload.  `tracing::span!` is invoked at call

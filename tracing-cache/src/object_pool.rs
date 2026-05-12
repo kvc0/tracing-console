@@ -95,8 +95,13 @@ impl<T: Resettable + Default + Send + 'static> ObjectPool<T> {
     /// minimum 1), each holding up to `per_shard_capacity` ready items.
     pub fn new(shard_count: usize, per_shard_capacity: usize) -> Arc<Self> {
         let n = shard_count.max(1).next_power_of_two();
-        let shards = (0..n).map(|_| Arc::new(Pool::new(per_shard_capacity))).collect();
-        Arc::new(Self { shards, shard_mask: (n as u64) - 1 })
+        let shards = (0..n)
+            .map(|_| Arc::new(Pool::new(per_shard_capacity)))
+            .collect();
+        Arc::new(Self {
+            shards,
+            shard_mask: (n as u64) - 1,
+        })
     }
 
     /// Acquire a `ReuseRef<T>` from this thread's shard.  Always
@@ -135,14 +140,18 @@ impl<T: Resettable + Default + Send + 'static> std::ops::Deref for ReuseRef<T> {
     fn deref(&self) -> &T {
         // SAFETY: `value` is only ever taken out in `drop`; while the
         // ReuseRef is alive `value` is `Some`.
-        self.value.as_deref().expect("ReuseRef value taken before drop")
+        self.value
+            .as_deref()
+            .expect("ReuseRef value taken before drop")
     }
 }
 
 impl<T: Resettable + Default + Send + 'static> std::ops::DerefMut for ReuseRef<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        self.value.as_deref_mut().expect("ReuseRef value taken before drop")
+        self.value
+            .as_deref_mut()
+            .expect("ReuseRef value taken before drop")
     }
 }
 
@@ -161,7 +170,9 @@ impl<T: Resettable + Default + Send + 'static + Clone> Clone for ReuseRef<T> {
 
 impl<T: Resettable + Default + Send + 'static> Drop for ReuseRef<T> {
     fn drop(&mut self) {
-        let Some(mut boxed) = self.value.take() else { return };
+        let Some(mut boxed) = self.value.take() else {
+            return;
+        };
         boxed.reset();
         self.pool.try_return(boxed);
     }
