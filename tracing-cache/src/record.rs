@@ -3,16 +3,18 @@
 //!
 //! Field capture avoids the per-field `HashMap` + heap-allocated `String`
 //! cost the original layout paid.  Each field is one entry in a
-//! `SmallVec<[(&'static str, FieldValue); 8]>` — spans/events with ≤ 8
-//! fields stay entirely inline.  `FieldValue` is a tagged union of the
-//! types `tracing::field::Visit` actually delivers, so primitive fields
-//! never touch the allocator and `&'static str` literals never copy.
+//! `Vec<(&'static str, FieldValue)>` — a 24-byte header pointing at the
+//! field list on the heap, so `SpanRecord` itself stays small (the
+//! earlier `SmallVec<[..; 8]>` inlined ~330 bytes and made every
+//! pipeline transit of a `SpanRecord` proportionally expensive).
+//! `FieldValue` is a tagged union of the types `tracing::field::Visit`
+//! actually delivers, so primitive fields never touch the allocator and
+//! string variants pay only one heap-allocation per long field.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use compact_str::CompactString;
-use smallvec::SmallVec;
 use tracing::Metadata;
 
 /// Each captured field value.  `Str` keeps a `&'static str` (zero-copy
@@ -79,7 +81,7 @@ impl FieldValue {
 
 /// A field list small enough to keep inline for the typical span.  Spans
 /// or events with > 8 fields spill to the heap.
-pub type FieldList = SmallVec<[(&'static str, FieldValue); 8]>;
+pub type FieldList = Vec<(&'static str, FieldValue)>;
 
 /// Look up a field by name; returns `None` if not present.
 #[inline]

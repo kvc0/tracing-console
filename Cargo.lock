@@ -1420,7 +1420,6 @@ dependencies = [
  "k-cache",
  "log",
  "slab",
- "smallvec",
  "spillway",
  "tokio",
  "tracing",
