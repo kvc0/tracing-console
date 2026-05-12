@@ -267,7 +267,7 @@ fn root_matches(record: &SpanRecord, needle: &str) -> bool {
     if record.metadata.name().contains(needle) {
         return true;
     }
-    record.fields.values().any(|v| v.contains(needle))
+    record.fields.iter().any(|(_, v)| v.contains(needle))
 }
 
 // ── Top-level acceptor ───────────────────────────────────────────────────────

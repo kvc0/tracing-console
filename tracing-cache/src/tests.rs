@@ -12,6 +12,30 @@ use crate::config::CacheConfig;
 use crate::driver::Driver;
 use crate::id_encoding::DISABLED;
 use crate::predicate::{EnabledPredicate, Interest, LevelPredicate};
+use crate::record::{EventRecord, FieldValue, SpanRecord};
+
+// ── field helpers ─────────────────────────────────────────────────────────
+
+/// Print the named field of a `SpanRecord` to a `String`, or `None` if absent.
+fn span_field(record: &SpanRecord, name: &str) -> Option<String> {
+    record.field(name).map(|v| v.to_display_string().to_string())
+}
+
+/// Same, for events.
+fn event_field(event: &EventRecord, name: &str) -> Option<String> {
+    event.field(name).map(|v| v.to_display_string().to_string())
+}
+
+#[allow(dead_code)]
+fn assert_field_value(record: &SpanRecord, name: &str, expected: &str) {
+    let got = span_field(record, name);
+    assert_eq!(got.as_deref(), Some(expected), "field {name:?}");
+}
+
+#[allow(dead_code)]
+fn fv_str(value: &FieldValue) -> String {
+    value.to_display_string().to_string()
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -74,7 +98,7 @@ fn basic_span_creation_and_retrieval() {
     let record = cache.get_span(actual_id).unwrap();
     assert_eq!(record.id, actual_id);
     assert_eq!(record.metadata.name(), "root");
-    assert_eq!(record.fields.get("field").map(String::as_str), Some("value"));
+    assert_eq!(span_field(&record, "field").as_deref(), Some("value"));
 }
 
 #[test]
@@ -321,7 +345,7 @@ fn event_attached_to_current_span() {
     let record = cache.get_span(actual_id).unwrap();
     assert_eq!(record.events.len(), 1);
     assert!(
-        record.events[0].fields.contains_key("message"),
+        record.events[0].field("message").is_some(),
         "event should have a message field"
     );
 }
@@ -351,9 +375,9 @@ fn field_capture() {
         actual_id_of(&cache, &span)
     });
     let record = cache.get_span(actual_id).unwrap();
-    assert_eq!(record.fields.get("str_field").map(String::as_str), Some("hello"));
-    assert_eq!(record.fields.get("int_field").map(String::as_str), Some("42"));
-    assert_eq!(record.fields.get("bool_field").map(String::as_str), Some("true"));
+    assert_eq!(span_field(&record, "str_field").as_deref(), Some("hello"));
+    assert_eq!(span_field(&record, "int_field").as_deref(), Some("42"));
+    assert_eq!(span_field(&record, "bool_field").as_deref(), Some("true"));
 }
 
 // ── API-handler-shape coverage ────────────────────────────────────────────
@@ -376,8 +400,8 @@ fn record_updates_span_fields_after_creation() {
         actual_id
     });
     let record = cache.get_span(actual_id).unwrap();
-    assert_eq!(record.fields.get("initial").map(String::as_str), Some("ready"));
-    assert_eq!(record.fields.get("status").map(String::as_str), Some("success"));
+    assert_eq!(span_field(&record, "initial").as_deref(), Some("ready"));
+    assert_eq!(span_field(&record, "status").as_deref(), Some("success"));
 }
 
 #[test]
@@ -394,14 +418,14 @@ fn multiple_events_recorded_in_order() {
     });
     let record = cache.get_span(actual_id).unwrap();
     assert_eq!(record.events.len(), 3);
-    let steps: Vec<&str> = record
+    let steps: Vec<String> = record
         .events
         .iter()
-        .map(|e| e.fields.get("step").unwrap().as_str())
+        .map(|e| event_field(e, "step").unwrap())
         .collect();
     assert_eq!(steps, vec!["first", "second", "third"]);
     assert_eq!(
-        record.events[1].fields.get("note").map(String::as_str),
+        event_field(&record.events[1], "note").as_deref(),
         Some("middle"),
     );
     // Timestamps monotonically non-decreasing.
@@ -494,30 +518,30 @@ fn api_handler_lifecycle() {
     let request = cache.get_span(request_id).unwrap();
     assert_eq!(request.metadata.name(), "request");
     assert_eq!(request.parent_id, None);
-    assert_eq!(request.fields.get("method").map(String::as_str), Some("GET"));
-    assert_eq!(request.fields.get("path").map(String::as_str), Some("/users/42"));
-    assert_eq!(request.fields.get("status").map(String::as_str), Some("200"));
+    assert_eq!(span_field(&request, "method").as_deref(), Some("GET"));
+    assert_eq!(span_field(&request, "path").as_deref(), Some("/users/42"));
+    assert_eq!(span_field(&request, "status").as_deref(), Some("200"));
 
     let validate = pages.iter().find(|s| s.metadata.name() == "validate").unwrap();
     assert_eq!(validate.parent_id, Some(request_id));
-    assert_eq!(validate.fields.get("ok").map(String::as_str), Some("true"));
+    assert_eq!(span_field(validate, "ok").as_deref(), Some("true"));
     assert_eq!(validate.events.len(), 1);
     assert_eq!(
-        validate.events[0].fields.get("message").map(String::as_str),
+        event_field(&validate.events[0], "message").as_deref(),
         Some("validation passed"),
     );
 
     let query = pages.iter().find(|s| s.metadata.name() == "db_query").unwrap();
     assert_eq!(query.parent_id, Some(request_id));
-    assert_eq!(query.fields.get("table").map(String::as_str), Some("users"));
+    assert_eq!(span_field(query, "table").as_deref(), Some("users"));
     assert_eq!(query.events.len(), 2);
-    let messages: Vec<&str> = query
+    let messages: Vec<String> = query
         .events
         .iter()
-        .map(|e| e.fields.get("message").unwrap().as_str())
+        .map(|e| event_field(e, "message").unwrap())
         .collect();
     assert_eq!(messages, vec!["query started", "query finished"]);
-    assert_eq!(query.events[1].fields.get("rows").map(String::as_str), Some("1"));
+    assert_eq!(event_field(&query.events[1], "rows").as_deref(), Some("1"));
 }
 
 // ── public re-export surface ──────────────────────────────────────────────

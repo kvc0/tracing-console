@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+compact_str                     = { workspace = true }
 k-cache                         = { workspace = true }
 log                             = { workspace = true }
 slab                            = { workspace = true }
+smallvec                        = { workspace = true }
 spillway                        = { workspace = true }
 tokio                           = { workspace = true }
 tracing                         = { workspace = true }

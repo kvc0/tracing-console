@@ -1,62 +1,179 @@
 //! In-memory records for spans and events, plus the visitor that captures
 //! their fields.
 //!
-//! `FieldVisitor` is internal to the crate — it's the bridge between
-//! `tracing::field::Visit` and our `HashMap<&'static str, String>` layout.
+//! Field capture avoids the per-field `HashMap` + heap-allocated `String`
+//! cost the original layout paid.  Each field is one entry in a
+//! `SmallVec<[(&'static str, FieldValue); 8]>` — spans/events with ≤ 8
+//! fields stay entirely inline.  `FieldValue` is a tagged union of the
+//! types `tracing::field::Visit` actually delivers, so primitive fields
+//! never touch the allocator and `&'static str` literals never copy.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
+use compact_str::CompactString;
+use smallvec::SmallVec;
 use tracing::Metadata;
 
-#[derive(Clone)]
+/// Each captured field value.  `Str` keeps a `&'static str` (zero-copy
+/// for literal field arguments), `SmallString` keeps the
+/// stack-inline-up-to-24-byte `CompactString` (no heap for short
+/// dynamic strings), `SharedString` keeps an `Arc<String>` for callers
+/// that want sharing, and `String` is the unrestricted owned fallback.
+#[derive(Debug, Clone)]
+pub enum FieldValue {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    Str(&'static str),
+    SmallString(CompactString),
+    SharedString(Arc<String>),
+    String(String),
+}
+
+impl FieldValue {
+    /// Return a `&str` view of the value.  Numeric / bool variants
+    /// format into a fresh `CompactString` (cheap, usually inline).
+    /// Callers that want a stable borrow should match on the variant
+    /// directly.
+    pub fn to_display_string(&self) -> CompactString {
+        use std::fmt::Write;
+        match self {
+            FieldValue::U64(v) => {
+                let mut s = CompactString::default();
+                let _ = write!(s, "{}", v);
+                s
+            }
+            FieldValue::I64(v) => {
+                let mut s = CompactString::default();
+                let _ = write!(s, "{}", v);
+                s
+            }
+            FieldValue::F64(v) => {
+                let mut s = CompactString::default();
+                let _ = write!(s, "{}", v);
+                s
+            }
+            FieldValue::Bool(v) => CompactString::const_new(if *v { "true" } else { "false" }),
+            FieldValue::Str(s) => CompactString::const_new(s),
+            FieldValue::SmallString(s) => s.clone(),
+            FieldValue::SharedString(s) => CompactString::from(s.as_str()),
+            FieldValue::String(s) => CompactString::from(s.as_str()),
+        }
+    }
+
+    /// Substring-match the printed representation.  Used by the server's
+    /// filter that matches against root-span field values.
+    pub fn contains(&self, needle: &str) -> bool {
+        match self {
+            FieldValue::Str(s) => s.contains(needle),
+            FieldValue::SmallString(s) => s.contains(needle),
+            FieldValue::SharedString(s) => s.contains(needle),
+            FieldValue::String(s) => s.contains(needle),
+            // Primitives: stringify on demand.
+            _ => self.to_display_string().contains(needle),
+        }
+    }
+}
+
+/// A field list small enough to keep inline for the typical span.  Spans
+/// or events with > 8 fields spill to the heap.
+pub type FieldList = SmallVec<[(&'static str, FieldValue); 8]>;
+
+/// Look up a field by name; returns `None` if not present.
+#[inline]
+pub fn field_get<'a>(fields: &'a FieldList, name: &str) -> Option<&'a FieldValue> {
+    fields.iter().find(|(k, _)| *k == name).map(|(_, v)| v)
+}
+
+#[derive(Clone, Debug)]
 pub struct EventRecord {
     pub metadata: &'static Metadata<'static>,
-    pub fields: HashMap<&'static str, String>,
+    pub fields: FieldList,
     pub recorded_at: Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SpanRecord {
     pub id: u64,
     pub parent_id: Option<u64>,
     pub metadata: &'static Metadata<'static>,
-    pub fields: HashMap<&'static str, String>,
+    pub fields: FieldList,
     pub events: Vec<EventRecord>,
     pub opened_at: Instant,
     pub closed_at: Option<Instant>,
 }
 
-/// Borrows a mutable reference to a field map and dumps every visited
-/// field into it as a `String`.  Reused for span attributes, span
-/// `record()` updates, and event fields.
+impl SpanRecord {
+    /// Convenience: linear-scan field lookup by name.
+    pub fn field(&self, name: &str) -> Option<&FieldValue> {
+        field_get(&self.fields, name)
+    }
+}
+
+impl EventRecord {
+    pub fn field(&self, name: &str) -> Option<&FieldValue> {
+        field_get(&self.fields, name)
+    }
+}
+
+/// Borrows a mutable reference to a field list and pushes every visited
+/// field onto it as a typed `FieldValue`.  Reused for span attributes,
+/// span `record()` updates, and event fields.
+///
+/// `record_str` pays one allocation only if the string exceeds the
+/// `CompactString` inline budget (24 bytes on 64-bit).  Numeric / bool
+/// variants are zero-allocation.
 pub(crate) struct FieldVisitor<'a> {
-    pub fields: &'a mut HashMap<&'static str, String>,
+    pub fields: &'a mut FieldList,
+}
+
+impl FieldVisitor<'_> {
+    /// Replace an existing entry by name or append a new one.  Mirrors
+    /// `HashMap::insert` semantics — repeated `record(...)` calls
+    /// overwrite the prior value for that field name.
+    #[inline]
+    fn set(&mut self, name: &'static str, value: FieldValue) {
+        match self.fields.iter_mut().find(|(k, _)| *k == name) {
+            Some(slot) => slot.1 = value,
+            None => self.fields.push((name, value)),
+        }
+    }
 }
 
 impl tracing::field::Visit for FieldVisitor<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.fields.insert(field.name(), format!("{:?}", value));
+        use std::fmt::Write;
+        let mut s = CompactString::default();
+        let _ = write!(s, "{:?}", value);
+        self.set(field.name(), FieldValue::SmallString(s));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.fields.insert(field.name(), value.to_string());
+        // `tracing::field::Visit::record_str` erases lifetime, so we can't
+        // tell a `&'static str` literal from a stack-borrowed `&str` here
+        // — copy into a `CompactString` (inline for ≤ 24 bytes).  The
+        // `Str(&'static str)` variant is reserved for synthetic
+        // constructions by tests / non-Visit callers that know the
+        // lifetime statically.
+        self.set(field.name(), FieldValue::SmallString(CompactString::from(value)));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.fields.insert(field.name(), value.to_string());
+        self.set(field.name(), FieldValue::I64(value));
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.fields.insert(field.name(), value.to_string());
+        self.set(field.name(), FieldValue::U64(value));
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.fields.insert(field.name(), value.to_string());
+        self.set(field.name(), FieldValue::Bool(value));
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.fields.insert(field.name(), value.to_string());
+        self.set(field.name(), FieldValue::F64(value));
     }
 
     fn record_error(
@@ -64,6 +181,9 @@ impl tracing::field::Visit for FieldVisitor<'_> {
         field: &tracing::field::Field,
         value: &(dyn std::error::Error + 'static),
     ) {
-        self.fields.insert(field.name(), format!("{}", value));
+        use std::fmt::Write;
+        let mut s = CompactString::default();
+        let _ = write!(s, "{}", value);
+        self.set(field.name(), FieldValue::SmallString(s));
     }
 }

@@ -240,6 +240,7 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
+ "serde",
  "static_assertions",
 ]
 
@@ -1414,10 +1415,12 @@ dependencies = [
 name = "tracing-cache"
 version = "0.1.0"
 dependencies = [
+ "compact_str",
  "criterion",
  "k-cache",
  "log",
  "slab",
+ "smallvec",
  "spillway",
  "tokio",
  "tracing",

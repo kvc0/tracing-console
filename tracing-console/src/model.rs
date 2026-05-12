@@ -113,7 +113,6 @@ pub enum Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use tracing_console_host::{WireLevel, WireSpan};
 
     fn span(id: u64, name: &str) -> WireSpan {
@@ -123,7 +122,7 @@ mod tests {
             name: name.into(),
             target: "test".into(),
             level: WireLevel::Info,
-            fields: HashMap::new(),
+            fields: Vec::new(),
             events: vec![],
             opened_at_ns: 0,
             closed_at_ns: Some(1000),

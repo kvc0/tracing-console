@@ -22,4 +22,4 @@ pub use cache::SpanCache;
 pub use config::{CacheConfig, DEFAULT_LANE_COUNT};
 pub use driver::Driver;
 pub use predicate::{EnabledPredicate, Interest, LevelPredicate};
-pub use record::{EventRecord, SpanRecord};
+pub use record::{EventRecord, FieldList, FieldValue, SpanRecord};

@@ -6,7 +6,7 @@
 //! buffer (`tls::pending_push`) and eventually flushed to the spillway
 //! channel that `Driver` consumes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, Ordering, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
@@ -20,7 +20,7 @@ use crate::config::CacheConfig;
 use crate::driver::Driver;
 use crate::id_encoding::{disabled_id, id_to_u64, u64_to_id, DISABLED, SLAB_OFFSET};
 use crate::predicate::{EnabledPredicate, Interest, LevelPredicate};
-use crate::record::{EventRecord, FieldVisitor, SpanRecord};
+use crate::record::{EventRecord, FieldList, FieldVisitor, SpanRecord};
 use crate::thread_state::{
     ensure_thread_shard_key, pending_drain, pending_push, stack_pop, stack_push, stack_top,
     StackedSpan, ID_BATCH, ID_CURSOR, THREAD_SENDER,
@@ -332,7 +332,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             id: actual_id,
             parent_id: parent_actual_id,
             metadata: attrs.metadata(),
-            fields: HashMap::new(),
+            fields: FieldList::new(),
             events: Vec::new(),
             opened_at: Instant::now(),
             closed_at: None,
@@ -398,7 +398,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             return;
         }
 
-        let mut fields = HashMap::new();
+        let mut fields = FieldList::new();
         event.record(&mut FieldVisitor { fields: &mut fields });
         let record = EventRecord {
             metadata: event.metadata(),

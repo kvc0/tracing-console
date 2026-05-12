@@ -5,10 +5,55 @@
 //! message to carry an id and a control code, so [`Request`] and [`Response`]
 //! both wrap an enum body next to those framework fields.
 
-use std::collections::HashMap;
-
 use protosocket_rpc::{Message, ProtosocketControlCode};
 use serde::{Deserialize, Serialize};
+
+/// Wire representation of a captured field value.  Mirrors
+/// [`tracing_cache::FieldValue`] but collapses the four string variants
+/// (`Str` / `SmallString` / `SharedString` / `String`) to a single
+/// `Str(String)` — the heap is unavoidable once we cross the network
+/// boundary anyway.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum WireFieldValue {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    Str(String),
+}
+
+impl WireFieldValue {
+    /// Render the value as its printable string form.
+    pub fn to_string_value(&self) -> String {
+        match self {
+            WireFieldValue::U64(v) => v.to_string(),
+            WireFieldValue::I64(v) => v.to_string(),
+            WireFieldValue::F64(v) => v.to_string(),
+            WireFieldValue::Bool(v) => v.to_string(),
+            WireFieldValue::Str(s) => s.clone(),
+        }
+    }
+
+    /// Substring-match the printable representation.
+    pub fn contains(&self, needle: &str) -> bool {
+        match self {
+            WireFieldValue::Str(s) => s.contains(needle),
+            other => other.to_string_value().contains(needle),
+        }
+    }
+}
+
+impl std::fmt::Display for WireFieldValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireFieldValue::U64(v) => write!(f, "{v}"),
+            WireFieldValue::I64(v) => write!(f, "{v}"),
+            WireFieldValue::F64(v) => write!(f, "{v}"),
+            WireFieldValue::Bool(v) => write!(f, "{v}"),
+            WireFieldValue::Str(s) => f.write_str(s),
+        }
+    }
+}
 
 // ── Wire-friendly span / event types ─────────────────────────────────────────
 
@@ -48,7 +93,7 @@ impl WireLevel {
 pub struct WireEvent {
     pub name: String,
     pub level: WireLevel,
-    pub fields: HashMap<String, String>,
+    pub fields: Vec<(String, WireFieldValue)>,
     /// Nanoseconds since the host's `Instant` reference.
     pub recorded_at_ns: u64,
 }
@@ -60,13 +105,26 @@ pub struct WireSpan {
     pub name: String,
     pub target: String,
     pub level: WireLevel,
-    pub fields: HashMap<String, String>,
+    pub fields: Vec<(String, WireFieldValue)>,
     pub events: Vec<WireEvent>,
     /// Nanoseconds since the host's `Instant` reference.
     pub opened_at_ns: u64,
     /// `None` if still in flight at snapshot time (currently only closed spans
     /// are streamed, so this is `Some` in practice).
     pub closed_at_ns: Option<u64>,
+}
+
+impl WireSpan {
+    /// Look up a field by name; O(N) over the typically-small field list.
+    pub fn field(&self, name: &str) -> Option<&WireFieldValue> {
+        self.fields.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+}
+
+impl WireEvent {
+    pub fn field(&self, name: &str) -> Option<&WireFieldValue> {
+        self.fields.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
 }
 
 // ── Request body — every command the client can send ─────────────────────────
