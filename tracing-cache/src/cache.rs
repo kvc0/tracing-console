@@ -19,6 +19,7 @@ use tracing::{Level, Metadata};
 use crate::config::CacheConfig;
 use crate::driver::Driver;
 use crate::id_encoding::{disabled_id, id_to_u64, u64_to_id, DISABLED, SLAB_OFFSET};
+use crate::object_pool::ObjectPool;
 use crate::predicate::{EnabledPredicate, Interest, LevelPredicate};
 use crate::record::{EventRecord, FieldList, FieldVisitor, SpanRecord};
 use crate::thread_state::{
@@ -76,6 +77,13 @@ pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
     pub(crate) pending_batch: usize,
     pub(crate) shard_mask: u64,  // lane_count - 1
     pub(crate) shard_shift: u32, // 64 - log2(lane_count); shard at top of id
+    /// Shared pool of pre-allocated `EventRecord`s.  `event()` acquires
+    /// from the per-thread shard, fills the record, and pushes the
+    /// `ReuseRef` onto the parent span's events vec.  When the
+    /// `SpanRecord` finally drops (BTreeMap eviction), each `ReuseRef`
+    /// returns its allocation to the pool — amortising away the
+    /// per-event `Box::new` cost the previous `Vec<EventRecord>` paid.
+    pub(crate) event_pool: Arc<ObjectPool<EventRecord>>,
 }
 
 impl SpanCache<LevelPredicate> {
@@ -124,6 +132,12 @@ impl<P: EnabledPredicate> SpanCache<P> {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        // Event pool sharded the same way as the slab (one per lane);
+        // per-shard capacity is generous so steady-state event traffic
+        // never spills.  These are tiny structs (~360 B with the
+        // inline-8 FieldList), 256 × 16 lanes = ~1.5 MB worst case.
+        let event_pool = ObjectPool::<EventRecord>::new(lane_count, 256);
+
         let cache = SpanCache {
             in_flight,
             map: Arc::clone(&map),
@@ -138,6 +152,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
             pending_batch: config.pending_batch,
             shard_mask,
             shard_shift,
+            event_pool,
         };
         let driver = Driver {
             map,
@@ -398,13 +413,15 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             return;
         }
 
-        let mut fields = FieldList::new();
-        event.record(&mut FieldVisitor { fields: &mut fields });
-        let record = EventRecord {
-            metadata: event.metadata(),
-            fields,
-            recorded_at: Instant::now(),
-        };
+        // Acquire a pooled EventRecord, fill it in place.  The
+        // FieldList capacity is preserved across pool reuse, so events
+        // with similar field counts amortise their per-event allocation
+        // to zero.
+        let mut record = self.event_pool.acquire();
+        record.metadata = Some(event.metadata());
+        record.recorded_at = Some(Instant::now());
+        record.fields.clear();
+        event.record(&mut FieldVisitor { fields: &mut record.fields });
 
         let (shard, slab_idx) = match self.decode_tracing_id(parent_id) {
             Some(t) => t,

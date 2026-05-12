@@ -576,7 +576,7 @@ fn public_api_reexports_are_reachable() {
         actual_id_of(&cache, &s)
     });
     let pages: Vec<ReexportedSpanRecord> = cache.page(0, 4);
-    let _: Option<&ReexportedEventRecord> = pages.first().and_then(|s| s.events.first());
+    let _: Option<&ReexportedEventRecord> = pages.first().and_then(|s| s.events.first().map(|e| &**e));
 }
 
 // ── async overlap test ────────────────────────────────────────────────────

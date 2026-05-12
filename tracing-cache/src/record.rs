@@ -87,11 +87,42 @@ pub fn field_get<'a>(fields: &'a FieldList, name: &str) -> Option<&'a FieldValue
     fields.iter().find(|(k, _)| *k == name).map(|(_, v)| v)
 }
 
-#[derive(Clone, Debug)]
+/// One captured event.  `metadata` and `recorded_at` are `Option` purely
+/// so `EventRecord` can implement `Default` for the [`crate::ObjectPool`]
+/// — they are always `Some` once an event has been published through the
+/// subscriber.  Helper accessors `metadata()` / `recorded_at()` unwrap.
+#[derive(Clone, Debug, Default)]
 pub struct EventRecord {
-    pub metadata: &'static Metadata<'static>,
+    pub metadata: Option<&'static Metadata<'static>>,
     pub fields: FieldList,
-    pub recorded_at: Instant,
+    pub recorded_at: Option<Instant>,
+}
+
+impl EventRecord {
+    /// Unwrap the metadata pointer.  Always `Some` for events that have
+    /// been observed by the subscriber; only `None` on a freshly-acquired
+    /// pool entry that hasn't been filled yet.
+    #[inline]
+    pub fn metadata(&self) -> &'static Metadata<'static> {
+        self.metadata.expect("EventRecord::metadata not set")
+    }
+
+    #[inline]
+    pub fn recorded_at(&self) -> Instant {
+        self.recorded_at.expect("EventRecord::recorded_at not set")
+    }
+
+    pub fn field(&self, name: &str) -> Option<&FieldValue> {
+        field_get(&self.fields, name)
+    }
+}
+
+impl crate::object_pool::Resettable for EventRecord {
+    fn reset(&mut self) {
+        self.metadata = None;
+        self.fields.clear();
+        self.recorded_at = None;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,19 +131,18 @@ pub struct SpanRecord {
     pub parent_id: Option<u64>,
     pub metadata: &'static Metadata<'static>,
     pub fields: FieldList,
-    pub events: Vec<EventRecord>,
+    /// Events captured while this span was on the stack.  Each entry is
+    /// a pooled `EventRecord` — pushing one moves a 16-byte pointer pair
+    /// rather than the full inline-vec body, and the underlying
+    /// `EventRecord` heap allocation is recycled when the SpanRecord
+    /// finally drops.
+    pub events: Vec<crate::object_pool::ReuseRef<EventRecord>>,
     pub opened_at: Instant,
     pub closed_at: Option<Instant>,
 }
 
 impl SpanRecord {
     /// Convenience: linear-scan field lookup by name.
-    pub fn field(&self, name: &str) -> Option<&FieldValue> {
-        field_get(&self.fields, name)
-    }
-}
-
-impl EventRecord {
     pub fn field(&self, name: &str) -> Option<&FieldValue> {
         field_get(&self.fields, name)
     }

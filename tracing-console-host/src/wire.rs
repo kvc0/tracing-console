@@ -55,7 +55,7 @@ pub fn span_to_wire(record: &SpanRecord, base: TimeBase) -> WireSpan {
 }
 
 pub fn event_to_wire(event: &EventRecord, base: TimeBase) -> WireEvent {
-    let metadata = event.metadata;
+    let metadata = event.metadata();
     WireEvent {
         name: metadata.name().to_string(),
         level: WireLevel::from_tracing(metadata.level()),
@@ -64,6 +64,6 @@ pub fn event_to_wire(event: &EventRecord, base: TimeBase) -> WireEvent {
             .iter()
             .map(|(k, v)| ((*k).to_string(), field_to_wire(v)))
             .collect(),
-        recorded_at_ns: base.ns(event.recorded_at),
+        recorded_at_ns: base.ns(event.recorded_at()),
     }
 }
