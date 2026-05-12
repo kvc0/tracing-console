@@ -64,7 +64,7 @@ fn span_id(span: &tracing::Span) -> Option<u64> {
 /// to look it up in the closed-span map after drain (the tracing id and
 /// actual id live in disjoint namespaces).
 fn actual_id_of(cache: &Arc<SpanCache>, span: &tracing::Span) -> u64 {
-    cache.get_active_span(span_id(span).unwrap()).unwrap().id
+    cache.actual_id_for(span_id(span).unwrap()).unwrap()
 }
 
 struct DisableByName(pub &'static str);
@@ -107,15 +107,10 @@ fn closed_at_set_after_drop() {
     let actual_id = run_with_drain(&cache, driver, || {
         let span = tracing::span!(parent: None, Level::INFO, "root");
         let tracing_id = span_id(&span).unwrap();
-        let actual_id = cache.get_active_span(tracing_id).unwrap().id;
+        let actual_id = cache.actual_id_for(tracing_id).unwrap();
         {
             let _g = span.enter();
         }
-        // While alive: lookup by tracing id finds the slab entry.
-        assert!(
-            cache.get_active_span(tracing_id).unwrap().closed_at.is_none(),
-            "not closed while span is alive"
-        );
         actual_id
         // span drops here → try_close → PENDING
     });

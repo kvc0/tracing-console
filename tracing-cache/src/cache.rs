@@ -17,7 +17,7 @@ use tracing::metadata::LevelFilter;
 use tracing::{Level, Metadata};
 
 use crate::config::CacheConfig;
-use crate::driver::Driver;
+use crate::driver::{Driver, DriverMsg};
 use crate::id_encoding::{disabled_id, id_to_u64, u64_to_id, DISABLED, SLAB_OFFSET};
 use crate::object_pool::ObjectPool;
 use crate::predicate::{EnabledPredicate, Interest, LevelPredicate};
@@ -73,7 +73,7 @@ pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
     /// Per-shard capacity.  Total open-span budget is
     /// `shard_capacity * lane_count`.
     pub(crate) shard_capacity: usize,
-    pub(crate) sender: spillway::Sender<SpanRecord>,
+    pub(crate) sender: spillway::Sender<DriverMsg>,
     pub(crate) pending_batch: usize,
     pub(crate) shard_mask: u64,  // lane_count - 1
     pub(crate) shard_shift: u32, // 64 - log2(lane_count); shard at top of id
@@ -160,6 +160,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
             capacity,
             batch_size: config.driver_batch,
             tick_interval: config.driver_interval,
+            side_events: std::collections::HashMap::new(),
         };
         (cache, driver)
     }
@@ -231,12 +232,13 @@ impl<P: EnabledPredicate> SpanCache<P> {
         self.map.read().unwrap().get(&actual_id).cloned()
     }
 
-    /// Returns an in-flight span by its tracing id (the value carried in
-    /// `tracing::span::Id`).  Returns `None` if the span has closed; once
-    /// closed it is reachable only via [`get_span`] using its `actual_id`.
-    pub fn get_active_span(&self, tracing_id: u64) -> Option<SpanRecord> {
+    /// Resolve the `actual_id` (i.e. the [`SpanRecord::id`] used as the
+    /// `BTreeMap` key after close) for an in-flight span addressed by
+    /// its `tracing::span::Id` u64.  Lock-free `Acquire` load from the
+    /// per-shard sidecar — does not touch the slab `Mutex`.
+    pub fn actual_id_for(&self, tracing_id: u64) -> Option<u64> {
         let (shard, slab_idx) = self.decode_tracing_id(tracing_id)?;
-        self.in_flight[shard].slab.lock().unwrap().get(slab_idx).cloned()
+        Some(self.load_actual_id(shard, slab_idx))
     }
 
     /// Returns closed spans in ascending actual_id order.  Open spans are
@@ -394,44 +396,48 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
     }
 
     fn event(&self, event: &tracing::Event<'_>) {
-        // Parent: explicit parent on the event, else the current span on
-        // the SPAN_STACK.  Either way we want a tracing id (the actual_id
-        // sitting on the stack entry isn't useful here — we need the slab
-        // address).
-        let parent_id = match event.parent().map(id_to_u64) {
-            Some(id) => id,
+        // Resolve the parent's `actual_id` lock-free.  Contextual events
+        // get it straight off the SPAN_STACK entry; events with an
+        // explicit parent decode the tracing id and `Acquire`-load from
+        // the per-shard sidecar — no slab lock either way.
+        let parent_actual_id = match event.parent().map(id_to_u64) {
+            Some(tracing_id) => {
+                if tracing_id == DISABLED {
+                    log::debug!("event dropped: parent span is disabled");
+                    return;
+                }
+                match self.decode_tracing_id(tracing_id) {
+                    Some((shard, slab_idx)) => self.load_actual_id(shard, slab_idx),
+                    None => return,
+                }
+            }
             None => match stack_top() {
-                Some(top) => top.tracing_id,
+                Some(top) if top.tracing_id == DISABLED => {
+                    log::debug!("event dropped: parent span is disabled");
+                    return;
+                }
+                Some(top) => top.actual_id,
                 None => {
                     log::debug!("event dropped: no active span");
                     return;
                 }
             },
         };
-        if parent_id == DISABLED {
-            log::debug!("event dropped: parent span is disabled");
-            return;
-        }
 
-        // Acquire a pooled EventRecord, fill it in place.  The
-        // FieldList capacity is preserved across pool reuse, so events
-        // with similar field counts amortise their per-event allocation
-        // to zero.
+        // Acquire a pooled EventRecord, fill it in place.  The pooled
+        // FieldList allocation is preserved across reuse.
         let mut record = self.event_pool.acquire();
         record.metadata = Some(event.metadata());
         record.recorded_at = Some(Instant::now());
         record.fields.clear();
         event.record(&mut FieldVisitor { fields: &mut record.fields });
 
-        let (shard, slab_idx) = match self.decode_tracing_id(parent_id) {
-            Some(t) => t,
-            None => return,
-        };
-        let mut shard_lock = self.in_flight[shard].slab.lock().unwrap();
-        if let Some(span) = shard_lock.get_mut(slab_idx) {
-            span.events.push(record);
-        } else {
-            log::debug!("event dropped: parent span at shard {shard} slab {slab_idx} not in cache");
+        // Hand off to the driver via PENDING — no slab lock here.  The
+        // driver attaches the event to its parent's `events` vec (or
+        // buffers it if the parent hasn't been inserted into the map
+        // yet).
+        if pending_push(DriverMsg::Event { parent_actual_id, record }) >= self.pending_batch {
+            self.flush_pending();
         }
     }
 
@@ -469,7 +475,7 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         };
 
         if let Some(record) = record {
-            if pending_push(record) >= self.pending_batch {
+            if pending_push(DriverMsg::Span(record)) >= self.pending_batch {
                 self.flush_pending();
             }
             true

@@ -19,7 +19,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use crate::record::SpanRecord;
+use crate::driver::DriverMsg;
 
 /// Number of `actual_id`s a thread reserves in a single bump of the
 /// per-cache `id_high_water` counter.  Power of two so the in-batch
@@ -53,8 +53,11 @@ thread_local! {
     pub(crate) static SPAN_STACK: UnsafeCell<Vec<StackedSpan>> =
         const { UnsafeCell::new(Vec::new()) };
 
-    /// Closed spans waiting to be sent to the driver via spillway.
-    pub(crate) static PENDING: UnsafeCell<Vec<SpanRecord>> =
+    /// Closed spans + emitted events waiting to be sent to the driver
+    /// via spillway.  The unified `DriverMsg` lets `try_close` and
+    /// `event` share one batch path; the driver attaches events to
+    /// their parent span on receipt.
+    pub(crate) static PENDING: UnsafeCell<Vec<DriverMsg>> =
         const { UnsafeCell::new(Vec::new()) };
 
     /// Stable per-thread shard key, lazily assigned from `NEXT_THREAD_KEY`
@@ -72,7 +75,7 @@ thread_local! {
     /// stash the source-cache's sender address alongside the clone so a
     /// thread that switches between two `SpanCache` instances notices the
     /// switch and re-clones.
-    pub(crate) static THREAD_SENDER: UnsafeCell<Option<(usize, spillway::Sender<SpanRecord>)>>
+    pub(crate) static THREAD_SENDER: UnsafeCell<Option<(usize, spillway::Sender<DriverMsg>)>>
         = const { UnsafeCell::new(None) };
 
     /// Per-thread `actual_id` cursor: the next id to hand out from the
@@ -105,12 +108,13 @@ pub(crate) fn stack_pop() {
     });
 }
 
-/// Push a closed span onto PENDING and return the new length.
+/// Push a driver message (closed span or emitted event) onto PENDING
+/// and return the new length.
 #[inline]
-pub(crate) fn pending_push(record: SpanRecord) -> usize {
+pub(crate) fn pending_push(msg: DriverMsg) -> usize {
     PENDING.with(|c| unsafe {
         let v = &mut *c.get();
-        v.push(record);
+        v.push(msg);
         v.len()
     })
 }
@@ -119,7 +123,7 @@ pub(crate) fn pending_push(record: SpanRecord) -> usize {
 /// once with the resulting `Drain` iterator.  `f` must not call back
 /// into tracing on this thread.
 #[inline]
-pub(crate) fn pending_drain<F: FnMut(std::vec::Drain<'_, SpanRecord>)>(mut f: F) {
+pub(crate) fn pending_drain<F: FnMut(std::vec::Drain<'_, DriverMsg>)>(mut f: F) {
     PENDING.with(|c| unsafe {
         f((*c.get()).drain(..));
     });
