@@ -28,6 +28,16 @@ pub struct CacheConfig {
     /// Upper bound on how long the driver will wait before flushing whatever
     /// it has, even if `driver_batch` hasn't been reached.  Default: 1 second.
     pub driver_interval: std::time::Duration,
+    /// Soft upper bound on each spillway channel (span + event) that moves
+    /// closed records from producer threads to the driver.  When producers
+    /// outrun the driver (e.g. many cores + few async workers), this caps
+    /// spillway's internal buffers so the producer can't grow process
+    /// memory unboundedly.  `send_many` rejects whole batches when the
+    /// limit is hit and `flush_pending` drops the rejected drain (logging
+    /// at DEBUG).  Decoupled from the user-facing `capacity` (the
+    /// BTreeMap bound): the channel is intermediate buffering and only
+    /// needs enough headroom for normal bursts.  Default: 65536.
+    pub channel_capacity: u64,
 }
 
 impl Default for CacheConfig {
@@ -37,6 +47,7 @@ impl Default for CacheConfig {
             pending_batch: 32,
             driver_batch: 600,
             driver_interval: std::time::Duration::from_secs(1),
+            channel_capacity: 65536,
         }
     }
 }

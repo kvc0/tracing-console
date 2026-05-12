@@ -120,8 +120,22 @@ impl<P: EnabledPredicate> SpanCache<P> {
         // is well-defined even when lane_count == 1.
         let shard_shift = 64 - shard_bits.max(1);
 
-        let (span_sender, span_receiver) = spillway::channel();
-        let (event_sender, event_receiver) = spillway::channel();
+        // Bound both channels so a faster producer than consumer (e.g. a
+        // 16-core Graviton with 4 async workers vs. one driver task) can't
+        // grow spillway's internal buffers without bound and exhaust RAM.
+        // `send_many` rejects the whole batch with `Error::Full` when the
+        // limit is exceeded; `flush_pending` discards the rejected drain.
+        // Concurrency matches `lane_count` so each lane's threads tend to
+        // land on their own chute and contend less with peers (spillway's
+        // chute count caps useful per-clone parallelism).
+        let (span_sender, span_receiver) = spillway::channel_with_capacity_and_concurrency(
+            config.channel_capacity,
+            lane_count,
+        );
+        let (event_sender, event_receiver) = spillway::channel_with_capacity_and_concurrency(
+            config.channel_capacity,
+            lane_count,
+        );
         let map = Arc::new(RwLock::new(BTreeMap::new()));
         let shard_capacity = capacity.div_ceil(lane_count);
         let in_flight: Box<[ShardLane]> = (0..lane_count)
@@ -284,15 +298,30 @@ impl<P: EnabledPredicate> SpanCache<P> {
             let senders = unsafe { slot.as_ref().unwrap_unchecked() };
             // Avoid send_many on empty drains — spillway's chute
             // invariant rejects sender clones that publish without
-            // having ever held content.
+            // having ever held content.  On `Error::Full`, the rejected
+            // drain is bound to the match arm and dropped, which drops
+            // each unsent record (and runs `ReuseRef::Drop` for events,
+            // returning the EventRecord allocation to the pool).
             pending_drain_events(|events| {
                 if events.len() > 0 {
-                    let _ = senders.event.send_many(events);
+                    if let Err(spillway::Error::Full(_dropped)) =
+                        senders.event.send_many(events)
+                    {
+                        log::debug!(
+                            "event channel full; dropping a batch — driver is behind"
+                        );
+                    }
                 }
             });
             pending_drain_spans(|spans| {
                 if spans.len() > 0 {
-                    let _ = senders.span.send_many(spans);
+                    if let Err(spillway::Error::Full(_dropped)) =
+                        senders.span.send_many(spans)
+                    {
+                        log::debug!(
+                            "span channel full; dropping a batch — driver is behind"
+                        );
+                    }
                 }
             });
         });
