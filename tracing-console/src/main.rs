@@ -28,7 +28,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use protosocket_messagepack::{MessagePackDecoder, MessagePackSerializer};
 use protosocket_rpc::client::{self, Configuration, TcpStreamConnector};
 use ratatui::Terminal;
@@ -82,9 +82,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move { run_network(args.addr, tx, out_rx).await });
     }
 
+    // Queue the optional auto-configure RPCs *before* dispatching to
+    // the per-mode loop.  Drained from `out_rx` by the network task
+    // as soon as it connects — so `--mode stats --set-level trace`
+    // can benchmark a host that defaults to OFF without needing a
+    // separate TUI session to flip it.
+    if let Some(level) = args.set_level {
+        let _ = out_tx.send(Outgoing::SetCacheLevel(level.to_wire()));
+    }
+    if let Some(chance) = args.set_chance {
+        let _ = out_tx.send(Outgoing::SetCacheChance(chance));
+    }
+
     match args.mode {
         ModeFlag::States => run_states(rx, args.history).await,
-        ModeFlag::Stats => stats::run_stats(rx, args.stats_hz).await,
+        ModeFlag::Stats => stats::run_stats(rx, args.stats_hz, args.history).await,
         ModeFlag::Tui => run_tui(tx, rx, out_tx, !args.no_color, args.history).await,
     }
 }
@@ -100,94 +112,155 @@ async fn run_network(
 ) {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    let _ = tx.send(Update::Status(format!("connecting to {addr}…")));
-
-    let configuration: Configuration<TcpStreamConnector> = Configuration::new(TcpStreamConnector);
-
-    let (rpc_client, conn) = match client::connect::<ClientCodec, _>(addr, &configuration).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            let _ = tx.send(Update::Disconnected(format!("connect failed: {e}")));
-            return;
-        }
-    };
-    // Drive the connection's I/O loop in the background.
-    let conn_task = tokio::spawn(conn);
-    let _ = tx.send(Update::Connected);
-
     // protosocket-rpc routes responses by `Message::message_id()` and
     // does not auto-assign ids.  `Request::new` defaults to id=0, so
-    // two coexisting RPCs at id=0 (streaming + unary) would collide in
-    // the client's completion registry and the second would clobber
-    // the first.  Use a unique id per outgoing request — that keeps
-    // the streaming completion alive while unary `SetCacheLevel`s
-    // come and go.
+    // two coexisting RPCs at id=0 (streaming + unary) would collide
+    // in the client's completion registry and the second would
+    // clobber the first.  A monotonic counter survives reconnects,
+    // so the same request never re-uses an id.
     let next_id = AtomicU64::new(1);
-    let mut start = Request::new(RequestBody::StartStream);
-    start.id = next_id.fetch_add(1, Ordering::Relaxed);
-    let stream = match rpc_client.send_streaming(start) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.send(Update::Disconnected(format!("StartStream failed: {e}")));
+    let configuration: Configuration<TcpStreamConnector> = Configuration::new(TcpStreamConnector);
+    // 1 Hz reconnect cadence — every failed dial or dropped stream
+    // sleeps for `RECONNECT_DELAY` before the next attempt.
+    const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+    'reconnect: loop {
+        let _ = tx.send(Update::Status(format!("connecting to {addr}…")));
+        let (rpc_client, conn) =
+            match client::connect::<ClientCodec, _>(addr, &configuration).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = tx.send(Update::Disconnected(format!("connect failed: {e}")));
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue 'reconnect;
+                }
+            };
+        let conn_task = tokio::spawn(conn);
+        let _ = tx.send(Update::Connected);
+
+        let mut start = Request::new(RequestBody::StartStream);
+        start.id = next_id.fetch_add(1, Ordering::Relaxed);
+        let mut stream = match rpc_client.send_streaming(start) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Update::Disconnected(format!("StartStream failed: {e}")));
+                conn_task.abort();
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue 'reconnect;
+            }
+        };
+
+        let mut runtime_gone = false;
+        // Convert one streaming Response into the matching Update, or
+        // None for body variants the client ignores (Ack / Noop /
+        // Error).  Pulled out of the select arm so the batch path
+        // below can reuse it.
+        let resp_to_update = |resp: Response| -> Option<Update> {
+            match resp.body {
+                ResponseBody::Span(s) => Some(Update::SpanReceived(s)),
+                ResponseBody::CacheLevel(filter) => Some(Update::CacheLevelReceived(filter)),
+                ResponseBody::CacheChance(pct) => Some(Update::CacheChanceReceived(pct)),
+                _ => None,
+            }
+        };
+        // Cap batch size so `send_many` (which atomically rejects the
+        // whole batch on Full) stays well under the spillway capacity
+        // and the inner drain loop doesn't starve `out_rx`.
+        const MAX_BATCH: usize = 256;
+        'stream: loop {
+            tokio::select! {
+                // Stream of pushes from the server.  Take the first
+                // item via select, then opportunistically drain
+                // additional ready items into a batch.  One
+                // `send_many` per burst replaces N atomic sends —
+                // big win at 10k+ spans/s where the runtime task
+                // was getting woken N times per tick.
+                item = stream.next() => {
+                    let mut batch: Vec<Update> = Vec::new();
+                    let mut stream_ended_at = None::<String>;
+                    let mut stream_dropped = false;
+                    match item {
+                        None => stream_dropped = true,
+                        Some(Err(e)) => {
+                            stream_ended_at = Some(format!("stream error: {e}"));
+                        }
+                        Some(Ok(resp)) => {
+                            if let Some(u) = resp_to_update(resp) {
+                                batch.push(u);
+                            }
+                        }
+                    }
+                    if !stream_dropped && stream_ended_at.is_none() {
+                        while batch.len() < MAX_BATCH {
+                            match stream.next().now_or_never() {
+                                Some(None) => {
+                                    stream_dropped = true;
+                                    break;
+                                }
+                                Some(Some(Err(e))) => {
+                                    stream_ended_at = Some(format!("stream error: {e}"));
+                                    break;
+                                }
+                                Some(Some(Ok(resp))) => {
+                                    if let Some(u) = resp_to_update(resp) {
+                                        batch.push(u);
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    if !batch.is_empty() {
+                        match tx.send_many(batch) {
+                            Ok(()) | Err(spillway::Error::Full(_)) => {}
+                            Err(spillway::Error::Closed(_)) => {
+                                runtime_gone = true;
+                                break 'stream;
+                            }
+                        }
+                    }
+                    if let Some(msg) = stream_ended_at {
+                        let _ = tx.send(Update::Disconnected(msg));
+                        break 'stream;
+                    }
+                    if stream_dropped {
+                        break 'stream;
+                    }
+                }
+                // Outgoing requests from the keyboard / runtime.
+                // `None` means all senders dropped → runtime is
+                // shutting down for good; don't reconnect.
+                req = out_rx.next() => {
+                    let Some(req) = req else {
+                        runtime_gone = true;
+                        break 'stream;
+                    };
+                    let mut request = match req {
+                        Outgoing::SetCacheLevel(filter) => {
+                            Request::new(RequestBody::SetCacheLevel(filter))
+                        }
+                        Outgoing::SetCacheChance(pct) => {
+                            Request::new(RequestBody::SetCacheChance(pct))
+                        }
+                    };
+                    request.id = next_id.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(unary) = rpc_client.send_unary(request) {
+                        // Server-pushed CacheLevel / CacheChance on
+                        // the stream is the source of truth — the
+                        // ack here is just signal that the request
+                        // landed.
+                        tokio::spawn(async move { let _ = unary.await; });
+                    }
+                }
+            }
+        }
+        let _ = tx.send(Update::Disconnected("stream ended".into()));
+        conn_task.abort();
+        if runtime_gone {
             return;
         }
-    };
-
-    let mut stream = stream;
-    loop {
-        tokio::select! {
-            // Stream of pushes from the server (spans + CacheLevel notices).
-            item = stream.next() => {
-                let Some(item) = item else { break };
-                match item {
-                    Ok(resp) => match resp.body {
-                        ResponseBody::Span(s) => {
-                            if tx.send(Update::SpanReceived(s)).is_err() {
-                                break;
-                            }
-                        }
-                        ResponseBody::CacheLevel(filter) => {
-                            if tx.send(Update::CacheLevelReceived(filter)).is_err() {
-                                break;
-                            }
-                        }
-                        ResponseBody::CacheChance(pct) => {
-                            if tx.send(Update::CacheChanceReceived(pct)).is_err() {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        let _ = tx.send(Update::Disconnected(format!("stream error: {e}")));
-                        break;
-                    }
-                }
-            }
-            // Outgoing requests from the keyboard / runtime.  None
-            // means all senders dropped → runtime is shutting down.
-            req = out_rx.next() => {
-                let Some(req) = req else { break };
-                let mut request = match req {
-                    Outgoing::SetCacheLevel(filter) => {
-                        Request::new(RequestBody::SetCacheLevel(filter))
-                    }
-                    Outgoing::SetCacheChance(pct) => {
-                        Request::new(RequestBody::SetCacheChance(pct))
-                    }
-                };
-                request.id = next_id.fetch_add(1, Ordering::Relaxed);
-                if let Ok(unary) = rpc_client.send_unary(request) {
-                    // We don't depend on the unary Ack — the
-                    // server-side stream will push the new state as
-                    // the source of truth.
-                    tokio::spawn(async move { let _ = unary.await; });
-                }
-            }
-        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
     }
-    let _ = tx.send(Update::Disconnected("stream ended".into()));
-    conn_task.abort();
 }
 
 // ── --states mode ────────────────────────────────────────────────────────────
@@ -243,31 +316,35 @@ async fn run_tui(
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
 
     let result: Result<(), Box<dyn std::error::Error>> = (async {
-        // Redraws ONLY on the ticker; updates accumulate between ticks.
-        // Without this gate, a 1k+ spans/s producer turns every redraw
-        // into another `bucket_by_stack` over the full 4096-span buffer
-        // and starves the keyboard mpsc behind it.
+        // Continuous drain via `select!`: the rx.next_batch() arm
+        // absorbs Updates as fast as the producer pushes them, and
+        // the ticker arm renders exactly once per interval.  An
+        // earlier tick-then-drain design paced consumption at
+        // `stream_buffer × tick_hz` because draining only happened
+        // at tick boundaries — that pinned throughput at a small
+        // multiple of the channel capacity even when the model
+        // itself could absorb orders of magnitude more.
         loop {
             tokio::select! {
-                maybe_update = rx.next() => {
-                    match maybe_update {
-                        Some(update) => {
-                            match model.apply(update) {
-                                Effect::None => {}
-                                Effect::Quit => break,
-                                Effect::RequestSetLevel(level) => {
-                                    let _ = out_tx.send(Outgoing::SetCacheLevel(level));
+                batch = rx.next_batch() => {
+                    match batch {
+                        Some(items) => {
+                            for update in items {
+                                match model.apply(update) {
+                                    Effect::None => {}
+                                    Effect::Quit => return Ok(()),
+                                    Effect::RequestSetLevel(level) => {
+                                        let _ = out_tx.send(Outgoing::SetCacheLevel(level));
+                                    }
+                                    Effect::RequestSetChance(pct) => {
+                                        let _ = out_tx.send(Outgoing::SetCacheChance(pct));
+                                    }
                                 }
-                                Effect::RequestSetChance(pct) => {
-                                    let _ = out_tx.send(Outgoing::SetCacheChance(pct));
-                                }
+                                chance_input_active
+                                    .store(model.chance_input.is_some(), Ordering::Relaxed);
                             }
-                            chance_input_active.store(
-                                model.chance_input.is_some(),
-                                Ordering::Relaxed,
-                            );
                         }
-                        None => break, // all senders dropped
+                        None => return Ok(()),
                     }
                 }
                 _ = ticker.tick() => {
@@ -275,7 +352,6 @@ async fn run_tui(
                 }
             }
         }
-        Ok(())
     })
     .await;
 

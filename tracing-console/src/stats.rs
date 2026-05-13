@@ -1,74 +1,81 @@
 //! `--stats <Hz>` mode: aggregate observed spans per stack and print
 //! min/avg/max for total and self durations on a configurable cadence.
+//!
+//! Uses the same aggregation strategy as the TUI: a bounded rolling
+//! `VecDeque<WireSpan>` of size `history_budget`, re-bucketed on each
+//! flush via `aggregate::bucket_by_stack`.  Per-tick work is therefore
+//! O(history_budget), not O(spans received this window), so the
+//! flush cost is bounded regardless of input rate.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use futures::FutureExt;
 use tracing_console_host::WireSpan;
 
 use crate::aggregate::{StackStats, bucket_by_stack, fmt_ns, tree_label};
-use crate::model::Update;
+use crate::model::{Update, RateTracker};
 
 pub async fn run_stats(
     mut rx: spillway::Receiver<Update>,
     hz: f64,
+    history_budget: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let period = Duration::from_secs_f64(1.0 / hz);
-    let mut acc = StatsAccumulator::new();
+    let mut acc = StatsAccumulator::new(history_budget);
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let started = Instant::now();
-    let mut last_tick = started;
 
+    // Continuous drain + tick-based flush.  Earlier this awaited
+    // the tick first and then drained, which paced consumption at
+    // `stream_buffer × stats_hz` spans/s (e.g. 65,536/s at
+    // --stats-hz 1).  Now `select!` lets the drain run as fast as
+    // the producer fills the channel, and the tick arm only fires
+    // the print/flush.
     loop {
-        let instant = tick.tick().await;
-        let now: Instant = instant.into_std();
-        let mut closed = false;
-        // Drain everything currently in the channel.  `now_or_never`
-        // on `rx.next()` returns:
-        //   * Some(Some(t))  → got an item, keep draining
-        //   * Some(None)     → all senders dropped, channel closed
-        //   * None           → channel empty right now, stop the drain
-        loop {
-            match rx.next().now_or_never() {
-                Some(Some(update)) => acc.absorb(update),
-                Some(None) => {
-                    closed = true;
-                    break;
+        tokio::select! {
+            batch = rx.next_batch() => {
+                match batch {
+                    Some(items) => {
+                        for update in items {
+                            acc.absorb(update);
+                        }
+                    }
+                    None => break, // all senders dropped
                 }
-                None => break,
             }
-        }
-        let elapsed_window = now.saturating_duration_since(last_tick);
-        let elapsed_total = now.saturating_duration_since(started);
-        acc.flush(elapsed_total, elapsed_window);
-        last_tick = now;
-        if closed {
-            break;
+            instant = tick.tick() => {
+                let now: Instant = instant.into_std();
+                let elapsed_total = now.saturating_duration_since(started);
+                acc.flush(elapsed_total);
+            }
         }
     }
     Ok(())
 }
 
 struct StatsAccumulator {
-    /// Spans received this window.  `bucket_by_stack` drops any whose
-    /// full parent chain isn't also in this window — same "don't
-    /// render without context" rule as the TUI.
-    window: Vec<WireSpan>,
+    /// Rolling history of closed spans, capped at `history_budget`.
+    /// Aggregation runs over this buffer on every flush, the same way
+    /// the TUI's `Model::visible_rows` runs over `Model::spans`.
+    spans: VecDeque<WireSpan>,
+    history_budget: usize,
     last_status: Option<String>,
     connected: bool,
+    rate: RateTracker,
     total_received: u64,
     total_dropped_unfinished: u64,
 }
 
 impl StatsAccumulator {
-    fn new() -> Self {
+    fn new(history_budget: usize) -> Self {
         Self {
-            window: Vec::new(),
+            spans: VecDeque::with_capacity(history_budget),
+            history_budget,
             last_status: None,
             connected: false,
+            rate: RateTracker::default(),
             total_received: 0,
             total_dropped_unfinished: 0,
         }
@@ -78,11 +85,15 @@ impl StatsAccumulator {
         match update {
             Update::SpanReceived(span) => {
                 self.total_received += 1;
+                self.rate.record(Instant::now());
                 if span.closed_at_ns.is_none() {
                     self.total_dropped_unfinished += 1;
                     return;
                 }
-                self.window.push(span);
+                if self.spans.len() >= self.history_budget {
+                    self.spans.pop_front();
+                }
+                self.spans.push_back(span);
             }
             Update::Connected => {
                 self.connected = true;
@@ -114,16 +125,12 @@ impl StatsAccumulator {
         }
     }
 
-    fn flush(&mut self, elapsed_total: Duration, elapsed_window: Duration) {
-        let received_this_window = self.window.len() as u64;
-        let span_rate = if elapsed_window.as_secs_f64() > 0.0 {
-            received_this_window as f64 / elapsed_window.as_secs_f64()
-        } else {
-            0.0
-        };
+    fn flush(&mut self, elapsed_total: Duration) {
+        let buffered = self.spans.len();
+        let span_rate = self.rate.rate_hz();
 
         let split_keys: BTreeSet<String> = BTreeSet::new();
-        let rows = bucket_by_stack(self.window.iter(), &split_keys);
+        let rows = bucket_by_stack(self.spans.iter(), &split_keys);
 
         let header_status = if self.connected {
             "[connected]".to_string()
@@ -134,20 +141,19 @@ impl StatsAccumulator {
                 .unwrap_or_else(|| "[disconnected]".into())
         };
         println!(
-            "=== stats @ {:.2}s — {recv} spans ({rate:.0} spans/s) over {win:.3?} {st} ===",
+            "=== stats @ {:.2}s — {buf} buffered ({rate:.0} spans/s, recv={recv}) {st} ===",
             elapsed_total.as_secs_f64(),
-            recv = received_this_window,
+            buf = buffered,
             rate = span_rate,
-            win = elapsed_window,
+            recv = self.total_received,
             st = header_status,
         );
 
         if rows.is_empty() {
             println!(
-                "  (no closed spans this window; received={} dropped_open={})",
+                "  (no renderable spans in buffer; received={} dropped_open={})",
                 self.total_received, self.total_dropped_unfinished
             );
-            self.window.clear();
             let _ = std::io::stdout().flush();
             return;
         }
@@ -183,7 +189,6 @@ impl StatsAccumulator {
             );
         }
 
-        self.window.clear();
         let _ = std::io::stdout().flush();
     }
 }

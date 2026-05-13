@@ -1,6 +1,7 @@
 //! Command-line argument parsing for `tracing-console`, via clap.
 
 use clap::{Parser, ValueEnum};
+use tracing_console_host::WireLevelFilter;
 
 pub const DEFAULT_HOST: &str = "127.0.0.1:7777";
 /// Default rolling-buffer size for received spans.
@@ -43,6 +44,41 @@ pub struct Args {
     /// further sends are dropped rather than blocking the producer.
     #[arg(long, default_value_t = DEFAULT_STREAM_BUFFER)]
     pub stream_buffer: usize,
+
+    /// Immediately on connect, request the host set its cache-
+    /// recording level to this value.  Useful for `--mode stats`
+    /// benchmarking and any other non-interactive run where you
+    /// don't want to type Shift+I/D/T to start recording.
+    #[arg(long, value_enum)]
+    pub set_level: Option<LevelArg>,
+
+    /// Immediately on connect, request the host set its
+    /// `ChancePredicate` percentage to this value (0.0–100.0).
+    #[arg(long)]
+    pub set_chance: Option<f64>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LevelArg {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LevelArg {
+    pub fn to_wire(self) -> WireLevelFilter {
+        match self {
+            LevelArg::Off => WireLevelFilter::Off,
+            LevelArg::Error => WireLevelFilter::Error,
+            LevelArg::Warn => WireLevelFilter::Warn,
+            LevelArg::Info => WireLevelFilter::Info,
+            LevelArg::Debug => WireLevelFilter::Debug,
+            LevelArg::Trace => WireLevelFilter::Trace,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

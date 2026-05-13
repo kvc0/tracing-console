@@ -42,8 +42,12 @@ const STREAM_BATCH: usize = 4096;
 // at typical loads.  Under sustained overload the interval bottoms out
 // at `STREAM_MIN_INTERVAL` and the per-tick `STREAM_BATCH` cap takes
 // over as the throughput limit.
-const STREAM_TARGET_BATCH: usize = 10;
-const STREAM_MIN_INTERVAL: Duration = Duration::from_micros(1);
+const STREAM_TARGET_BATCH: usize = 32;
+/// Floor for the adaptive page interval.  Set to `ZERO` so that
+/// under sustained overload the controller drops to "no sleep at
+/// all" — the polling loop just yields to the scheduler and pages
+/// again, which is the highest sustainable throughput.
+const STREAM_MIN_INTERVAL: Duration = Duration::ZERO;
 const STREAM_MAX_INTERVAL: Duration = Duration::from_millis(250);
 const STREAM_ADJUST_RATIO: f64 = 0.2; // ±20% per tick
 
@@ -317,20 +321,38 @@ fn span_stream<P: EnabledPredicate>(
         let mut cursor: u64 = 0;
         let mut interval = STREAM_POLL_INTERVAL_INITIAL;
         loop {
-            tokio::select! {
-                changed = level_rx.changed() => {
-                    if changed.is_err() { break; }
+            if interval.is_zero() {
+                // Saturated path: don't sleep at all.  Poll the
+                // watches non-blocking and immediately page again.
+                // `yield_now` is the only cooperative point so we
+                // don't starve other tokio tasks on this runtime.
+                if level_rx.has_changed().unwrap_or(false) {
                     let lvl = *level_rx.borrow_and_update();
                     yield Response::cache_level(lvl).with_id(request_id);
                     continue;
                 }
-                changed = chance_rx.changed() => {
-                    if changed.is_err() { break; }
+                if chance_rx.has_changed().unwrap_or(false) {
                     let pct = *chance_rx.borrow_and_update();
                     yield Response::cache_chance(pct).with_id(request_id);
                     continue;
                 }
-                _ = tokio::time::sleep(interval) => {}
+                tokio::task::yield_now().await;
+            } else {
+                tokio::select! {
+                    changed = level_rx.changed() => {
+                        if changed.is_err() { break; }
+                        let lvl = *level_rx.borrow_and_update();
+                        yield Response::cache_level(lvl).with_id(request_id);
+                        continue;
+                    }
+                    changed = chance_rx.changed() => {
+                        if changed.is_err() { break; }
+                        let pct = *chance_rx.borrow_and_update();
+                        yield Response::cache_chance(pct).with_id(request_id);
+                        continue;
+                    }
+                    _ = tokio::time::sleep(interval) => {}
+                }
             }
             // Snapshot the streaming flag + filter under the lock, then drop
             // it before paging the cache so the page isn't holding two locks.
@@ -371,12 +393,35 @@ fn span_stream<P: EnabledPredicate>(
 /// spans treats the ratio as if `count = 1` (i.e., grow by the maximum
 /// allowed amount).
 fn adjust_interval(current: Duration, count: usize) -> Duration {
+    // ZERO is a fixed point for multiplicative scaling — `ZERO.mul_f64(x)`
+    // is always ZERO, so once the controller lands on the no-sleep path it
+    // can't climb back out by itself.  That's only the right steady state
+    // when pages are genuinely full; otherwise we burn per-page lock cost
+    // on 1-span batches.  Seed back to 1 µs so the next adjustment has a
+    // non-zero base to scale from.
+    if current.is_zero() {
+        return if count >= STREAM_TARGET_BATCH {
+            Duration::ZERO
+        } else {
+            Duration::from_micros(1)
+        };
+    }
     let ratio = STREAM_TARGET_BATCH as f64 / count.max(1) as f64;
     let raw = current.mul_f64(ratio);
     let max_up = current.mul_f64(1.0 + STREAM_ADJUST_RATIO);
     let min_down = current.mul_f64(1.0 - STREAM_ADJUST_RATIO);
     let clamped = raw.clamp(min_down, max_up);
-    clamped.clamp(STREAM_MIN_INTERVAL, STREAM_MAX_INTERVAL)
+    let bounded = clamped.clamp(STREAM_MIN_INTERVAL, STREAM_MAX_INTERVAL);
+    // Below the OS's practical sleep resolution (~1 µs is a hard
+    // floor for tokio anyway), snap to ZERO so the loop hits the
+    // no-sleep fast path.  Without this, `mul_f64`'s round-to-
+    // -nearest gets stuck at 1 ns when shrinking by a constant
+    // ratio and the controller never crosses into "saturated".
+    if bounded < Duration::from_micros(1) {
+        Duration::ZERO
+    } else {
+        bounded
+    }
 }
 
 /// True iff `record_level` is at least as severe as `floor`.  In tracing's
@@ -587,19 +632,29 @@ mod tests {
 
     #[test]
     fn adjust_interval_takes_ratio_when_inside_20pct_band() {
-        // count == 11, target == 10: ratio = 10/11 ≈ 0.909, within [0.8, 1.2].
+        // count just above target: ratio inside [0.8, 1.2].
         let i = Duration::from_millis(110);
-        let next = adjust_interval(i, 11);
-        // 110 ms × 10/11 = 100 ms exactly.
-        assert_eq!(next, Duration::from_millis(100));
+        let count = STREAM_TARGET_BATCH + STREAM_TARGET_BATCH / 10;
+        let next = adjust_interval(i, count);
+        // 110 ms × target / count.
+        let expected = i.mul_f64(STREAM_TARGET_BATCH as f64 / count as f64);
+        assert_eq!(next, expected);
     }
 
     #[test]
     fn adjust_interval_clamps_to_min_floor() {
-        // Already at the floor and observing huge counts: stays at floor.
+        // At the ZERO floor with saturated batches: stays at ZERO.
         let i = STREAM_MIN_INTERVAL;
         let next = adjust_interval(i, STREAM_TARGET_BATCH * 100);
         assert_eq!(next, STREAM_MIN_INTERVAL);
+    }
+
+    #[test]
+    fn adjust_interval_escapes_zero_when_batches_undersized() {
+        // At ZERO but pages are tiny: re-seed at 1 µs so multiplicative
+        // scaling has a non-zero base to climb from.
+        let next = adjust_interval(Duration::ZERO, 1);
+        assert_eq!(next, Duration::from_micros(1));
     }
 
     #[test]
@@ -612,8 +667,10 @@ mod tests {
 
     #[test]
     fn adjust_interval_reaches_min_in_bounded_steps_under_overload() {
-        // Sustained overload: each step shrinks by exactly 20%.  From 50 ms
-        // down to STREAM_MIN_INTERVAL (1 µs) takes ~log_0.8(2e-5) ≈ 49 steps.
+        // Sustained overload: each step shrinks by exactly 20%, so
+        // from 50 ms down to `STREAM_MIN_INTERVAL` (= ZERO) takes
+        // ~log_0.8(1 ns / 50 ms) ≈ 80 steps before nanosecond
+        // precision rounds the result to zero.
         let mut i = Duration::from_millis(50);
         let mut steps = 0;
         while i > STREAM_MIN_INTERVAL && steps < 1000 {
@@ -621,7 +678,7 @@ mod tests {
             steps += 1;
         }
         assert_eq!(i, STREAM_MIN_INTERVAL);
-        assert!(steps < 60, "took {steps} steps to reach floor");
+        assert!(steps < 100, "took {steps} steps to reach floor");
     }
 
     /// Bind a std listener to ephemeral port, capture the port, drop it.  The
