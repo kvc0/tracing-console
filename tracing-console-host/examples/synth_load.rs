@@ -56,7 +56,8 @@ use std::time::Duration;
 
 use tokio::time::interval;
 use tracing::Level;
-use tracing_cache::SpanCache;
+use tracing::metadata::LevelFilter;
+use tracing_cache::{ChancePredicate, LevelPredicate, SpanCache};
 use tracing_console_host::serve;
 
 /// Channel labels rotated through by `post_message`.
@@ -66,14 +67,23 @@ const CHANNELS: &[&str] = &["general", "engineering", "ops"];
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (hz, per_tick, addr) = parse_args();
 
-    let (cache, driver) = SpanCache::new(16384);
+    // Default OFF + chance=100% so the host doesn't record anything
+    // until a console connects and raises the level via Shift+I /D /T,
+    // and root sampling is full when it does.
+    let level = LevelPredicate::with_filter(LevelFilter::OFF);
+    let level_handle = level.handle();
+    let predicate = ChancePredicate::new(level, 100.0);
+    let chance_handle = predicate.handle();
+    let (cache, driver) = SpanCache::with_predicate(16384, predicate);
     let cache = Arc::new(cache);
     tracing::subscriber::set_global_default(Arc::clone(&cache))?;
     tokio::spawn(driver.run());
 
     let serve_cache = Arc::clone(&cache);
+    let serve_level = level_handle.clone();
+    let serve_chance = chance_handle.clone();
     tokio::spawn(async move {
-        if let Err(e) = serve(serve_cache, addr).await {
+        if let Err(e) = serve(serve_cache, serve_level, serve_chance, addr).await {
             eprintln!("serve: {e}");
         }
     });

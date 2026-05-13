@@ -23,5 +23,7 @@ pub use cache::SpanCache;
 pub use config::{CacheConfig, DEFAULT_LANE_COUNT};
 pub use driver::Driver;
 pub use object_pool::{ObjectPool, Pool, Resettable, ReuseRef};
-pub use predicate::{EnabledPredicate, Interest, LevelPredicate};
+pub use predicate::{
+    ChanceHandle, ChancePredicate, EnabledPredicate, Interest, LevelHandle, LevelPredicate,
+};
 pub use record::{EventRecord, FieldList, FieldValue, SpanRecord};

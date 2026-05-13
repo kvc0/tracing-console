@@ -127,6 +127,53 @@ impl WireEvent {
     }
 }
 
+// ── Level filter (mirrors tracing::LevelFilter, OFF + 5 levels) ─────────────
+
+/// Wire counterpart to `tracing::level_filters::LevelFilter`.  Includes
+/// `Off` because the cache-side global level can be fully disabled —
+/// distinct from `WireLevel` (which is the per-span/event level and
+/// therefore can't be "off").
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WireLevelFilter {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl WireLevelFilter {
+    pub fn from_tracing(filter: tracing::metadata::LevelFilter) -> Self {
+        use tracing::metadata::LevelFilter as L;
+        if filter == L::OFF {
+            WireLevelFilter::Off
+        } else if filter == L::ERROR {
+            WireLevelFilter::Error
+        } else if filter == L::WARN {
+            WireLevelFilter::Warn
+        } else if filter == L::INFO {
+            WireLevelFilter::Info
+        } else if filter == L::DEBUG {
+            WireLevelFilter::Debug
+        } else {
+            WireLevelFilter::Trace
+        }
+    }
+
+    pub fn to_tracing(self) -> tracing::metadata::LevelFilter {
+        use tracing::metadata::LevelFilter as L;
+        match self {
+            WireLevelFilter::Off => L::OFF,
+            WireLevelFilter::Error => L::ERROR,
+            WireLevelFilter::Warn => L::WARN,
+            WireLevelFilter::Info => L::INFO,
+            WireLevelFilter::Debug => L::DEBUG,
+            WireLevelFilter::Trace => L::TRACE,
+        }
+    }
+}
+
 // ── Request body — every command the client can send ─────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +190,17 @@ pub enum RequestBody {
     /// Per-connection minimum span level filter.  Only spans whose level is
     /// at least this severe (per `tracing` ordering) are streamed.
     SetLevel(WireLevel),
+    /// Server-wide cache-recording level.  Mutates the subscriber's
+    /// `LevelPredicate`, so it affects what the cache *records*, not
+    /// just what gets streamed to one client.  The server pushes the
+    /// resulting level back to every connected stream as
+    /// [`ResponseBody::CacheLevel`].
+    SetCacheLevel(WireLevelFilter),
+    /// Server-wide chance percentage `[0.0, 100.0]` that a root
+    /// span passes the cache's `ChancePredicate`.  Out-of-range or
+    /// NaN values are clamped server-side; the resulting effective
+    /// chance is broadcast as [`ResponseBody::CacheChance`].
+    SetCacheChance(f64),
     /// Sample the stream — `1.0` = every span, `0.5` = ~half.  Applied per
     /// root-span family so a sampled root drops its whole subtree.
     SetSamplingRate(f64),
@@ -204,6 +262,16 @@ pub enum ResponseBody {
     /// One closed span snapshot.  The streaming response side of `StartStream`
     /// emits these one at a time as the host's span cache produces them.
     Span(WireSpan),
+    /// Server-pushed notification of the current cache-recording level.
+    /// Sent once when a `StartStream` begins and again every time the
+    /// level changes (e.g. another client sent `SetCacheLevel`).  The
+    /// client treats this as the source of truth for its UI display.
+    CacheLevel(WireLevelFilter),
+    /// Server-pushed notification of the current effective chance
+    /// percentage `[0.0, 100.0]` for the cache's `ChancePredicate`.
+    /// Same lifecycle as [`CacheLevel`]: sent on `StartStream` and on
+    /// every change.
+    CacheChance(f64),
     /// Acknowledgement of a unary command (Set*, StopStream).
     Ack,
     /// Server-side error message for a command.
@@ -233,6 +301,23 @@ impl Response {
     }
     pub fn span(s: WireSpan) -> Self {
         Self::new(ResponseBody::Span(s))
+    }
+    pub fn cache_level(level: WireLevelFilter) -> Self {
+        Self::new(ResponseBody::CacheLevel(level))
+    }
+    pub fn cache_chance(pct: f64) -> Self {
+        Self::new(ResponseBody::CacheChance(pct))
+    }
+    /// Set the message id and return `self` so the call chains.  The
+    /// server must echo the request id on every response so the
+    /// client's completion registry (keyed by id) can route the
+    /// response back to the right pending RPC.  protosocket-rpc does
+    /// NOT auto-assign ids — both endpoints must do it manually, and
+    /// in particular an RPC at id=0 will clobber any other RPC at
+    /// id=0 on the same client connection.
+    pub fn with_id(mut self, id: u64) -> Self {
+        self.id = id;
+        self
     }
 }
 

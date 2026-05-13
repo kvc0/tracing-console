@@ -247,6 +247,16 @@ impl<P: EnabledPredicate> SpanCache<P> {
         self.map.read().unwrap().get(&actual_id).cloned()
     }
 
+    /// Drop every closed span currently in the BTreeMap.  Called by
+    /// the host when the cache-recording level transitions to `OFF`
+    /// so a paused host doesn't keep stale data around to confuse the
+    /// next session.  In-flight spans (still open in the slabs) are
+    /// not affected; if any close after this call they'll repopulate
+    /// the map as normal.
+    pub fn clear(&self) {
+        self.map.write().unwrap().clear();
+    }
+
     /// Resolve the `actual_id` (i.e. the [`SpanRecord::id`] used as the
     /// `BTreeMap` key after close) for an in-flight span addressed by
     /// its `tracing::span::Id` u64.  Lock-free `Acquire` load from the

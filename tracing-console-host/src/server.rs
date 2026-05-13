@@ -2,15 +2,21 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use protosocket::TcpSocketListener;
 use protosocket_messagepack::{MessagePackDecoder, MessagePackSerializer};
+use protosocket_rpc::Message;
 use protosocket_rpc::server::{ConnectionService, RpcResponder, SocketRpcServer, SocketService};
-use tracing_cache::{EnabledPredicate, SpanCache, SpanRecord};
+use tokio::sync::watch;
+use tracing::metadata::LevelFilter;
+use tracing_cache::{
+    ChanceHandle, ChancePredicate, EnabledPredicate, LevelHandle, SpanCache, SpanRecord,
+};
 
-use crate::protocol::{Request, RequestBody, Response, WireLevel};
+use crate::protocol::{Request, RequestBody, Response, WireLevel, WireLevelFilter};
 use crate::wire::{TimeBase, span_to_wire};
 
 // One messagepack frame per direction:
@@ -63,6 +69,123 @@ impl StreamState {
     }
 }
 
+// ── Cache-level broadcaster ──────────────────────────────────────────────────
+
+/// Holds the `LevelHandle` for the cache's `LevelPredicate` plus a
+/// `tokio::sync::watch` channel so every active streaming connection
+/// can observe level changes without polling the handle.  A
+/// `SetCacheLevel` from any client flips the handle and pushes the
+/// new value into the watch — receivers wake up and forward a
+/// `CacheLevel` message down their span stream.
+///
+/// Also tracks the number of active streaming sessions via
+/// [`StreamGuard`] so the host can fall back to `OFF` when the last
+/// console drops — the cache costs zero work when nobody's watching.
+#[derive(Clone)]
+pub struct CacheLevelBroadcast {
+    level_handle: LevelHandle,
+    level_tx: watch::Sender<WireLevelFilter>,
+    chance_handle: ChanceHandle,
+    chance_tx: watch::Sender<f64>,
+    /// Trait-erased "clear the cache's BTreeMap of closed spans"
+    /// hook.  Fired whenever the level transitions to `OFF` —
+    /// explicit `SetCacheLevel` or the last-disconnect reset — so
+    /// a paused host doesn't keep stale recordings around.
+    clear_cache: Arc<dyn Fn() + Send + Sync>,
+    active_streams: Arc<AtomicUsize>,
+}
+
+impl CacheLevelBroadcast {
+    pub fn new(
+        level_handle: LevelHandle,
+        chance_handle: ChanceHandle,
+        clear_cache: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let initial_level = WireLevelFilter::from_tracing(level_handle.get());
+        let initial_chance = chance_handle.get();
+        let (level_tx, _) = watch::channel(initial_level);
+        let (chance_tx, _) = watch::channel(initial_chance);
+        Self {
+            level_handle,
+            level_tx,
+            chance_handle,
+            chance_tx,
+            clear_cache,
+            active_streams: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn set_level(&self, filter: WireLevelFilter) {
+        if filter == WireLevelFilter::Off {
+            (self.clear_cache)();
+        }
+        self.level_handle.set(filter.to_tracing());
+        let _ = self.level_tx.send(filter);
+    }
+
+    fn set_chance(&self, pct: f64) {
+        // Clamp to a sensible range — the cache also clamps, but we
+        // broadcast the *effective* value so clients show what the
+        // host is actually applying.
+        let pct = if pct.is_nan() {
+            0.0
+        } else {
+            pct.clamp(0.0, 100.0)
+        };
+        self.chance_handle.set(pct);
+        let _ = self.chance_tx.send(pct);
+    }
+
+    fn subscribe_level(&self) -> watch::Receiver<WireLevelFilter> {
+        self.level_tx.subscribe()
+    }
+
+    fn subscribe_chance(&self) -> watch::Receiver<f64> {
+        self.chance_tx.subscribe()
+    }
+
+    /// Register a new console *streaming session* (one StartStream
+    /// RPC).  Returns a guard whose `Drop` decrements the counter;
+    /// when the counter hits zero (the last streaming RPC ended),
+    /// the level resets to `OFF`, the cache is cleared, and the
+    /// new state is broadcast so any still-active stream picks it
+    /// up.  Scoped to the streaming RPC (not the connection) so
+    /// liveness probes that open + close a TCP socket without
+    /// issuing StartStream don't trigger a spurious reset.
+    fn enter_stream(&self) -> StreamGuard {
+        self.active_streams.fetch_add(1, Ordering::SeqCst);
+        StreamGuard {
+            broadcast: self.clone(),
+        }
+    }
+}
+
+/// RAII guard tracking a single active StartStream RPC.  Held by
+/// the `span_stream` async generator, so its `Drop` runs when the
+/// generator (and thus the spawned responder.stream future) ends —
+/// e.g. when the client cancels the streaming RPC by dropping the
+/// `StreamingCompletion`.
+pub struct StreamGuard {
+    broadcast: CacheLevelBroadcast,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let prev = self.broadcast.active_streams.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            // Last active streaming session — drop the cache back to
+            // OFF so an idle host pays nothing for tracing dispatch,
+            // wipe recorded spans, and reset chance to 100% so the
+            // next console reconnects to a clean slate.
+            (self.broadcast.clear_cache)();
+            self.broadcast.level_handle.set(LevelFilter::OFF);
+            let _ = self.broadcast.level_tx.send(WireLevelFilter::Off);
+            self.broadcast.chance_handle.set(100.0);
+            let _ = self.broadcast.chance_tx.send(100.0);
+        }
+    }
+}
+
 // ── Per-connection service ───────────────────────────────────────────────────
 
 /// One per active client connection.  Holds an `Arc` to the shared cache so
@@ -71,6 +194,14 @@ pub struct ConnectionState<P: EnabledPredicate> {
     cache: Arc<SpanCache<P>>,
     base: TimeBase,
     state: Arc<RwLock<StreamState>>,
+    level_bus: CacheLevelBroadcast,
+    /// Lazily set on the first StartStream RPC.  Liveness probes that
+    /// open + close a TCP connection without ever issuing a streaming
+    /// RPC leave this `None`, so their drop doesn't decrement the
+    /// active-stream counter and trigger a spurious reset.  A real
+    /// console always sends StartStream once, so its connection's
+    /// drop reliably fires the reset.
+    stream_guard: Option<StreamGuard>,
     /// Memo of which root-span actual_ids the filter accepted (so descendants
     /// inherit transitively without rechecking the filter against fields the
     /// child doesn't carry).  Bounded — drops oldest entries when over budget.
@@ -78,11 +209,13 @@ pub struct ConnectionState<P: EnabledPredicate> {
 }
 
 impl<P: EnabledPredicate> ConnectionState<P> {
-    fn new(cache: Arc<SpanCache<P>>, base: TimeBase) -> Self {
+    fn new(cache: Arc<SpanCache<P>>, base: TimeBase, level_bus: CacheLevelBroadcast) -> Self {
         Self {
             cache,
             base,
             state: Arc::new(RwLock::new(StreamState::new())),
+            level_bus,
+            stream_guard: None,
             root_decisions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -93,62 +226,112 @@ impl<P: EnabledPredicate> ConnectionService for ConnectionState<P> {
     type Response = Response;
 
     fn new_rpc(&mut self, msg: Request, responder: RpcResponder<'_, Response>) {
+        // Every Response must echo the request id so the client's
+        // completion registry (keyed by id) routes it back to the
+        // right pending RPC — see `Response::with_id`.
+        let request_id = msg.message_id();
         match msg.body {
             RequestBody::StartStream => {
                 self.state.write().unwrap().streaming = true;
+                // First StartStream on this connection — register a
+                // stream guard tied to the connection's lifetime.
+                // Subsequent StartStreams are idempotent: the guard
+                // already exists, the counter doesn't move twice.
+                if self.stream_guard.is_none() {
+                    self.stream_guard = Some(self.level_bus.enter_stream());
+                }
                 let cache = Arc::clone(&self.cache);
                 let state = Arc::clone(&self.state);
                 let roots = Arc::clone(&self.root_decisions);
                 let base = self.base;
-                tokio::spawn(responder.stream(span_stream(cache, state, roots, base)));
+                let level_rx = self.level_bus.subscribe_level();
+                let chance_rx = self.level_bus.subscribe_chance();
+                tokio::spawn(responder.stream(span_stream(
+                    cache, state, roots, base, level_rx, chance_rx, request_id,
+                )));
             }
             RequestBody::StopStream => {
                 self.state.write().unwrap().streaming = false;
-                responder.immediate(Response::ack());
+                responder.immediate(Response::ack().with_id(request_id));
             }
             RequestBody::SetLevel(level) => {
                 self.state.write().unwrap().min_level = Some(level);
-                responder.immediate(Response::ack());
+                responder.immediate(Response::ack().with_id(request_id));
+            }
+            RequestBody::SetCacheLevel(filter) => {
+                self.level_bus.set_level(filter);
+                responder.immediate(Response::ack().with_id(request_id));
+            }
+            RequestBody::SetCacheChance(pct) => {
+                self.level_bus.set_chance(pct);
+                responder.immediate(Response::ack().with_id(request_id));
             }
             RequestBody::SetSamplingRate(rate) => {
                 if !(0.0..=1.0).contains(&rate) || rate.is_nan() {
-                    responder.immediate(Response::error(format!(
-                        "sampling rate {rate} out of range [0.0, 1.0]"
-                    )));
+                    responder.immediate(
+                        Response::error(format!("sampling rate {rate} out of range [0.0, 1.0]"))
+                            .with_id(request_id),
+                    );
                     return;
                 }
                 self.state.write().unwrap().sampling_rate = rate;
-                // Sampling decisions are made at root-span creation time —
-                // reset the memo so the new rate applies prospectively.
                 self.root_decisions.write().unwrap().clear();
-                responder.immediate(Response::ack());
+                responder.immediate(Response::ack().with_id(request_id));
             }
             RequestBody::SetFilter(f) => {
                 self.state.write().unwrap().root_filter = f;
                 self.root_decisions.write().unwrap().clear();
-                responder.immediate(Response::ack());
+                responder.immediate(Response::ack().with_id(request_id));
             }
-            RequestBody::Noop => {
-                // Cancel / End control frames land here; nothing to do.
-            }
+            RequestBody::Noop => {}
         }
     }
 }
 
-/// Build the async stream of `Response::Span` messages that satisfies a
-/// `StartStream` RPC.  Polls the cache's BTreeMap on a tick, applies the
-/// connection's filter / level / sampling, and yields each accepted span.
+/// Build the async stream of `Response` messages that satisfies a
+/// `StartStream` RPC.  Yields:
+///
+/// * an initial `CacheLevel` carrying the current cache level (so the
+///   client's UI is in sync the moment streaming begins),
+/// * every span the cache produces (after per-connection level /
+///   sampling / filter), and
+/// * a fresh `CacheLevel` every time the level changes (broadcast
+///   from any client's `SetCacheLevel`).
 fn span_stream<P: EnabledPredicate>(
     cache: Arc<SpanCache<P>>,
     state: Arc<RwLock<StreamState>>,
     roots: Arc<RwLock<HashMap<u64, bool>>>,
     base: TimeBase,
+    mut level_rx: watch::Receiver<WireLevelFilter>,
+    mut chance_rx: watch::Receiver<f64>,
+    request_id: u64,
 ) -> impl futures_core::Stream<Item = Response> {
     async_stream::stream! {
+        // Push current level + chance first so the client renders
+        // its switcher / chance UI before any spans land.
+        let initial_level = *level_rx.borrow_and_update();
+        yield Response::cache_level(initial_level).with_id(request_id);
+        let initial_chance = *chance_rx.borrow_and_update();
+        yield Response::cache_chance(initial_chance).with_id(request_id);
+
         let mut cursor: u64 = 0;
         let mut interval = STREAM_POLL_INTERVAL_INITIAL;
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                changed = level_rx.changed() => {
+                    if changed.is_err() { break; }
+                    let lvl = *level_rx.borrow_and_update();
+                    yield Response::cache_level(lvl).with_id(request_id);
+                    continue;
+                }
+                changed = chance_rx.changed() => {
+                    if changed.is_err() { break; }
+                    let pct = *chance_rx.borrow_and_update();
+                    yield Response::cache_chance(pct).with_id(request_id);
+                    continue;
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
             // Snapshot the streaming flag + filter under the lock, then drop
             // it before paging the cache so the page isn't holding two locks.
             let (streaming, min_level, sampling_rate, root_filter) = {
@@ -175,7 +358,7 @@ fn span_stream<P: EnabledPredicate>(
                 if !filter_passes(&record, &root_filter, &roots) {
                     continue;
                 }
-                yield Response::span(span_to_wire(&record, base));
+                yield Response::span(span_to_wire(&record, base)).with_id(request_id);
             }
             interval = adjust_interval(interval, count);
         }
@@ -272,6 +455,7 @@ fn root_matches(record: &SpanRecord, needle: &str) -> bool {
 struct Service<P: EnabledPredicate> {
     cache: Arc<SpanCache<P>>,
     base: TimeBase,
+    level_bus: CacheLevelBroadcast,
 }
 
 impl<P: EnabledPredicate> SocketService for Service<P> {
@@ -290,7 +474,7 @@ impl<P: EnabledPredicate> SocketService for Service<P> {
         &self,
         _stream: &<Self::SocketListener as protosocket::SocketListener>::Stream,
     ) -> Self::ConnectionService {
-        ConnectionState::new(Arc::clone(&self.cache), self.base)
+        ConnectionState::new(Arc::clone(&self.cache), self.base, self.level_bus.clone())
     }
 }
 
@@ -322,18 +506,29 @@ impl From<protosocket_rpc::Error> for ServeError {
 
 /// Bind to `addr` and serve the console RPC protocol against `cache`.
 ///
-/// Caller is responsible for spawning the cache's `Driver`.  The future
-/// returned here runs until the listener errors out.
+/// `level_handle` is the `LevelHandle` returned by the cache's
+/// `LevelPredicate`; the server uses it to apply `SetCacheLevel`
+/// requests and to broadcast the resulting level to every connected
+/// stream.  Caller is responsible for spawning the cache's `Driver`
+/// and for keeping `level_handle` consistent with what the cache
+/// actually uses.  The future runs until the listener errors out.
 pub async fn serve<P: EnabledPredicate>(
     cache: Arc<SpanCache<P>>,
+    level_handle: LevelHandle,
+    chance_handle: ChanceHandle,
     addr: SocketAddr,
 ) -> Result<(), ServeError> {
     // listen(addr, listen_backlog, accept_timeout) — last two are optional knobs.
     let listener = TcpSocketListener::listen(addr, 1024, None)?;
 
+    let clear_cache: Arc<dyn Fn() + Send + Sync> = {
+        let cache = Arc::clone(&cache);
+        Arc::new(move || cache.clear())
+    };
     let service = Service {
         cache,
         base: TimeBase::now(),
+        level_bus: CacheLevelBroadcast::new(level_handle, chance_handle, clear_cache),
     };
     let server: SocketRpcServer<Service<P>, _> = SocketRpcServer::new(
         listener,
@@ -441,26 +636,44 @@ mod tests {
 
     /// Build a SpanCache, emit spans by running `f` under it, then synchronously
     /// drain so the BTreeMap has every closed span before any test assertion.
-    fn cache_with_spans<F>(f: F) -> Arc<SpanCache>
+    fn cache_with_spans<F>(
+        f: F,
+    ) -> (
+        Arc<SpanCache<ChancePredicate<tracing_cache::LevelPredicate>>>,
+        LevelHandle,
+        ChanceHandle,
+    )
     where
         F: FnOnce(),
     {
-        let (cache, driver) = SpanCache::new(1024);
+        let level = tracing_cache::LevelPredicate::with_filter(
+            tracing::metadata::LevelFilter::TRACE,
+        );
+        let level_handle = level.handle();
+        let predicate = ChancePredicate::new(level, 100.0);
+        let chance_handle = predicate.handle();
+        let (cache, driver) = SpanCache::with_predicate(1024, predicate);
         let cache = Arc::new(cache);
         tracing::subscriber::with_default(Arc::clone(&cache), f);
         cache.flush_pending();
         driver.drain_sync();
-        cache
+        (cache, level_handle, chance_handle)
     }
 
     /// Spawn `serve` on a free port; return the address and a JoinHandle for
     /// abort-on-drop semantics.  Briefly retries connect to confirm bind.
-    async fn spawn_server(cache: Arc<SpanCache>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    async fn spawn_server<P: EnabledPredicate>(
+        cache: Arc<SpanCache<P>>,
+        level_handle: LevelHandle,
+        chance_handle: ChanceHandle,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let addr = pick_addr();
         let server_cache = Arc::clone(&cache);
+        let serve_level = level_handle.clone();
+        let serve_chance = chance_handle.clone();
         let handle = tokio::spawn(async move {
             // Discard the result; the test aborts this task at the end.
-            let _ = serve(server_cache, addr).await;
+            let _ = serve(server_cache, serve_level, serve_chance, addr).await;
         });
         // Wait for the server to actually be listening.
         for _ in 0..50 {
@@ -507,14 +720,14 @@ mod tests {
 
     #[tokio::test]
     async fn start_stream_delivers_closed_spans() {
-        let cache = cache_with_spans(|| {
+        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
             for _ in 0..3 {
                 let span = tracing::span!(parent: None, tracing::Level::INFO, "test_a");
                 let _g = span.enter();
             }
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
         let client = connect_client(addr).await;
         let mut stream = client
             .send_streaming(Request::new(RequestBody::StartStream))
@@ -531,14 +744,14 @@ mod tests {
 
     #[tokio::test]
     async fn stop_stream_halts_delivery() {
-        let cache = cache_with_spans(|| {
+        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
             for _ in 0..5 {
                 let span = tracing::span!(parent: None, tracing::Level::INFO, "test_b");
                 let _g = span.enter();
             }
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
         let client = connect_client(addr).await;
         let mut stream = client
             .send_streaming(Request::new(RequestBody::StartStream))
@@ -572,7 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_level_filters_below_threshold() {
-        let cache = cache_with_spans(|| {
+        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
             // The cache predicate is TRACE so DEBUG is captured; the host's
             // SetLevel must be the thing that filters DEBUG on the wire.
             let span_info = tracing::span!(parent: None, tracing::Level::INFO, "info_span");
@@ -581,7 +794,7 @@ mod tests {
             drop(span_debug);
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
         let client = connect_client(addr).await;
 
         let ack = client
@@ -604,14 +817,14 @@ mod tests {
 
     #[tokio::test]
     async fn set_sampling_rate_zero_drops_all() {
-        let cache = cache_with_spans(|| {
+        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
             for _ in 0..5 {
                 let span = tracing::span!(parent: None, tracing::Level::INFO, "sampled");
                 let _g = span.enter();
             }
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
         let client = connect_client(addr).await;
 
         client
@@ -634,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_filter_matches_root_and_inherits_to_children() {
-        let cache = cache_with_spans(|| {
+        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
             // Two trees; "alpha" matches the filter, "beta" doesn't.
             {
                 let root = tracing::span!(parent: None, tracing::Level::INFO, "alpha");
@@ -648,7 +861,7 @@ mod tests {
             }
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache)).await;
+        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
         let client = connect_client(addr).await;
 
         client
@@ -666,6 +879,108 @@ mod tests {
         let mut names: Vec<_> = received.iter().map(|s| s.name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["alpha".to_string(), "alpha_child".to_string()]);
+
+        server.abort();
+    }
+
+    /// Setting the cache level must not end the streaming RPC — the
+    /// server should push a fresh `CacheLevel` notification on the
+    /// existing stream and continue streaming spans after.
+    #[tokio::test]
+    async fn set_cache_level_keeps_stream_open() {
+        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
+            // Pre-populate a span so the stream has content to deliver.
+            let s = tracing::span!(parent: None, tracing::Level::INFO, "pre_level");
+            drop(s);
+        });
+        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let client = connect_client(addr).await;
+        // Distinct ids — the framework matches responses to RPCs by
+        // request id, and id=0 would clobber on the client side.
+        let mut start = Request::new(RequestBody::StartStream);
+        start.id = 100;
+        let mut stream = client.send_streaming(start).unwrap();
+
+        // First push is always the initial CacheLevel snapshot.
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first.body, ResponseBody::CacheLevel(_)),
+            "first message should be CacheLevel, got {:?}",
+            first.body
+        );
+
+        // Change the level — the unary should ack while the streaming
+        // RPC stays open.
+        let mut set = Request::new(RequestBody::SetCacheLevel(WireLevelFilter::Off));
+        set.id = 101;
+        let ack = client.send_unary(set).unwrap().await.unwrap();
+        assert!(matches!(ack.body, ResponseBody::Ack));
+
+        // Next stream item must be the updated CacheLevel; it must
+        // arrive (not end-of-stream) within a generous window.
+        let mut next_level: Option<WireLevelFilter> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && next_level.is_none() {
+            let item = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+            let Ok(Some(Ok(resp))) = item else { continue };
+            match resp.body {
+                ResponseBody::CacheLevel(l) => next_level = Some(l),
+                // Initial chance push + any chance broadcasts are fine
+                // — we just don't care about them in this test.
+                ResponseBody::CacheChance(_) => continue,
+                ResponseBody::Span(_) => continue,
+                other => panic!("unexpected stream item: {other:?}"),
+            }
+        }
+        assert_eq!(
+            next_level,
+            Some(WireLevelFilter::Off),
+            "stream did not yield the updated CacheLevel (probably ended)",
+        );
+
+        server.abort();
+    }
+
+    /// When the last streaming RPC drops, the server should reset
+    /// the cache level to `OFF`.  Verified by: connect a client at
+    /// non-OFF level, drop the client, then reconnect and observe
+    /// the initial CacheLevel is OFF.
+    #[tokio::test]
+    async fn level_resets_to_off_when_last_console_disconnects() {
+        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
+            let s = tracing::span!(parent: None, tracing::Level::INFO, "anchor");
+            drop(s);
+        });
+        // Start at INFO via the cache predicate handle.
+        level_handle.set(LevelFilter::INFO);
+
+        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+
+        // Open a streaming RPC; drop it immediately to mimic a console
+        // disconnect.
+        {
+            let client = connect_client(addr).await;
+            let mut start = Request::new(RequestBody::StartStream);
+            start.id = 200;
+            let _stream = client.send_streaming(start).unwrap();
+            // Wait a beat for the StartStream to register on the
+            // server side, then drop everything.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Give the server time to notice the disconnect and run the
+        // StreamGuard's Drop.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Level handle should now read OFF.
+        assert_eq!(
+            level_handle.get(),
+            LevelFilter::OFF,
+            "level should have reset to OFF after last console disconnected",
+        );
 
         server.abort();
     }

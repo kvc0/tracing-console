@@ -38,15 +38,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "127.0.0.1:7777".to_string())
         .parse()?;
 
-    let (cache, driver) = SpanCache::new(16384);
+    let level = tracing_cache::LevelPredicate::with_filter(
+        tracing::metadata::LevelFilter::OFF,
+    );
+    let level_handle = level.handle();
+    let predicate = tracing_cache::ChancePredicate::new(level, 100.0);
+    let chance_handle = predicate.handle();
+    let (cache, driver) = SpanCache::with_predicate(16384, predicate);
     let cache = Arc::new(cache);
 
     tracing::subscriber::set_global_default(Arc::clone(&cache))?;
     tokio::spawn(driver.run());
 
     let serve_cache = Arc::clone(&cache);
+    let serve_level = level_handle.clone();
+    let serve_chance = chance_handle.clone();
     tokio::spawn(async move {
-        if let Err(e) = serve(serve_cache, addr).await {
+        if let Err(e) = serve(serve_cache, serve_level, serve_chance, addr).await {
             eprintln!("serve: {e}");
         }
     });

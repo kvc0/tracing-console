@@ -5,14 +5,14 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use futures::FutureExt;
 use tracing_console_host::WireSpan;
 
 use crate::aggregate::{StackStats, bucket_by_stack, fmt_ns, tree_label};
 use crate::model::Update;
 
 pub async fn run_stats(
-    mut rx: mpsc::UnboundedReceiver<Update>,
+    mut rx: spillway::Receiver<Update>,
     hz: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let period = Duration::from_secs_f64(1.0 / hz);
@@ -26,14 +26,19 @@ pub async fn run_stats(
         let instant = tick.tick().await;
         let now: Instant = instant.into_std();
         let mut closed = false;
+        // Drain everything currently in the channel.  `now_or_never`
+        // on `rx.next()` returns:
+        //   * Some(Some(t))  → got an item, keep draining
+        //   * Some(None)     → all senders dropped, channel closed
+        //   * None           → channel empty right now, stop the drain
         loop {
-            match rx.try_recv() {
-                Ok(update) => acc.absorb(update),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+            match rx.next().now_or_never() {
+                Some(Some(update)) => acc.absorb(update),
+                Some(None) => {
                     closed = true;
                     break;
                 }
+                None => break,
             }
         }
         let elapsed_window = now.saturating_duration_since(last_tick);
@@ -97,6 +102,14 @@ impl StatsAccumulator {
             | Update::CollapseSelected
             | Update::SwitchFocus
             | Update::ToggleSplitSelected
+            | Update::CacheLevelReceived(_)
+            | Update::RequestCacheLevel(_)
+            | Update::CacheChanceReceived(_)
+            | Update::BeginChanceInput
+            | Update::ChanceInputChar(_)
+            | Update::ChanceInputBackspace
+            | Update::ChanceInputCancel
+            | Update::ChanceInputCommit
             | Update::Quit => {}
         }
     }

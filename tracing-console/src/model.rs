@@ -7,11 +7,75 @@
 //! assert on the resulting model.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tracing_console_host::WireSpan;
+use tracing_console_host::{WireLevelFilter, WireSpan};
 
 use crate::aggregate::{BucketKey, StackStats, bucket_by_stack};
+
+/// Half-second-bucket rolling-rate counter.  The model holds 21
+/// buckets — the in-progress one plus 20 older half-seconds (10 s
+/// of completed history).  `rate_hz` reports the average over the
+/// 20 completed buckets only; the in-progress bucket is ignored so
+/// partial fills don't drag the displayed Hz down.
+///
+/// Skipped from serialization because it's purely transient
+/// display state — round-trip tests would otherwise have to deal
+/// with timing-dependent `Instant`s.
+#[derive(Debug, Clone, Default)]
+pub struct RateTracker {
+    /// Per-half-second counts.  `head` indexes the in-progress
+    /// (current) bucket.  `(head + 1) % 21` is the oldest.
+    buckets: [u32; 21],
+    head: usize,
+    /// `Instant` when the current bucket started; `None` until the
+    /// first sample lands.
+    bucket_start: Option<Instant>,
+}
+
+impl RateTracker {
+    /// Record one event at `now`, advancing buckets as needed.
+    pub fn record(&mut self, now: Instant) {
+        match self.bucket_start {
+            None => {
+                self.bucket_start = Some(now);
+            }
+            Some(start) => {
+                let elapsed_ms = now.duration_since(start).as_millis() as u64;
+                if elapsed_ms >= 500 {
+                    // How many half-seconds have rolled past since
+                    // the current bucket opened.  Cap at 21 since
+                    // beyond that every bucket is stale anyway.
+                    let advances = ((elapsed_ms / 500) as usize).min(21);
+                    for _ in 0..advances {
+                        self.head = (self.head + 1) % 21;
+                        self.buckets[self.head] = 0;
+                    }
+                    self.bucket_start =
+                        Some(start + Duration::from_millis(500 * advances as u64));
+                }
+            }
+        }
+        self.buckets[self.head] = self.buckets[self.head].saturating_add(1);
+    }
+
+    /// Rate in Hz over the 20 completed buckets, ignoring the
+    /// in-progress one.  Returns 0.0 before any sample has landed.
+    pub fn rate_hz(&self) -> f64 {
+        if self.bucket_start.is_none() {
+            return 0.0;
+        }
+        let mut sum: u64 = 0;
+        for (i, &v) in self.buckets.iter().enumerate() {
+            if i != self.head {
+                sum += v as u64;
+            }
+        }
+        // 20 buckets × 0.5 s = 10 s of window.
+        sum as f64 / 10.0
+    }
+}
 
 /// One visible line in the hierarchical tree view.
 #[derive(Debug, Clone)]
@@ -23,12 +87,22 @@ pub struct VisibleRow {
     pub is_expanded: bool,
 }
 
-/// Which pane currently owns keyboard navigation.
+/// Which pane currently owns keyboard navigation.  `Tab` toggles
+/// between the two.  The level switcher is driven by global
+/// Shift+letter shortcuts (Shift-O/I/D/T), so it doesn't take focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Focus {
     Stacks,
     Details,
 }
+
+/// The four level choices the switcher exposes, in display order.
+pub const LEVEL_OPTIONS: &[WireLevelFilter] = &[
+    WireLevelFilter::Off,
+    WireLevelFilter::Info,
+    WireLevelFilter::Debug,
+    WireLevelFilter::Trace,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
@@ -47,6 +121,28 @@ pub struct Model {
     pub connection: ConnectionStatus,
     pub status: Option<String>,
     pub history_budget: usize,
+    /// Server-confirmed current cache-recording level — `None` until
+    /// the server pushes its first `CacheLevel` message.  Only
+    /// `Update::CacheLevelReceived` writes this; the user's
+    /// Shift+letter shortcuts do *not* update it optimistically —
+    /// confirmation flows from the server.
+    pub cache_level: Option<WireLevelFilter>,
+    /// Server-confirmed current chance percentage `[0.0, 100.0]`.
+    /// Same lifecycle as `cache_level`: `None` until the server
+    /// pushes its first `CacheChance`, and updates only via
+    /// `Update::CacheChanceReceived`.
+    pub cache_chance: Option<f64>,
+    /// When `Some`, the user is typing a new chance value (after
+    /// pressing `c`).  Only digits and `.` are accepted; `Enter`
+    /// commits and emits [`Effect::RequestSetChance`]; `Esc`
+    /// cancels and discards the buffer.  Empty string means the
+    /// user pressed `c` and hasn't typed anything yet.
+    pub chance_input: Option<String>,
+    /// Rolling 10-second receive-rate counter, displayed as
+    /// `N spans / NHz` in the header.  Transient — skipped from
+    /// serialization.
+    #[serde(skip)]
+    pub rate: RateTracker,
 }
 
 impl Model {
@@ -61,6 +157,10 @@ impl Model {
             connection: ConnectionStatus::Connecting,
             status: None,
             history_budget,
+            cache_level: None,
+            cache_chance: None,
+            chance_input: None,
+            rate: RateTracker::default(),
         }
     }
 
@@ -71,6 +171,7 @@ impl Model {
                     self.spans.pop_front();
                 }
                 self.spans.push_back(span);
+                self.rate.record(Instant::now());
                 Effect::None
             }
             Update::SelectUp => {
@@ -94,13 +195,12 @@ impl Model {
                 Effect::None
             }
             Update::ExpandSelected => {
-                if self.focus != Focus::Stacks {
-                    return Effect::None;
-                }
-                let rows = self.visible_rows();
-                if let Some(r) = rows.get(self.selected) {
-                    if r.has_children {
-                        self.expanded.insert(r.key.clone());
+                if self.focus == Focus::Stacks {
+                    let rows = self.visible_rows();
+                    if let Some(r) = rows.get(self.selected) {
+                        if r.has_children {
+                            self.expanded.insert(r.key.clone());
+                        }
                     }
                 }
                 Effect::None
@@ -167,8 +267,6 @@ impl Model {
                     Focus::Stacks => Focus::Details,
                     Focus::Details => Focus::Stacks,
                 };
-                // Reset details cursor when entering Details so it
-                // doesn't reference a stale position.
                 if self.focus == Focus::Details {
                     self.details_selected = 0;
                 }
@@ -202,6 +300,54 @@ impl Model {
             Update::Status(msg) => {
                 self.status = Some(msg);
                 Effect::None
+            }
+            Update::CacheLevelReceived(filter) => {
+                self.cache_level = Some(filter);
+                Effect::None
+            }
+            Update::RequestCacheLevel(filter) => Effect::RequestSetLevel(filter),
+            Update::CacheChanceReceived(pct) => {
+                self.cache_chance = Some(pct);
+                Effect::None
+            }
+            Update::BeginChanceInput => {
+                self.chance_input = Some(String::new());
+                Effect::None
+            }
+            Update::ChanceInputChar(c) => {
+                if let Some(buf) = self.chance_input.as_mut() {
+                    // Accept only digits and a single decimal point.
+                    // Anything else (whitespace, letters, etc.) is
+                    // silently dropped — input mode never holds
+                    // garbage that the user could commit.
+                    if c.is_ascii_digit() || (c == '.' && !buf.contains('.')) {
+                        buf.push(c);
+                    }
+                }
+                Effect::None
+            }
+            Update::ChanceInputBackspace => {
+                if let Some(buf) = self.chance_input.as_mut() {
+                    buf.pop();
+                }
+                Effect::None
+            }
+            Update::ChanceInputCancel => {
+                self.chance_input = None;
+                Effect::None
+            }
+            Update::ChanceInputCommit => {
+                let Some(buf) = self.chance_input.take() else {
+                    return Effect::None;
+                };
+                // Empty buffer / invalid parse / out-of-range →
+                // revert silently, keep `cache_chance` untouched.
+                match buf.parse::<f64>() {
+                    Ok(v) if v.is_finite() && (0.0..=100.0).contains(&v) => {
+                        Effect::RequestSetChance(v)
+                    }
+                    _ => Effect::None,
+                }
             }
             Update::Quit => Effect::Quit,
         }
@@ -344,16 +490,52 @@ pub enum Update {
     /// In Details focus: toggle the highlighted metadata key in/out
     /// of `split_keys`.
     ToggleSplitSelected,
+    /// Server pushed the current cache-recording level — display
+    /// state is updated to reflect this (and only this).
+    CacheLevelReceived(WireLevelFilter),
+    /// User pressed a Shift+letter shortcut to request a new cache
+    /// level.  The model returns `Effect::RequestSetLevel`, which
+    /// the runtime turns into an outgoing `SetCacheLevel` RPC.
+    /// `cache_level` does *not* change here — it only flips when the
+    /// server pushes its `CacheLevel` reply back.
+    RequestCacheLevel(WireLevelFilter),
+    /// Server pushed the current cache-recording chance percentage.
+    CacheChanceReceived(f64),
+    /// User pressed `C` (with the level switcher visible) to begin
+    /// editing the chance percentage.  Initialises `chance_input` to
+    /// an empty buffer.
+    BeginChanceInput,
+    /// User typed a digit / `.` while editing the chance.  Anything
+    /// else is silently ignored.
+    ChanceInputChar(char),
+    /// User pressed Backspace while editing the chance.
+    ChanceInputBackspace,
+    /// User pressed `Esc` — cancel chance input without commit.
+    ChanceInputCancel,
+    /// User pressed `Enter` while editing the chance.  If the buffer
+    /// parses as an `f64` in `[0.0, 100.0]`, the model emits
+    /// `Effect::RequestSetChance(value)`; otherwise it silently
+    /// reverts (buffer is cleared, `cache_chance` stays unchanged).
+    ChanceInputCommit,
     Connected,
     Disconnected(String),
     Status(String),
     Quit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     None,
     Quit,
+    /// User committed a tentative level selection (Enter on the Level
+    /// pane).  The runtime translates this into an outgoing
+    /// `SetCacheLevel` RPC.  The model itself does not update
+    /// `cache_level` — that only flips when the server confirms.
+    RequestSetLevel(WireLevelFilter),
+    /// User committed a chance-input buffer.  The runtime turns this
+    /// into an outgoing `SetCacheChance` RPC.  `cache_chance` does
+    /// not change locally — the server's `CacheChance` confirms.
+    RequestSetChance(f64),
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -433,13 +615,25 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_focus() {
+    fn tab_toggles_focus_between_two_panes() {
         let mut m = Model::new(4);
         assert_eq!(m.focus, Focus::Stacks);
         m.apply(Update::SwitchFocus);
         assert_eq!(m.focus, Focus::Details);
         m.apply(Update::SwitchFocus);
         assert_eq!(m.focus, Focus::Stacks);
+    }
+
+    #[test]
+    fn request_cache_level_emits_effect_without_updating_state() {
+        let mut m = Model::new(4);
+        let effect = m.apply(Update::RequestCacheLevel(WireLevelFilter::Debug));
+        assert_eq!(effect, Effect::RequestSetLevel(WireLevelFilter::Debug));
+        // Local state is untouched — the server hasn't confirmed yet.
+        assert!(m.cache_level.is_none());
+        // Server confirms.
+        m.apply(Update::CacheLevelReceived(WireLevelFilter::Debug));
+        assert_eq!(m.cache_level, Some(WireLevelFilter::Debug));
     }
 
     #[test]

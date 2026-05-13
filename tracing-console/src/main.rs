@@ -16,6 +16,7 @@
 //! once this skeleton is happy.
 
 mod aggregate;
+mod args;
 mod model;
 mod stats;
 
@@ -36,85 +37,55 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as TuiSpan, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
-use tokio::sync::mpsc;
-use tracing_console_host::{Request, RequestBody, Response, ResponseBody};
+use tracing_console_host::{Request, RequestBody, Response, ResponseBody, WireLevelFilter};
 
+use crate::args::{Args, ModeFlag};
 use crate::model::{ConnectionStatus, Effect, Model, Update};
 
-const DEFAULT_HOST: &str = "127.0.0.1:7777";
-const HISTORY_BUDGET: usize = 4096;
+/// Outgoing commands that the runtime queues for the network task.
+/// Separate from `Update` so the model never sees them — the model
+/// only reflects server-confirmed state (e.g. `CacheLevelReceived`).
+#[derive(Debug, Clone)]
+enum Outgoing {
+    SetCacheLevel(WireLevelFilter),
+    SetCacheChance(f64),
+}
+
+/// Number of producer chutes on the Update spillway.  We have two
+/// fan-in points (network task + keyboard thread), so 2 is the
+/// minimum-contention setting.
+const UPDATE_CHANNEL_CONCURRENCY: usize = 2;
+
+/// Outgoing-request spillway is single-producer (the runtime), so
+/// concurrency = 1.  Capacity is small — outgoing requests are
+/// driven by keystrokes, not high-rate traffic.
+const OUTGOING_CHANNEL_CAPACITY: u64 = 64;
+const OUTGOING_CHANNEL_CONCURRENCY: usize = 1;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse(std::env::args().skip(1));
+    let args = Args::from_cli();
 
-    let (tx, rx) = mpsc::unbounded_channel::<Update>();
+    let stream_buffer = args.stream_buffer as u64;
+    let (tx, rx) = spillway::channel_with_capacity_and_concurrency::<Update>(
+        stream_buffer,
+        UPDATE_CHANNEL_CONCURRENCY,
+    );
+    let (out_tx, out_rx) = spillway::channel_with_capacity_and_concurrency::<Outgoing>(
+        OUTGOING_CHANNEL_CAPACITY,
+        OUTGOING_CHANNEL_CONCURRENCY,
+    );
 
     // Network task: feeds Updates into the channel.  Owns no UI concerns.
     {
         let tx = tx.clone();
-        tokio::spawn(async move { run_network(args.addr, tx).await });
+        tokio::spawn(async move { run_network(args.addr, tx, out_rx).await });
     }
 
     match args.mode {
-        Mode::States => run_states(rx).await,
-        Mode::Stats(hz) => stats::run_stats(rx, hz).await,
-        Mode::Tui => run_tui(tx, rx, args.colorize).await,
-    }
-}
-
-enum Mode {
-    Tui,
-    States,
-    Stats(f64),
-}
-
-// ── argv ─────────────────────────────────────────────────────────────────────
-
-struct Args {
-    addr: std::net::SocketAddr,
-    mode: Mode,
-    colorize: bool,
-}
-
-impl Args {
-    fn parse(args: impl Iterator<Item = String>) -> Self {
-        let mut addr_arg: Option<String> = None;
-        let mut mode = Mode::Tui;
-        let mut colorize = true;
-        let mut iter = args.peekable();
-        while let Some(a) = iter.next() {
-            match a.as_str() {
-                "--states" => mode = Mode::States,
-                "--no-color" => colorize = false,
-                "--stats" => {
-                    let val = iter.next().unwrap_or_else(|| {
-                        eprintln!("--stats expects a Hz argument (e.g. --stats 1, --stats 0.1)");
-                        std::process::exit(2);
-                    });
-                    let hz: f64 = val.parse().unwrap_or_else(|_| {
-                        eprintln!("--stats: invalid Hz value {val:?}");
-                        std::process::exit(2);
-                    });
-                    if !hz.is_finite() || hz <= 0.0 {
-                        eprintln!("--stats: Hz must be > 0, got {hz}");
-                        std::process::exit(2);
-                    }
-                    mode = Mode::Stats(hz);
-                }
-                other if !other.starts_with("--") => addr_arg = Some(other.to_string()),
-                other => eprintln!("ignoring unknown flag: {other}"),
-            }
-        }
-        let addr_str = addr_arg.unwrap_or_else(|| DEFAULT_HOST.to_string());
-        let addr = addr_str
-            .parse()
-            .unwrap_or_else(|e| panic!("invalid address {addr_str:?}: {e}"));
-        Args {
-            addr,
-            mode,
-            colorize,
-        }
+        ModeFlag::States => run_states(rx, args.history).await,
+        ModeFlag::Stats => stats::run_stats(rx, args.stats_hz).await,
+        ModeFlag::Tui => run_tui(tx, rx, out_tx, !args.no_color, args.history).await,
     }
 }
 
@@ -122,7 +93,13 @@ impl Args {
 
 type ClientCodec = (MessagePackSerializer<Request>, MessagePackDecoder<Response>);
 
-async fn run_network(addr: std::net::SocketAddr, tx: mpsc::UnboundedSender<Update>) {
+async fn run_network(
+    addr: std::net::SocketAddr,
+    tx: spillway::Sender<Update>,
+    mut out_rx: spillway::Receiver<Outgoing>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     let _ = tx.send(Update::Status(format!("connecting to {addr}…")));
 
     let configuration: Configuration<TcpStreamConnector> = Configuration::new(TcpStreamConnector);
@@ -138,7 +115,17 @@ async fn run_network(addr: std::net::SocketAddr, tx: mpsc::UnboundedSender<Updat
     let conn_task = tokio::spawn(conn);
     let _ = tx.send(Update::Connected);
 
-    let stream = match rpc_client.send_streaming(Request::new(RequestBody::StartStream)) {
+    // protosocket-rpc routes responses by `Message::message_id()` and
+    // does not auto-assign ids.  `Request::new` defaults to id=0, so
+    // two coexisting RPCs at id=0 (streaming + unary) would collide in
+    // the client's completion registry and the second would clobber
+    // the first.  Use a unique id per outgoing request — that keeps
+    // the streaming completion alive while unary `SetCacheLevel`s
+    // come and go.
+    let next_id = AtomicU64::new(1);
+    let mut start = Request::new(RequestBody::StartStream);
+    start.id = next_id.fetch_add(1, Ordering::Relaxed);
+    let stream = match rpc_client.send_streaming(start) {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(Update::Disconnected(format!("StartStream failed: {e}")));
@@ -147,18 +134,55 @@ async fn run_network(addr: std::net::SocketAddr, tx: mpsc::UnboundedSender<Updat
     };
 
     let mut stream = stream;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(resp) => {
-                if let ResponseBody::Span(s) = resp.body {
-                    if tx.send(Update::SpanReceived(s)).is_err() {
-                        break; // receiver dropped — runtime is shutting down
+    loop {
+        tokio::select! {
+            // Stream of pushes from the server (spans + CacheLevel notices).
+            item = stream.next() => {
+                let Some(item) = item else { break };
+                match item {
+                    Ok(resp) => match resp.body {
+                        ResponseBody::Span(s) => {
+                            if tx.send(Update::SpanReceived(s)).is_err() {
+                                break;
+                            }
+                        }
+                        ResponseBody::CacheLevel(filter) => {
+                            if tx.send(Update::CacheLevelReceived(filter)).is_err() {
+                                break;
+                            }
+                        }
+                        ResponseBody::CacheChance(pct) => {
+                            if tx.send(Update::CacheChanceReceived(pct)).is_err() {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        let _ = tx.send(Update::Disconnected(format!("stream error: {e}")));
+                        break;
                     }
                 }
             }
-            Err(e) => {
-                let _ = tx.send(Update::Disconnected(format!("stream error: {e}")));
-                break;
+            // Outgoing requests from the keyboard / runtime.  None
+            // means all senders dropped → runtime is shutting down.
+            req = out_rx.next() => {
+                let Some(req) = req else { break };
+                let mut request = match req {
+                    Outgoing::SetCacheLevel(filter) => {
+                        Request::new(RequestBody::SetCacheLevel(filter))
+                    }
+                    Outgoing::SetCacheChance(pct) => {
+                        Request::new(RequestBody::SetCacheChance(pct))
+                    }
+                };
+                request.id = next_id.fetch_add(1, Ordering::Relaxed);
+                if let Ok(unary) = rpc_client.send_unary(request) {
+                    // We don't depend on the unary Ack — the
+                    // server-side stream will push the new state as
+                    // the source of truth.
+                    tokio::spawn(async move { let _ = unary.await; });
+                }
             }
         }
     }
@@ -169,13 +193,16 @@ async fn run_network(addr: std::net::SocketAddr, tx: mpsc::UnboundedSender<Updat
 // ── --states mode ────────────────────────────────────────────────────────────
 
 async fn run_states(
-    mut rx: mpsc::UnboundedReceiver<Update>,
+    mut rx: spillway::Receiver<Update>,
+    history_budget: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut model = Model::new(HISTORY_BUDGET);
-    while let Some(update) = rx.recv().await {
+    let mut model = Model::new(history_budget);
+    while let Some(update) = rx.next().await {
         // Print the update first so an integration test sees the cause line
         // followed by an effect line if needed.
         println!("{}", serde_json::to_string(&update)?);
+        // --states mode has no upstream pipe; ignore any non-Quit
+        // side-effects (e.g. `RequestSetLevel` requires a `out_tx`).
         if model.apply(update) == Effect::Quit {
             break;
         }
@@ -186,14 +213,25 @@ async fn run_states(
 // ── TUI mode ─────────────────────────────────────────────────────────────────
 
 async fn run_tui(
-    tx: mpsc::UnboundedSender<Update>,
-    mut rx: mpsc::UnboundedReceiver<Update>,
+    tx: spillway::Sender<Update>,
+    mut rx: spillway::Receiver<Update>,
+    out_tx: spillway::Sender<Outgoing>,
     colorize: bool,
+    history_budget: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Keyboard thread: sync (crossterm is sync) and pushes Updates via the
-    // tokio channel.  Exits when the receiver drops or the user quits.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Shared flag: when set, the keyboard loop routes keys as chance
+    // input (digits/./Backspace/Enter/Esc → ChanceInput* Updates)
+    // rather than the normal navigation bindings.  The runtime keeps
+    // it in sync with `model.chance_input.is_some()` after each
+    // `model.apply`.
+    let chance_input_active = Arc::new(AtomicBool::new(false));
+
     let kb_tx = tx.clone();
-    std::thread::spawn(move || keyboard_loop(kb_tx));
+    let kb_flag = Arc::clone(&chance_input_active);
+    std::thread::spawn(move || keyboard_loop(kb_tx, kb_flag));
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -201,7 +239,7 @@ async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
 
-    let mut model = Model::new(HISTORY_BUDGET);
+    let mut model = Model::new(history_budget);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
 
     let result: Result<(), Box<dyn std::error::Error>> = (async {
@@ -211,10 +249,23 @@ async fn run_tui(
         // and starves the keyboard mpsc behind it.
         loop {
             tokio::select! {
-                maybe_update = rx.recv() => {
+                maybe_update = rx.next() => {
                     match maybe_update {
                         Some(update) => {
-                            if model.apply(update) == Effect::Quit { break; }
+                            match model.apply(update) {
+                                Effect::None => {}
+                                Effect::Quit => break,
+                                Effect::RequestSetLevel(level) => {
+                                    let _ = out_tx.send(Outgoing::SetCacheLevel(level));
+                                }
+                                Effect::RequestSetChance(pct) => {
+                                    let _ = out_tx.send(Outgoing::SetCacheChance(pct));
+                                }
+                            }
+                            chance_input_active.store(
+                                model.chance_input.is_some(),
+                                Ordering::Relaxed,
+                            );
                         }
                         None => break, // all senders dropped
                     }
@@ -234,22 +285,69 @@ async fn run_tui(
     result
 }
 
-fn keyboard_loop(tx: mpsc::UnboundedSender<Update>) {
+fn keyboard_loop(
+    tx: spillway::Sender<Update>,
+    chance_input_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let send_or_exit = |update: Update| -> std::ops::ControlFlow<()> {
+        // Closed → runtime is shutting down, exit.  Full →
+        // keystroke dropped (rare with the configured buffer
+        // size), keep going.
+        if matches!(tx.send(update), Err(spillway::Error::Closed(_))) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+
     loop {
         // Short poll so we can notice the runtime shutting down via send-fail.
         match event::poll(Duration::from_millis(200)) {
             Ok(true) => {}
-            Ok(false) => {
-                if tx.is_closed() {
-                    return;
-                }
-                continue;
-            }
+            Ok(false) => continue,
             Err(_) => return,
         }
         let Ok(Event::Key(k)) = event::read() else {
             continue;
         };
+
+        // Chance-input mode owns the keystroke set: digits + `.` for
+        // characters, Backspace to edit, Enter to commit, Esc to
+        // cancel.  Everything else is silently dropped so the user
+        // can't escape into a normal command while typing a number.
+        if chance_input_active.load(Ordering::Relaxed) {
+            let update = match k.code {
+                KeyCode::Char(c) => Update::ChanceInputChar(c),
+                KeyCode::Backspace => Update::ChanceInputBackspace,
+                KeyCode::Enter => Update::ChanceInputCommit,
+                KeyCode::Esc => Update::ChanceInputCancel,
+                _ => continue,
+            };
+            if send_or_exit(update).is_break() {
+                return;
+            }
+            continue;
+        }
+
+        // Shift+letter as cache-level meta key.  Terminals report a
+        // shifted letter as the uppercase char (with or without the
+        // SHIFT modifier flag, depending on protocol) — match on the
+        // uppercase character so both wirings work.
+        let level = match k.code {
+            KeyCode::Char('O') => Some(WireLevelFilter::Off),
+            KeyCode::Char('I') => Some(WireLevelFilter::Info),
+            KeyCode::Char('D') => Some(WireLevelFilter::Debug),
+            KeyCode::Char('T') => Some(WireLevelFilter::Trace),
+            _ => None,
+        };
+        if let Some(level) = level {
+            if send_or_exit(Update::RequestCacheLevel(level)).is_break() {
+                return;
+            }
+            continue;
+        }
         let update = match k.code {
             KeyCode::Char('q') | KeyCode::Esc => Update::Quit,
             KeyCode::Down | KeyCode::Char('j') => Update::SelectDown,
@@ -259,9 +357,14 @@ fn keyboard_loop(tx: mpsc::UnboundedSender<Update>) {
             KeyCode::Left | KeyCode::Char('h') => Update::CollapseSelected,
             KeyCode::Tab | KeyCode::BackTab => Update::SwitchFocus,
             KeyCode::Char(' ') => Update::ToggleSplitSelected,
+            // `Shift+C` (i.e. uppercase `C`) opens the chance-input
+            // area.  The runtime echoes model.chance_input.is_some()
+            // back into the shared flag so subsequent keys (digits,
+            // `.`, Backspace, Enter, Esc) route into input mode.
+            KeyCode::Char('C') => Update::BeginChanceInput,
             _ => continue,
         };
-        if tx.send(update).is_err() {
+        if send_or_exit(update).is_break() {
             return;
         }
     }
@@ -273,10 +376,115 @@ mod view {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-    use tracing_console_host::{WireLevel, WireSpan};
+    use tracing_console_host::{WireLevel, WireLevelFilter, WireSpan};
 
     use crate::aggregate::{bucket_key, fmt_ns};
     use crate::model::Focus;
+
+    /// Format a chance percentage like the user asked: `100%`, `2%`,
+    /// `.001%`, `0.5%` — drop trailing zeros, drop the leading `0`
+    /// for sub-1% values.  Clamps NaN to `0%` defensively.
+    pub(super) fn format_chance(pct: f64) -> String {
+        if !pct.is_finite() || pct <= 0.0 {
+            return "0%".to_string();
+        }
+        if pct >= 100.0 {
+            return "100%".to_string();
+        }
+        // 3 decimals is more than enough — the user types only with
+        // dots and digits and we clamp at 100 anyway.
+        let s = format!("{:.3}", pct);
+        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+        if pct < 1.0 && let Some(rest) = trimmed.strip_prefix("0.") {
+            format!(".{rest}%")
+        } else {
+            format!("{trimmed}%")
+        }
+    }
+
+    /// Format the rolling 10-second receive rate (from [`Model::rate`])
+    /// in k/M/Hz units for the header line.
+    pub(super) fn format_span_rate(model: &Model) -> String {
+        let hz = model.rate.rate_hz();
+        if hz >= 1_000_000.0 {
+            format!("{:.1}MHz", hz / 1e6)
+        } else if hz >= 1_000.0 {
+            format!("{:.1}kHz", hz / 1e3)
+        } else if hz >= 10.0 {
+            format!("{:.0}Hz", hz)
+        } else {
+            format!("{:.1}Hz", hz)
+        }
+    }
+
+    /// Push the `Chance <value>` widget into the header span buffer.
+    /// The `C` in `Chance` is always underlined as the keyboard
+    /// shortcut.  When the user is typing (model.chance_input is
+    /// Some), the area renders with a reversed-background highlight
+    /// and shows the buffer plus a `_` cursor.
+    pub(super) fn chance_switcher_spans(out: &mut Vec<TuiSpan<'static>>, model: &Model) {
+        let editing = model.chance_input.is_some();
+        let label_base = if editing {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        out.push(TuiSpan::styled(
+            "C",
+            label_base.add_modifier(Modifier::UNDERLINED),
+        ));
+        out.push(TuiSpan::styled("hance ", label_base));
+        if let Some(buf) = &model.chance_input {
+            let body = if buf.is_empty() {
+                "_".to_string()
+            } else {
+                format!("{buf}_")
+            };
+            out.push(TuiSpan::styled(
+                body,
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ));
+        } else {
+            let txt = match model.cache_chance {
+                Some(pct) => format_chance(pct),
+                None => "—".to_string(),
+            };
+            out.push(TuiSpan::raw(txt));
+        }
+    }
+
+    /// Push the `Off Info Debug Trace` switcher into a span buffer.
+    /// * The label whose level matches `model.cache_level` (server-
+    ///   confirmed) renders with a reversed background highlight.
+    /// * Each label's first letter is the Shift+letter shortcut —
+    ///   always underlined so the keybinding is discoverable.
+    pub(super) fn level_switcher_spans(out: &mut Vec<TuiSpan<'static>>, model: &Model) {
+        for (idx, level) in crate::model::LEVEL_OPTIONS.iter().enumerate() {
+            if idx > 0 {
+                out.push(TuiSpan::raw(" "));
+            }
+            let label = match level {
+                WireLevelFilter::Off => "Off",
+                WireLevelFilter::Error => "Error",
+                WireLevelFilter::Warn => "Warn",
+                WireLevelFilter::Info => "Info",
+                WireLevelFilter::Debug => "Debug",
+                WireLevelFilter::Trace => "Trace",
+            };
+            let confirmed = model.cache_level == Some(*level);
+            let base = if confirmed {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            let shortcut_style = base.add_modifier(Modifier::UNDERLINED);
+            let mut chars = label.chars();
+            let first = chars.next().unwrap_or(' ').to_string();
+            let rest: String = chars.collect();
+            out.push(TuiSpan::styled(first, shortcut_style));
+            out.push(TuiSpan::styled(rest, base));
+        }
+    }
 
     fn level_str(level: WireLevel) -> &'static str {
         match level {
@@ -395,8 +603,18 @@ mod view {
             .constraints([Constraint::Length(1), stacks_constraint, details_constraint])
             .split(area);
 
-        // Top: connection status line.
-        let header = match &model.connection {
+        // Top: connection status + cache-level switcher.
+        //
+        // When connected, the header reads:
+        //   [connected]  Off Info Debug Trace   N spans buffered
+        //
+        // * The label matching `model.cache_level` is bold + green
+        //   (the server-confirmed current level).  Until the server
+        //   pushes its first `CacheLevel`, no label is highlighted.
+        // * Each label's first letter is underlined as a hint for
+        //   the Shift+letter shortcut that requests that level.  The
+        //   green selection only moves when the server confirms.
+        let header: Line = match &model.connection {
             ConnectionStatus::Connecting => Line::from(vec![
                 TuiSpan::raw("[connecting] "),
                 TuiSpan::styled(
@@ -405,7 +623,17 @@ mod view {
                 ),
             ]),
             ConnectionStatus::Connected => {
-                Line::from(format!("[connected]  {} spans buffered", model.spans.len()))
+                let mut spans: Vec<TuiSpan<'static>> =
+                    vec![TuiSpan::raw("[connected]  ")];
+                level_switcher_spans(&mut spans, model);
+                spans.push(TuiSpan::raw("  "));
+                chance_switcher_spans(&mut spans, model);
+                spans.push(TuiSpan::raw(format!(
+                    "   {n} spans / {rate}",
+                    n = model.spans.len(),
+                    rate = format_span_rate(model),
+                )));
+                Line::from(spans)
             }
             ConnectionStatus::Disconnected(reason) => {
                 Line::from(format!("[disconnected] {reason}"))

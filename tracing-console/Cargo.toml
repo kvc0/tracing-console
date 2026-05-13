@@ -8,6 +8,7 @@ name = "tracing-console"
 path = "src/main.rs"
 
 [dependencies]
+clap                            = { workspace = true }
 crossterm                       = { workspace = true }
 futures                         = { workspace = true }
 k-cache                         = { workspace = true }
@@ -18,5 +19,6 @@ protosocket-rpc                 = { workspace = true }
 ratatui                         = { workspace = true }
 serde                           = { workspace = true }
 serde_json                      = { workspace = true }
+spillway                        = { workspace = true }
 tokio                           = { workspace = true }
 tracing-console-host            = { workspace = true }
