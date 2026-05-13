@@ -842,7 +842,10 @@ mod view {
                 let show_per_key = if details_focused { 20 } else { 5 };
                 for (k, vals) in &distinguishing {
                     let mut entries: Vec<(&String, &u32)> = vals.iter().collect();
-                    entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    // Alphabetical by value — stable order across
+                    // renders is more useful than count-rank when
+                    // the user's scanning for a specific value.
+                    entries.sort_by(|a, b| a.0.cmp(b.0));
                     let shown = entries
                         .iter()
                         .take(show_per_key)

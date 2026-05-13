@@ -14,10 +14,10 @@ use tracing_console_host::{WireLevelFilter, WireSpan};
 
 use crate::aggregate::{BucketKey, StackStats, bucket_by_stack};
 
-/// Half-second-bucket rolling-rate counter.  The model holds 21
-/// buckets — the in-progress one plus 20 older half-seconds (10 s
-/// of completed history).  `rate_hz` reports the average over the
-/// 20 completed buckets only; the in-progress bucket is ignored so
+/// Half-second-bucket rolling-rate counter.  The model holds 9
+/// buckets — the in-progress one plus 8 older half-seconds (4 s of
+/// completed history).  `rate_hz` reports the average over the 8
+/// completed buckets only; the in-progress bucket is ignored so
 /// partial fills don't drag the displayed Hz down.
 ///
 /// Skipped from serialization because it's purely transient
@@ -26,8 +26,8 @@ use crate::aggregate::{BucketKey, StackStats, bucket_by_stack};
 #[derive(Debug, Clone, Default)]
 pub struct RateTracker {
     /// Per-half-second counts.  `head` indexes the in-progress
-    /// (current) bucket.  `(head + 1) % 21` is the oldest.
-    buckets: [u32; 21],
+    /// (current) bucket.  `(head + 1) % BUCKETS` is the oldest.
+    buckets: [u32; Self::BUCKETS],
     head: usize,
     /// `Instant` when the current bucket started; `None` until the
     /// first sample lands.
@@ -35,6 +35,12 @@ pub struct RateTracker {
 }
 
 impl RateTracker {
+    /// 8 completed half-second buckets + 1 in-progress = 4 s of
+    /// completed window.
+    pub const BUCKETS: usize = 9;
+    /// Length of the completed window in seconds — `(BUCKETS - 1) / 2`.
+    pub const WINDOW_SECS: f64 = 4.0;
+
     /// Record one event at `now`, advancing buckets as needed.
     pub fn record(&mut self, now: Instant) {
         match self.bucket_start {
@@ -45,11 +51,11 @@ impl RateTracker {
                 let elapsed_ms = now.duration_since(start).as_millis() as u64;
                 if elapsed_ms >= 500 {
                     // How many half-seconds have rolled past since
-                    // the current bucket opened.  Cap at 21 since
-                    // beyond that every bucket is stale anyway.
-                    let advances = ((elapsed_ms / 500) as usize).min(21);
+                    // the current bucket opened.  Cap at `BUCKETS`
+                    // since beyond that every bucket is stale anyway.
+                    let advances = ((elapsed_ms / 500) as usize).min(Self::BUCKETS);
                     for _ in 0..advances {
-                        self.head = (self.head + 1) % 21;
+                        self.head = (self.head + 1) % Self::BUCKETS;
                         self.buckets[self.head] = 0;
                     }
                     self.bucket_start =
@@ -60,8 +66,8 @@ impl RateTracker {
         self.buckets[self.head] = self.buckets[self.head].saturating_add(1);
     }
 
-    /// Rate in Hz over the 20 completed buckets, ignoring the
-    /// in-progress one.  Returns 0.0 before any sample has landed.
+    /// Rate in Hz over the completed buckets, ignoring the in-progress
+    /// one.  Returns 0.0 before any sample has landed.
     pub fn rate_hz(&self) -> f64 {
         if self.bucket_start.is_none() {
             return 0.0;
@@ -72,8 +78,7 @@ impl RateTracker {
                 sum += v as u64;
             }
         }
-        // 20 buckets × 0.5 s = 10 s of window.
-        sum as f64 / 10.0
+        sum as f64 / Self::WINDOW_SECS
     }
 }
 
