@@ -1,20 +1,17 @@
 //! `--stats <Hz>` mode: aggregate observed spans per stack and print
 //! min/avg/max for total and self durations on a configurable cadence.
 //!
-//! Uses the same aggregation strategy as the TUI: a bounded rolling
-//! `VecDeque<WireSpan>` of size `history_budget`, re-bucketed on each
-//! flush via `aggregate::bucket_by_stack`.  Per-tick work is therefore
-//! O(history_budget), not O(spans received this window), so the
-//! flush cost is bounded regardless of input rate.
+//! Uses the same incremental aggregator the TUI uses (see
+//! [`crate::aggregate::Aggregator`]): each absorbed span updates the
+//! per-bucket aggregates in place, so the per-tick flush cost is
+//! `O(|buckets|)` — independent of how many spans are in the
+//! rolling-window buffer.
 
-use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use tracing_console_host::WireSpan;
-
-use crate::aggregate::{StackStats, bucket_by_stack, fmt_ns, tree_label};
-use crate::model::{Update, RateTracker};
+use crate::aggregate::{Aggregator, StackStats, fmt_ns, tree_label};
+use crate::model::{RateTracker, Update};
 
 pub async fn run_stats(
     mut rx: spillway::Receiver<Update>,
@@ -27,12 +24,9 @@ pub async fn run_stats(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let started = Instant::now();
 
-    // Continuous drain + tick-based flush.  Earlier this awaited
-    // the tick first and then drained, which paced consumption at
-    // `stream_buffer × stats_hz` spans/s (e.g. 65,536/s at
-    // --stats-hz 1).  Now `select!` lets the drain run as fast as
-    // the producer fills the channel, and the tick arm only fires
-    // the print/flush.
+    // Continuous drain + tick-based flush.  `select!` lets the drain
+    // run as fast as the producer fills the channel; the tick arm
+    // only fires the print/flush.
     loop {
         tokio::select! {
             batch = rx.next_batch() => {
@@ -56,11 +50,7 @@ pub async fn run_stats(
 }
 
 struct StatsAccumulator {
-    /// Rolling history of closed spans, capped at `history_budget`.
-    /// Aggregation runs over this buffer on every flush, the same way
-    /// the TUI's `Model::visible_rows` runs over `Model::spans`.
-    spans: VecDeque<WireSpan>,
-    history_budget: usize,
+    agg: Aggregator,
     last_status: Option<String>,
     connected: bool,
     rate: RateTracker,
@@ -71,8 +61,7 @@ struct StatsAccumulator {
 impl StatsAccumulator {
     fn new(history_budget: usize) -> Self {
         Self {
-            spans: VecDeque::with_capacity(history_budget),
-            history_budget,
+            agg: Aggregator::new(history_budget),
             last_status: None,
             connected: false,
             rate: RateTracker::default(),
@@ -90,10 +79,7 @@ impl StatsAccumulator {
                     self.total_dropped_unfinished += 1;
                     return;
                 }
-                if self.spans.len() >= self.history_budget {
-                    self.spans.pop_front();
-                }
-                self.spans.push_back(span);
+                self.agg.absorb(span);
             }
             Update::Connected => {
                 self.connected = true;
@@ -126,11 +112,9 @@ impl StatsAccumulator {
     }
 
     fn flush(&mut self, elapsed_total: Duration) {
-        let buffered = self.spans.len();
+        let buffered = self.agg.len();
         let span_rate = self.rate.rate_hz();
-
-        let split_keys: BTreeSet<String> = BTreeSet::new();
-        let rows = bucket_by_stack(self.spans.iter(), &split_keys);
+        let rows = self.agg.rows();
 
         let header_status = if self.connected {
             "[connected]".to_string()

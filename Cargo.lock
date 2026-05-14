@@ -1530,6 +1530,7 @@ name = "tracing-console-host"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "clap",
  "futures",
  "futures-core",
  "log",

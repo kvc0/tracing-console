@@ -450,11 +450,11 @@ fn keyboard_loop(
 
 mod view {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::BTreeMap;
 
     use tracing_console_host::{WireLevel, WireLevelFilter, WireSpan};
 
-    use crate::aggregate::{bucket_key, fmt_ns};
+    use crate::aggregate::fmt_ns;
     use crate::model::Focus;
 
     /// Format a chance percentage like the user asked: `100%`, `2%`,
@@ -706,7 +706,7 @@ mod view {
                 chance_switcher_spans(&mut spans, model);
                 spans.push(TuiSpan::raw(format!(
                     "   {n} spans / {rate}",
-                    n = model.spans.len(),
+                    n = model.agg.len(),
                     rate = format_span_rate(model),
                 )));
                 Line::from(spans)
@@ -873,17 +873,15 @@ mod view {
         if let Some(idx) = selected {
             let r = &rows[idx];
 
-            // Resolve which spans match the selected stack.  Use the
-            // same bucket_key path as the aggregator so we don't drift.
-            let by_id: HashMap<u64, &WireSpan> = model.spans.iter().map(|s| (s.id, s)).collect();
-            let split_empty: BTreeSet<String> = BTreeSet::new();
+            // Resolve which spans match the selected stack via the
+            // aggregator's cached resolved stacks — same result as
+            // the old `bucket_key` walk, but already computed at
+            // span-arrival time.
             let matching: Vec<&WireSpan> = model
-                .spans
-                .iter()
-                .filter(|s| {
-                    let k = bucket_key(s, &by_id, &split_empty);
-                    k.stack == r.key.stack
-                })
+                .agg
+                .iter_with_stack()
+                .filter(|(_, stack)| stack == &&r.key.stack)
+                .map(|(s, _)| s)
                 .collect();
 
             detail_lines.push(Line::from(format!("stack:  {}", r.key.stack.join(" › "))));
@@ -894,8 +892,8 @@ mod view {
                 fmt_ns(r.stats.total_avg_ns()),
                 fmt_ns(r.stats.self_avg_ns()),
             )));
-            if !model.split_keys.is_empty() {
-                let split_list: Vec<String> = model.split_keys.iter().cloned().collect();
+            if !model.split_keys().is_empty() {
+                let split_list: Vec<String> = model.split_keys().iter().cloned().collect();
                 detail_lines.push(Line::from(format!("split by: {}", split_list.join(", "),)));
             }
 
@@ -987,7 +985,7 @@ mod view {
                     detail_lines.push(Line::from("  (no metadata keys present on matching spans)"));
                 } else {
                     for (i, k) in candidates.iter().enumerate() {
-                        let checked = model.split_keys.contains(k);
+                        let checked = model.split_keys().contains(k);
                         let mark = if checked { "[✓]" } else { "[ ]" };
                         let line_text = format!("  {mark} {k}");
                         let style = if i == sel {

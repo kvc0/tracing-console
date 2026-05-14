@@ -17,4 +17,5 @@ tracing                         = { workspace = true }
 tracing-cache                   = { workspace = true }
 
 [dev-dependencies]
+clap                            = { workspace = true }
 futures                         = { workspace = true }

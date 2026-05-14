@@ -6,13 +6,13 @@
 //! sequences of updates (or replay a captured `--states` dump) and
 //! assert on the resulting model.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tracing_console_host::{WireLevelFilter, WireSpan};
 
-use crate::aggregate::{BucketKey, StackStats, bucket_by_stack};
+use crate::aggregate::{Aggregator, BucketKey, StackStats};
 
 /// Half-second-bucket rolling-rate counter.  The model holds 9
 /// buckets — the in-progress one plus 8 older half-seconds (4 s of
@@ -111,13 +111,13 @@ pub const LEVEL_OPTIONS: &[WireLevelFilter] = &[
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
-    pub spans: VecDeque<WireSpan>,
+    /// Rolling-window aggregator.  Owns the bounded span ring, the
+    /// per-bucket aggregates, and the active `split_keys` — all kept
+    /// up to date incrementally by `apply(SpanReceived)`.
+    pub agg: Aggregator,
     /// Stack prefixes whose children should be revealed.  A row whose
     /// bucket-key proper prefixes are all in this set is visible.
     pub expanded: HashSet<BucketKey>,
-    /// Field keys the user has selected to split the aggregation by.
-    /// Empty by default → spans bucket purely by stack.
-    pub split_keys: BTreeSet<String>,
     /// Selection index into the visible-row list (Stacks focus) or
     /// the details key list (Details focus).
     pub selected: usize,
@@ -153,9 +153,8 @@ pub struct Model {
 impl Model {
     pub fn new(history_budget: usize) -> Self {
         Self {
-            spans: VecDeque::new(),
+            agg: Aggregator::new(history_budget),
             expanded: HashSet::new(),
-            split_keys: BTreeSet::new(),
             selected: 0,
             details_selected: 0,
             focus: Focus::Stacks,
@@ -169,13 +168,14 @@ impl Model {
         }
     }
 
+    pub fn split_keys(&self) -> &BTreeSet<String> {
+        self.agg.split_keys()
+    }
+
     pub fn apply(&mut self, update: Update) -> Effect {
         match update {
             Update::SpanReceived(span) => {
-                if self.spans.len() >= self.history_budget {
-                    self.spans.pop_front();
-                }
-                self.spans.push_back(span);
+                self.agg.absorb(span);
                 self.rate.record(Instant::now());
                 Effect::None
             }
@@ -221,7 +221,7 @@ impl Model {
                     // every bucket in the (unfiltered) tree.
                     let root_stack = r.key.stack.clone();
                     let root_splits = r.key.splits.clone();
-                    let all = bucket_by_stack(self.spans.iter(), &self.split_keys);
+                    let all = self.agg.rows();
                     for (k, _) in &all {
                         if k.stack.starts_with(&root_stack)
                             && k.stack.len() > root_stack.len()
@@ -283,9 +283,11 @@ impl Model {
                 }
                 let keys = self.candidate_split_keys();
                 if let Some(k) = keys.get(self.details_selected).cloned() {
-                    if !self.split_keys.remove(&k) {
-                        self.split_keys.insert(k);
+                    let mut new_keys = self.agg.split_keys().clone();
+                    if !new_keys.remove(&k) {
+                        new_keys.insert(k);
                     }
+                    self.agg.set_split_keys(new_keys);
                     // Splits changed → row identities change.  Drop
                     // selection / expansion to avoid stale references.
                     self.expanded.clear();
@@ -360,7 +362,7 @@ impl Model {
 
     /// Recompute the visible (post-expansion) row list.
     pub fn visible_rows(&self) -> Vec<VisibleRow> {
-        let rows = bucket_by_stack(self.spans.iter(), &self.split_keys);
+        let rows = self.agg.rows();
         if rows.is_empty() {
             return Vec::new();
         }
@@ -424,14 +426,10 @@ impl Model {
         };
         let target_stack = &row.key.stack;
         let mut keys: BTreeSet<String> = BTreeSet::new();
-        // Build id_to_span once so we resolve stacks the same way the
-        // aggregator does.
-        let by_id: std::collections::HashMap<u64, &WireSpan> =
-            self.spans.iter().map(|s| (s.id, s)).collect();
-        let split_empty: BTreeSet<String> = BTreeSet::new();
-        for s in &self.spans {
-            let k = crate::aggregate::bucket_key(s, &by_id, &split_empty);
-            if k.stack == *target_stack {
+        // Use the aggregator's cached resolved stack — same shape
+        // `bucket_key` produced, but already computed at insertion.
+        for (s, stack) in self.agg.iter_with_stack() {
+            if stack == target_stack {
                 for (field_name, _) in &s.fields {
                     keys.insert(field_name.clone());
                 }
@@ -649,14 +647,14 @@ mod tests {
         )));
         // Toggle while Stacks-focused: no-op.
         m.apply(Update::ToggleSplitSelected);
-        assert!(m.split_keys.is_empty());
+        assert!(m.split_keys().is_empty());
         // Switch to Details, then toggle: api becomes a split key.
         m.apply(Update::SwitchFocus);
         m.apply(Update::ToggleSplitSelected);
-        assert!(m.split_keys.contains("api"));
+        assert!(m.split_keys().contains("api"));
         // Toggle again removes.
         m.apply(Update::ToggleSplitSelected);
-        assert!(m.split_keys.is_empty());
+        assert!(m.split_keys().is_empty());
     }
 
     #[test]
@@ -673,7 +671,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].stats.count, 2);
 
-        m.split_keys.insert("api".to_string());
+        let mut sk = BTreeSet::new();
+        sk.insert("api".to_string());
+        m.agg.set_split_keys(sk);
         let rows = m.visible_rows();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.key.stack == vec!["req".to_string()]));
@@ -693,7 +693,9 @@ mod tests {
             "validate",
             Some(10),
         )));
-        m.split_keys.insert("api".to_string());
+        let mut sk = BTreeSet::new();
+        sk.insert("api".to_string());
+        m.agg.set_split_keys(sk);
         let rows = m.visible_rows();
         // root + child = 1 row visible (root); expand and we should
         // see the child carry the same `api=fetch` split inherited

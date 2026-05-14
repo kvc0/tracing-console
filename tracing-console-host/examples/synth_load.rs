@@ -45,15 +45,12 @@
 //! Run:
 //!   cargo run -p tracing-console-host --example synth_load --release -- --hz 10
 //! Then, in another terminal:
-//!   cargo run -p tracing-console --release -- --stats 1
-//!
-//! Args:
-//!   --hz <N>      tick frequency in Hz (default 10; accepts fractional)
-//!   --addr <A>    bind address (default 127.0.0.1:7777)
+//!   cargo run -p tracing-console --release -- --mode stats --stats-hz 1
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::Parser;
 use tokio::time::interval;
 use tracing::Level;
 use tracing::metadata::LevelFilter;
@@ -63,9 +60,29 @@ use tracing_console_host::serve;
 /// Channel labels rotated through by `post_message`.
 const CHANNELS: &[&str] = &["general", "engineering", "ops"];
 
+#[derive(Parser, Debug)]
+#[command(
+    name = "synth_load",
+    about = "Synthetic span-tree load generator for tracing-console-host"
+)]
+struct Args {
+    /// Tick frequency in Hz (accepts fractional).
+    #[arg(long, default_value_t = 10.0)]
+    hz: f64,
+
+    /// Span-tree invocations per tick.  Real total spans/s is
+    /// approximately `per_tick × 8 × 1.3 × hz` (see banner output).
+    #[arg(long, default_value_t = 1)]
+    per_tick: usize,
+
+    /// Bind address for the RPC server.
+    #[arg(long, default_value = "127.0.0.1:7777")]
+    addr: std::net::SocketAddr,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (hz, per_tick, addr) = parse_args();
+    let Args { hz, per_tick, addr } = Args::parse();
 
     // Default OFF + chance=100% so the host doesn't record anything
     // until a console connects and raises the level via Shift+I /D /T,
@@ -115,50 +132,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-}
-
-fn parse_args() -> (f64, usize, std::net::SocketAddr) {
-    let mut hz = 10.0_f64;
-    let mut per_tick: usize = 1;
-    let mut addr_str = "127.0.0.1:7777".to_string();
-    let mut args = std::env::args().skip(1).peekable();
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--hz" => {
-                hz = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .filter(|v: &f64| v.is_finite() && *v > 0.0)
-                    .unwrap_or_else(|| {
-                        eprintln!("--hz expects a positive number");
-                        std::process::exit(2);
-                    });
-            }
-            "--per-tick" => {
-                per_tick = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .filter(|v: &usize| *v > 0)
-                    .unwrap_or_else(|| {
-                        eprintln!("--per-tick expects a positive integer");
-                        std::process::exit(2);
-                    });
-            }
-            "--addr" => {
-                addr_str = args.next().unwrap_or_else(|| {
-                    eprintln!("--addr expects an address");
-                    std::process::exit(2);
-                });
-            }
-            other => {
-                eprintln!("ignoring unknown arg: {other}");
-            }
-        }
-    }
-    let addr = addr_str
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid address {addr_str:?}: {e}"));
-    (hz, per_tick, addr)
 }
 
 fn emit_fetch_user(counter: u64) {
