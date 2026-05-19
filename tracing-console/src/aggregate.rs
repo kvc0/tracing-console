@@ -213,6 +213,59 @@ impl Aggregator {
         })
     }
 
+    /// Resolved stack for a span currently in the ring.  Used by
+    /// the graph view to check whether a freshly-absorbed span
+    /// belongs to the locked bucket in `O(1)`.  Returns `None` if
+    /// the span isn't in the ring (parked in pending, evicted, or
+    /// never made it past the `closed_at_ns` filter).
+    pub fn resolved_stack(&self, id: u64) -> Option<&[String]> {
+        self.by_id.get(&id).map(|e| e.bucket.stack.as_slice())
+    }
+
+    /// Sum of direct-children totals currently in the ring for the
+    /// given span id; 0 if none.  Used by the graph view to derive
+    /// `self_ns = total - child_sum` for the metric toggle.
+    pub fn child_sum_for(&self, id: u64) -> u64 {
+        self.child_sum.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Fetch a span by id from the ring, if present.  Used by the
+    /// graph view's rehydrate path so it can re-record every
+    /// matching ring entry without holding the iterator borrow.
+    pub fn span_by_id(&self, id: u64) -> Option<&WireSpan> {
+        self.by_id.get(&id).map(|e| &e.span)
+    }
+
+    /// Resolve splits for the span with `id` against an arbitrary
+    /// key set (unrelated to `self.split_keys`).  Walks the parent
+    /// chain via `by_id`, taking fields closest-to-leaf-first; same
+    /// algorithm as `collect_splits` but parametrised so the graph
+    /// view can produce its own series keys without touching the
+    /// aggregator's own split state.
+    pub fn collect_splits_for(
+        &self,
+        id: u64,
+        keys: &BTreeSet<String>,
+    ) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut cursor = self.by_id.get(&id);
+        let mut depth = 0;
+        while let Some(entry) = cursor {
+            if depth > 64 {
+                break;
+            }
+            depth += 1;
+            for (k, v) in &entry.span.fields {
+                if keys.contains(k) && !out.iter().any(|(kk, _)| kk == k) {
+                    out.push((k.clone(), v.to_string_value()));
+                }
+            }
+            cursor = entry.span.parent_id.and_then(|pid| self.by_id.get(&pid));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub fn absorb(&mut self, span: WireSpan) {
         // Discard open spans — same as the old `bucket_by_stack`.
         if span.closed_at_ns.is_none() {
@@ -474,6 +527,21 @@ fn collect_splits(
     }
     splits.sort_by(|a, b| a.0.cmp(&b.0));
     splits
+}
+
+/// Field keys observed on spans whose resolved stack matches
+/// `target_stack`.  Used by both `Model::candidate_split_keys` (for
+/// the table view) and the graph view's Details pane.
+pub fn candidate_split_keys_for(agg: &Aggregator, target_stack: &[String]) -> Vec<String> {
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for (s, stack) in agg.iter_with_stack() {
+        if stack.as_slice() == target_stack {
+            for (field_name, _) in &s.fields {
+                keys.insert(field_name.clone());
+            }
+        }
+    }
+    keys.into_iter().collect()
 }
 
 // ── Manual Debug + Clone + Serialize/Deserialize ────────────────────

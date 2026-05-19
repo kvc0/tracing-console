@@ -92,22 +92,10 @@ impl StatsAccumulator {
             Update::Status(s) => {
                 self.last_status = Some(s);
             }
-            Update::SelectUp
-            | Update::SelectDown
-            | Update::ExpandSelected
-            | Update::ExpandAllSelected
-            | Update::CollapseSelected
-            | Update::SwitchFocus
-            | Update::ToggleSplitSelected
-            | Update::CacheLevelReceived(_)
-            | Update::RequestCacheLevel(_)
-            | Update::CacheChanceReceived(_)
-            | Update::BeginChanceInput
-            | Update::ChanceInputChar(_)
-            | Update::ChanceInputBackspace
-            | Update::ChanceInputCancel
-            | Update::ChanceInputCommit
-            | Update::Quit => {}
+            // Everything else — TUI navigation, level switcher,
+            // chance modal, graph view + its modals — is irrelevant
+            // to the headless stats output and is silently ignored.
+            _ => {}
         }
     }
 
