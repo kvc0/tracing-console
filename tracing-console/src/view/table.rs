@@ -12,7 +12,10 @@ use tracing_console_host::{WireLevel, WireSpan};
 use crate::aggregate::fmt_ns;
 use crate::model::{ConnectionStatus, Focus, Model};
 
-use super::header::{chance_switcher_spans, format_span_rate, level_switcher_spans};
+use super::header::{
+    GRAPH_HINT_WIDTH, chance_switcher_spans, format_span_rate, graph_toggle_hint,
+    level_switcher_spans,
+};
 
 fn level_str(level: WireLevel) -> &'static str {
     match level {
@@ -171,7 +174,15 @@ pub(super) fn render_table(
             Line::from(format!("[disconnected] {reason}"))
         }
     };
-    f.render_widget(Paragraph::new(header), chunks[0]);
+    let header_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(GRAPH_HINT_WIDTH)])
+        .split(chunks[0]);
+    f.render_widget(Paragraph::new(header), header_chunks[0]);
+    f.render_widget(
+        Paragraph::new(graph_toggle_hint(model)).alignment(Alignment::Right),
+        header_chunks[1],
+    );
 
     // Middle: hierarchical aggregated tree as a Table so the
     // measurement columns sit at fixed positions regardless of

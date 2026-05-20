@@ -12,7 +12,10 @@ use crate::model::{
     SeriesSummary, SortColumn,
 };
 
-use super::header::{chance_switcher_spans, format_span_rate, level_switcher_spans};
+use super::header::{
+    GRAPH_HINT_WIDTH, chance_switcher_spans, format_span_rate, graph_toggle_hint,
+    level_switcher_spans,
+};
 
 
 /// Same palette as the rest of the TUI, rotated round-robin per
@@ -240,7 +243,15 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, model:
             Line::from(format!("[disconnected] {reason}"))
         }
     };
-    f.render_widget(Paragraph::new(header), area);
+    let header_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(GRAPH_HINT_WIDTH)])
+        .split(area);
+    f.render_widget(Paragraph::new(header), header_chunks[0]);
+    f.render_widget(
+        Paragraph::new(graph_toggle_hint(model)).alignment(ratatui::layout::Alignment::Right),
+        header_chunks[1],
+    );
 }
 
 /// Render the "agg:   …" detail-pane row.  When the input modal
@@ -335,7 +346,6 @@ fn series_table_lines(
     gs: &GraphState,
     cursor_series_idx: Option<usize>,
     colorize: bool,
-    show_sort_underline: bool,
 ) -> (Option<Line<'static>>, Vec<Line<'static>>, Option<usize>) {
     use std::fmt::Write;
 
@@ -414,12 +424,17 @@ fn series_table_lines(
     let stat_headers = ["n", "min", "avg", "max", "last"];
     let stat_columns =
         [SortColumn::Count, SortColumn::Min, SortColumn::Avg, SortColumn::Max, SortColumn::Last];
+    // Reserve enough width for the worst-case `fmt_ns` formatting at
+    // any single scale — `XXX.Xms` / `XXX.Xµs` is 7 chars — so the
+    // time columns don't flap when values waffle between tens and
+    // hundreds.  `n` (count) stays purely content-driven.
+    const TIME_COL_MIN: usize = 7;
     let mut stat_widths: [usize; 5] = [
         stat_headers[0].len(),
-        stat_headers[1].len(),
-        stat_headers[2].len(),
-        stat_headers[3].len(),
-        stat_headers[4].len(),
+        stat_headers[1].len().max(TIME_COL_MIN),
+        stat_headers[2].len().max(TIME_COL_MIN),
+        stat_headers[3].len().max(TIME_COL_MIN),
+        stat_headers[4].len().max(TIME_COL_MIN),
     ];
     for r in &rows {
         stat_widths[0] = stat_widths[0].max(r.n.chars().count());
@@ -438,16 +453,14 @@ fn series_table_lines(
         vec![TuiSpan::styled("      ", dim)];
     for (i, c) in split_cols.iter().enumerate() {
         let cell = format!("{:<w$}", c, w = split_widths[i]);
-        let is_active = show_sort_underline
-            && matches!(&gs.sort_column, SortColumn::SplitKey(k) if k == c);
+        let is_active = matches!(&gs.sort_column, SortColumn::SplitKey(k) if k == c);
         let style = if is_active { underline } else { dim };
         header_spans.push(TuiSpan::styled(cell, style));
         header_spans.push(TuiSpan::styled("  ", dim));
     }
     for (i, h) in stat_headers.iter().enumerate() {
         let cell = format!("{:>w$}", h, w = stat_widths[i]);
-        let is_active =
-            show_sort_underline && gs.sort_column == stat_columns[i];
+        let is_active = gs.sort_column == stat_columns[i];
         let style = if is_active { underline } else { dim };
         header_spans.push(TuiSpan::styled(cell, style));
         if i + 1 < stat_headers.len() {
@@ -551,12 +564,8 @@ fn render_graph_details(
 
         // Table.  Header goes into sticky; data rows + the
         // metadata-keys section go into body.
-        let (table_header, table_rows, table_cursor) = series_table_lines(
-            gs,
-            series_cursor,
-            colorize,
-            /* show_sort_underline */ true,
-        );
+        let (table_header, table_rows, table_cursor) =
+            series_table_lines(gs, series_cursor, colorize);
         if let Some(h) = table_header {
             sticky.push(h);
         }
@@ -660,12 +669,8 @@ fn render_graph_details(
         } else {
             Some(gs.details_selected.min(series_count - 1))
         };
-        let (table_header, table_rows, table_cursor) = series_table_lines(
-            gs,
-            cursor_idx,
-            colorize,
-            /* show_sort_underline */ false,
-        );
+        let (table_header, table_rows, table_cursor) =
+            series_table_lines(gs, cursor_idx, colorize);
         if let Some(h) = table_header {
             sticky.push(h);
         }

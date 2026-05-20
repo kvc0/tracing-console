@@ -3,10 +3,31 @@
 //! formatters they call.
 
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Span as TuiSpan;
+use ratatui::text::{Line, Span as TuiSpan};
 use tracing_console_host::WireLevelFilter;
 
-use crate::model::Model;
+use crate::model::{Model, ViewMode};
+
+/// Right-aligned `g graph` / `g stack` hint shown in the top-right
+/// of the header.  The `g` is underlined as the shortcut key; the
+/// label names the *destination* view (so the table shows "graph"
+/// and the graph shows "stack").
+pub(super) fn graph_toggle_hint(model: &Model) -> Line<'static> {
+    let label = match model.view {
+        ViewMode::Graph(_) => "stack",
+        ViewMode::Table => "graph",
+    };
+    Line::from(vec![
+        TuiSpan::styled("g", Style::default().add_modifier(Modifier::UNDERLINED)),
+        TuiSpan::raw(" "),
+        TuiSpan::raw(label),
+    ])
+}
+
+/// Fixed column width reserved on the right of the header for
+/// [`graph_toggle_hint`].  Long-form label is `g stack` / `g graph`
+/// — both 7 chars; round up to 8 for a one-cell gutter.
+pub(super) const GRAPH_HINT_WIDTH: u16 = 8;
 
 /// Format a chance percentage like the user asked: `100%`, `2%`,
 /// `.001%`, `0.5%` — drop trailing zeros, drop the leading `0`
