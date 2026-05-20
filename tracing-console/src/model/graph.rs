@@ -54,6 +54,37 @@ impl PartialEq for AggMode {
     }
 }
 
+/// How the chart's X-axis tick labels are rendered.  Toggled via
+/// `u` (cycles `Delta → Unix → Local → Delta`).  Affects only
+/// the chart pane labels; the lookback math is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeLabels {
+    /// Seconds before "now" — `-30s`, `-1m`, etc.
+    Delta,
+    /// UTC wall clock — `14:37:58Z`.
+    Unix,
+    /// Local wall clock — `14:37:58` (no suffix).
+    Local,
+}
+
+impl TimeLabels {
+    /// Cycle to the next mode in the `Delta → Unix → Local → Delta`
+    /// order driven by the `u` key.
+    pub fn next(self) -> Self {
+        match self {
+            TimeLabels::Delta => TimeLabels::Unix,
+            TimeLabels::Unix => TimeLabels::Local,
+            TimeLabels::Local => TimeLabels::Delta,
+        }
+    }
+}
+
+impl Default for TimeLabels {
+    fn default() -> Self {
+        TimeLabels::Delta
+    }
+}
+
 /// Which pane has focus inside the graph view.  Mirrors `Focus` but
 /// scoped to graph-mode keys (`Tab` swaps; in Details the user
 /// navigates the split-key candidate list).
@@ -468,6 +499,9 @@ pub struct GraphState {
     pub agg_input: Option<String>,
     pub window_input: Option<String>,
     pub lookback_input: Option<String>,
+    /// X-axis label format; cycled by `u`.
+    #[serde(default)]
+    pub time_labels: TimeLabels,
     /// Per-(series, bin) accumulators — see [`GraphSeriesStore`].
     /// Skipped from serde because it's transient: round-tripping
     /// the Model rebuilds an empty store and re-fills as spans
@@ -496,6 +530,7 @@ impl GraphState {
             agg_input: None,
             window_input: None,
             lookback_input: None,
+            time_labels: TimeLabels::default(),
             store: GraphSeriesStore::new(window_secs),
         }
     }

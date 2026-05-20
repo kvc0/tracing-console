@@ -85,6 +85,9 @@ pub enum Update {
     GraphLookbackInputBackspace,
     GraphLookbackInputCancel,
     GraphLookbackInputCommit,
+    /// `u`: cycle the chart's X-axis label format
+    /// (`Delta → Unix → Local → Delta`).
+    ToggleGraphTimeLabels,
     /// `Tab` inside graph mode.  Swaps focus between Chart and
     /// Details panes (graph-mode analogue of `SwitchFocus`).
     GraphSwitchFocus,

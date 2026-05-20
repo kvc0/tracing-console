@@ -5,6 +5,7 @@ members = ["tracing-console", "tracing-cache", "tracing-console-host"]
 [workspace.dependencies]
 criterion                       = { version = "0", features = ["async_tokio"] }
 async-stream                    = { version = "0.3" }
+chrono                          = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap                            = { version = "4", features = ["derive"] }
 compact_str                     = { version = "0.8", features = ["serde"] }
 crossterm                       = { version = "0.28" }

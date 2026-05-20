@@ -8,6 +8,7 @@ name = "tracing-console"
 path = "src/main.rs"
 
 [dependencies]
+chrono                          = { workspace = true }
 clap                            = { workspace = true }
 crossterm                       = { workspace = true }
 futures                         = { workspace = true }

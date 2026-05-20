@@ -562,6 +562,12 @@ impl Model {
                 }
                 Effect::None
             }
+            Update::ToggleGraphTimeLabels => {
+                if let ViewMode::Graph(gs) = &mut self.view {
+                    gs.time_labels = gs.time_labels.next();
+                }
+                Effect::None
+            }
             Update::GraphSwitchFocus => {
                 if let ViewMode::Graph(gs) = &mut self.view {
                     gs.focus = match gs.focus {

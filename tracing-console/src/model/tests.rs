@@ -598,6 +598,56 @@ fn graph_lookback_input_does_not_rehydrate_store() {
     assert_eq!(series_id_before, series_id_after);
 }
 
+// ── Time-labels (u) ─────────────────────────────────────────
+
+#[test]
+fn graph_time_labels_default_is_delta() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    assert_eq!(current_graph(&m).time_labels, TimeLabels::Delta);
+}
+
+#[test]
+fn graph_time_labels_toggle_cycles_delta_unix_local() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    assert_eq!(current_graph(&m).time_labels, TimeLabels::Delta);
+    m.apply(Update::ToggleGraphTimeLabels);
+    assert_eq!(current_graph(&m).time_labels, TimeLabels::Unix);
+    m.apply(Update::ToggleGraphTimeLabels);
+    assert_eq!(current_graph(&m).time_labels, TimeLabels::Local);
+    m.apply(Update::ToggleGraphTimeLabels);
+    assert_eq!(current_graph(&m).time_labels, TimeLabels::Delta);
+}
+
+#[test]
+fn graph_time_labels_toggle_is_noop_outside_graph_mode() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    // Not in graph view — toggle should do nothing observable.
+    m.apply(Update::ToggleGraphTimeLabels);
+    assert!(matches!(m.view, ViewMode::Table));
+}
+
+#[test]
+fn graph_time_labels_survive_json_round_trip() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::ToggleGraphTimeLabels);
+    m.apply(Update::ToggleGraphTimeLabels);
+    assert_eq!(current_graph(&m).time_labels, TimeLabels::Local);
+    let json = serde_json::to_string(&m).unwrap();
+    let back: Model = serde_json::from_str(&json).unwrap();
+    if let ViewMode::Graph(gs) = &back.view {
+        assert_eq!(gs.time_labels, TimeLabels::Local);
+    } else {
+        panic!("expected graph view");
+    }
+}
+
 #[test]
 fn graph_metric_toggle_rehydrates_store() {
     let mut m = Model::new(8);

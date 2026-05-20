@@ -484,6 +484,9 @@ fn keyboard_loop(
                 // modal rather than the sort cursor so the letter
                 // matches its label in the details pane.
                 KeyCode::Char('l') => Update::BeginGraphLookbackInput,
+                // `u` cycles the chart's X-axis label format
+                // (delta → unix UTC → local clock → delta).
+                KeyCode::Char('u') => Update::ToggleGraphTimeLabels,
                 KeyCode::Tab | KeyCode::BackTab => Update::GraphSwitchFocus,
                 KeyCode::Down | KeyCode::Char('j') => Update::GraphSelectDown,
                 KeyCode::Up | KeyCode::Char('k') => Update::GraphSelectUp,

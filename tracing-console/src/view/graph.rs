@@ -1,7 +1,8 @@
 //! Graph view: chart + columnar series-toggle legend.  Driven by
 //! `Model::view == ViewMode::Graph(_)`.
 
-use ratatui::layout::{Constraint, Direction, Layout};
+use chrono::{DateTime, Local, Utc};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span as TuiSpan};
@@ -9,7 +10,7 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragrap
 
 use crate::model::{
     AggMode, ConnectionStatus, GraphFocus, GraphState, Metric, Model, SeriesProjection,
-    SeriesSummary, SortColumn,
+    SeriesSummary, SortColumn, TimeLabels,
 };
 
 use super::header::{
@@ -75,20 +76,59 @@ fn series_legend(key: &[(String, String)]) -> String {
 /// Pick a "nice" axis step for a span of `span_secs`.  Returns
 /// the step (in seconds) and labels positioned at multiples of
 /// the step, ending at `now` (= 0).
-fn wall_clock_labels(span_secs: f64) -> Vec<ratatui::text::Span<'static>> {
+fn wall_clock_labels(
+    span_secs: f64,
+    mode: TimeLabels,
+    now: DateTime<Utc>,
+) -> Vec<ratatui::text::Span<'static>> {
     let (step, n) = wall_clock_label_step(span_secs);
     let mut out = Vec::with_capacity(n + 1);
     for i in 0..=n {
         let t = i as f64 * step;
-        let text = if i == 0 {
-            "now".to_string()
-        } else {
-            format!("-{}", format_seconds(t))
-        };
-        out.push(ratatui::text::Span::raw(text));
+        out.push(ratatui::text::Span::raw(format_axis_label(t, mode, now)));
     }
     out.reverse();
     out
+}
+
+/// Render one X-axis tick label.  `secs_ago` is how far back from
+/// `now` the tick sits; modes either format it as a duration
+/// (`Delta`) or as a wall-clock time (`Unix` UTC, `Local`).
+fn format_axis_label(secs_ago: f64, mode: TimeLabels, now: DateTime<Utc>) -> String {
+    match mode {
+        TimeLabels::Delta => {
+            if secs_ago < 1e-9 {
+                "now".to_string()
+            } else {
+                format!("-{}", format_seconds(secs_ago))
+            }
+        }
+        TimeLabels::Unix => {
+            let instant = now - chrono::Duration::nanoseconds((secs_ago * 1e9) as i64);
+            instant.format("%H:%M:%SZ").to_string()
+        }
+        TimeLabels::Local => {
+            let instant: DateTime<Local> =
+                (now - chrono::Duration::nanoseconds((secs_ago * 1e9) as i64)).into();
+            instant.format("%H:%M:%S").to_string()
+        }
+    }
+}
+
+/// Right-side title for the graph details block: `u-delta` /
+/// `u-unix` / `u-local`, with the leading `u` underlined as the
+/// shortcut hint.
+fn time_labels_hint(mode: TimeLabels) -> Line<'static> {
+    let label = match mode {
+        TimeLabels::Delta => "delta",
+        TimeLabels::Unix => "unix",
+        TimeLabels::Local => "local",
+    };
+    Line::from(vec![
+        TuiSpan::raw(" "),
+        TuiSpan::styled("u", Style::default().add_modifier(Modifier::UNDERLINED)),
+        TuiSpan::raw(format!("-{label} ")),
+    ])
 }
 
 /// Pick a `(step, n)` such that `n * step == span_secs` exactly and
@@ -238,10 +278,11 @@ pub(super) fn render_graph(
         win = gs.window_secs,
     );
 
+    let now = Utc::now();
     let x_axis = Axis::default()
         .style(Style::default().add_modifier(Modifier::DIM))
         .bounds([-x_max_secs, 0.0])
-        .labels(wall_clock_labels(x_max_secs));
+        .labels(wall_clock_labels(x_max_secs, gs.time_labels, now));
     let y_axis = Axis::default()
         .style(Style::default().add_modifier(Modifier::DIM))
         .bounds([0.0, y_max.max(1.0)])
@@ -797,8 +838,12 @@ fn render_graph_details(
     }
 
     // Draw the outer block first; subsequent paragraphs draw
-    // inside its inner rect.
-    let block = Block::default().title(title).borders(Borders::ALL);
+    // inside its inner rect.  Right-side title shows the X-axis
+    // label mode (`u-delta` / `u-unix` / `u-local`) — `u` cycles.
+    let block = Block::default()
+        .title(title)
+        .title(time_labels_hint(gs.time_labels).alignment(Alignment::Right))
+        .borders(Borders::ALL);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -834,7 +879,15 @@ fn render_graph_details(
 
 #[cfg(test)]
 mod tests {
-    use super::wall_clock_label_step;
+    use super::{format_axis_label, time_labels_hint, wall_clock_label_step};
+    use crate::model::TimeLabels;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn fixed_now() -> DateTime<Utc> {
+        // 2026-05-19 14:37:58 UTC — matches the example in the
+        // user-facing description so tests document the format.
+        Utc.with_ymd_and_hms(2026, 5, 19, 14, 37, 58).unwrap()
+    }
 
     /// Direct values from the user-reported regression:
     /// "with window 0.25s, lookback 2m shows -1.7m, 3m → -2.5m,
@@ -887,5 +940,64 @@ mod tests {
         let span = 67.0_f64;
         let (step, n) = wall_clock_label_step(span);
         assert!((step * n as f64 - span).abs() < 1e-6);
+    }
+
+    #[test]
+    fn format_axis_label_delta_mode_matches_legacy_format() {
+        let now = fixed_now();
+        assert_eq!(format_axis_label(0.0, TimeLabels::Delta, now), "now");
+        assert_eq!(format_axis_label(30.0, TimeLabels::Delta, now), "-30s");
+        assert_eq!(format_axis_label(60.0, TimeLabels::Delta, now), "-1m");
+    }
+
+    #[test]
+    fn format_axis_label_unix_mode_emits_utc_with_z_suffix() {
+        let now = fixed_now();
+        // The "now" tick (secs_ago = 0) is the literal current time.
+        assert_eq!(format_axis_label(0.0, TimeLabels::Unix, now), "14:37:58Z");
+        // 30s and 1m earlier — pure subtraction, no tz involvement.
+        assert_eq!(format_axis_label(30.0, TimeLabels::Unix, now), "14:37:28Z");
+        assert_eq!(format_axis_label(60.0, TimeLabels::Unix, now), "14:36:58Z");
+        // Span backward across the minute boundary.
+        assert_eq!(
+            format_axis_label(120.0, TimeLabels::Unix, now),
+            "14:35:58Z",
+        );
+    }
+
+    #[test]
+    fn format_axis_label_local_mode_omits_z_suffix() {
+        // The Local clock depends on the host's tz; we can't assert
+        // the literal HH:MM:SS without controlling tz.  What we can
+        // assert: the string has no Z suffix (distinguishing it from
+        // Unix mode) and matches an HH:MM:SS shape.
+        let now = fixed_now();
+        let s = format_axis_label(0.0, TimeLabels::Local, now);
+        assert!(!s.ends_with('Z'), "Local mode must drop the Z suffix: {s}");
+        assert_eq!(s.len(), 8, "expected HH:MM:SS, got {s}");
+        let mut chars = s.chars();
+        // HH:MM:SS layout.
+        for (i, c) in s.char_indices() {
+            if i == 2 || i == 5 {
+                assert_eq!(c, ':', "colon at {i}: {s}");
+            } else {
+                assert!(c.is_ascii_digit(), "digit at {i}: {s}");
+            }
+        }
+        let _ = chars.next();
+    }
+
+    #[test]
+    fn time_labels_hint_carries_the_active_mode_word() {
+        let plain = |line: ratatui::text::Line<'_>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert!(plain(time_labels_hint(TimeLabels::Delta)).contains("delta"));
+        assert!(plain(time_labels_hint(TimeLabels::Unix)).contains("unix"));
+        assert!(plain(time_labels_hint(TimeLabels::Local)).contains("local"));
+        // All three variants prefix the letter `u-` as the shortcut.
+        for mode in [TimeLabels::Delta, TimeLabels::Unix, TimeLabels::Local] {
+            assert!(plain(time_labels_hint(mode)).contains("u-"));
+        }
     }
 }
