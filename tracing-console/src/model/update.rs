@@ -78,6 +78,13 @@ pub enum Update {
     GraphWindowInputBackspace,
     GraphWindowInputCancel,
     GraphWindowInputCommit,
+    /// `l`: open the lookback-input modal.  Buffer accepts digits,
+    /// one `.`, and an optional trailing `s`/`m` unit suffix.
+    BeginGraphLookbackInput,
+    GraphLookbackInputChar(char),
+    GraphLookbackInputBackspace,
+    GraphLookbackInputCancel,
+    GraphLookbackInputCommit,
     /// `Tab` inside graph mode.  Swaps focus between Chart and
     /// Details panes (graph-mode analogue of `SwitchFocus`).
     GraphSwitchFocus,

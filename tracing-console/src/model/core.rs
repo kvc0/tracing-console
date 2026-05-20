@@ -12,7 +12,7 @@ use tracing_console_host::WireLevelFilter;
 use crate::aggregate::{Aggregator, BucketKey, StackStats, candidate_split_keys_for};
 
 use super::graph::{
-    GraphFocus, GraphState, Metric, SortColumn, ViewMode, parse_agg_input,
+    GraphFocus, GraphState, Metric, SortColumn, ViewMode, parse_agg_input, parse_lookback_input,
 };
 use super::update::{Effect, Update};
 
@@ -504,6 +504,60 @@ impl Model {
                             gs.window_secs = v;
                             gs.rehydrate(&self.agg);
                         }
+                    }
+                }
+                Effect::None
+            }
+            Update::BeginGraphLookbackInput => {
+                if let ViewMode::Graph(gs) = &mut self.view {
+                    gs.lookback_input = Some(String::new());
+                }
+                Effect::None
+            }
+            Update::GraphLookbackInputChar(c) => {
+                if let ViewMode::Graph(gs) = &mut self.view {
+                    if let Some(buf) = gs.lookback_input.as_mut() {
+                        // Already terminated by a unit suffix → reject
+                        // further input so the user can't type "5sm".
+                        let has_suffix =
+                            buf.ends_with('s') || buf.ends_with('m');
+                        if has_suffix {
+                            // no-op
+                        } else if c.is_ascii_digit() {
+                            buf.push(c);
+                        } else if c == '.' && !buf.contains('.') {
+                            buf.push(c);
+                        } else if (c == 's' || c == 'm') && !buf.is_empty() {
+                            buf.push(c);
+                        }
+                    }
+                }
+                Effect::None
+            }
+            Update::GraphLookbackInputBackspace => {
+                if let ViewMode::Graph(gs) = &mut self.view {
+                    if let Some(buf) = gs.lookback_input.as_mut() {
+                        buf.pop();
+                    }
+                }
+                Effect::None
+            }
+            Update::GraphLookbackInputCancel => {
+                if let ViewMode::Graph(gs) = &mut self.view {
+                    gs.lookback_input = None;
+                }
+                Effect::None
+            }
+            Update::GraphLookbackInputCommit => {
+                if let ViewMode::Graph(gs) = &mut self.view {
+                    let Some(buf) = gs.lookback_input.take() else {
+                        return Effect::None;
+                    };
+                    if let Some(secs) = parse_lookback_input(&buf) {
+                        // Lookback is a pure projection knob — no
+                        // rehydrate needed; the next render reads
+                        // it as `x_max_secs`.
+                        gs.lookback_secs = secs;
                     }
                 }
                 Effect::None

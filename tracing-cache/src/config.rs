@@ -19,7 +19,7 @@ pub struct CacheConfig {
     pub lane_count: usize,
     /// Flush the thread-local PENDING buffer to the spillway after this many
     /// span closures on a single thread.  Smaller = lower visibility latency
-    /// for low-traffic threads at the cost of more spillway sends.  Default: 32.
+    /// for low-traffic threads at the cost of more spillway sends.  Default: 8.
     pub pending_batch: usize,
     /// Flush the driver's accumulated batch into the shared map after this
     /// many spans have been received.  Smaller = lower visibility latency at
@@ -44,7 +44,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             lane_count: DEFAULT_LANE_COUNT,
-            pending_batch: 32,
+            pending_batch: 8,
             driver_batch: 600,
             driver_interval: std::time::Duration::from_secs(1),
             channel_capacity: 65536,

@@ -342,6 +342,8 @@ async fn run_tui(
                                         MODAL_GRAPH_AGG
                                     } else if gs.window_input.is_some() {
                                         MODAL_GRAPH_WINDOW
+                                    } else if gs.lookback_input.is_some() {
+                                        MODAL_GRAPH_LOOKBACK
                                     } else {
                                         MODAL_NONE
                                     }
@@ -380,6 +382,7 @@ const MODAL_NONE: u8 = 0;
 const MODAL_CHANCE: u8 = 1;
 const MODAL_GRAPH_AGG: u8 = 2;
 const MODAL_GRAPH_WINDOW: u8 = 3;
+const MODAL_GRAPH_LOOKBACK: u8 = 4;
 
 fn keyboard_loop(
     tx: spillway::Sender<Update>,
@@ -431,6 +434,10 @@ fn keyboard_loop(
                 (MODAL_GRAPH_WINDOW, KeyCode::Backspace) => Update::GraphWindowInputBackspace,
                 (MODAL_GRAPH_WINDOW, KeyCode::Enter) => Update::GraphWindowInputCommit,
                 (MODAL_GRAPH_WINDOW, KeyCode::Esc) => Update::GraphWindowInputCancel,
+                (MODAL_GRAPH_LOOKBACK, KeyCode::Char(c)) => Update::GraphLookbackInputChar(c),
+                (MODAL_GRAPH_LOOKBACK, KeyCode::Backspace) => Update::GraphLookbackInputBackspace,
+                (MODAL_GRAPH_LOOKBACK, KeyCode::Enter) => Update::GraphLookbackInputCommit,
+                (MODAL_GRAPH_LOOKBACK, KeyCode::Esc) => Update::GraphLookbackInputCancel,
                 _ => continue,
             };
             if send_or_exit(update).is_break() {
@@ -472,13 +479,18 @@ fn keyboard_loop(
                 KeyCode::Char('a') => Update::BeginGraphAggInput,
                 KeyCode::Char('t') => Update::ToggleGraphMetric,
                 KeyCode::Char('w') => Update::BeginGraphWindowInput,
+                // `l` opens the lookback-input modal — sets how far
+                // back the chart's X axis extends.  Reserved for the
+                // modal rather than the sort cursor so the letter
+                // matches its label in the details pane.
+                KeyCode::Char('l') => Update::BeginGraphLookbackInput,
                 KeyCode::Tab | KeyCode::BackTab => Update::GraphSwitchFocus,
                 KeyCode::Down | KeyCode::Char('j') => Update::GraphSelectDown,
                 KeyCode::Up | KeyCode::Char('k') => Update::GraphSelectUp,
                 // Left/Right cycle the series table's leading sort
                 // column.  Underlined in the expanded details pane.
                 KeyCode::Left | KeyCode::Char('h') => Update::GraphSortColumnLeft,
-                KeyCode::Right | KeyCode::Char('l') => Update::GraphSortColumnRight,
+                KeyCode::Right => Update::GraphSortColumnRight,
                 KeyCode::Char(' ') => Update::GraphToggleSplit,
                 _ => continue,
             };

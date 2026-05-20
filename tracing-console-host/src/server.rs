@@ -48,7 +48,7 @@ const STREAM_TARGET_BATCH: usize = 32;
 /// all" — the polling loop just yields to the scheduler and pages
 /// again, which is the highest sustainable throughput.
 const STREAM_MIN_INTERVAL: Duration = Duration::ZERO;
-const STREAM_MAX_INTERVAL: Duration = Duration::from_millis(250);
+const STREAM_MAX_INTERVAL: Duration = Duration::from_millis(50);
 const STREAM_ADJUST_RATIO: f64 = 0.2; // ±20% per tick
 
 /// Per-connection mutable state.  Read by the streaming RPC, mutated by the
@@ -614,29 +614,32 @@ mod tests {
 
     #[test]
     fn adjust_interval_speeds_up_when_over_target_capped_at_20pct() {
-        let i = Duration::from_millis(100);
+        // Pick a starting interval comfortably inside [MIN, MAX] so
+        // the ±20% adjustment isn't clipped by the outer clamp.
+        let i = Duration::from_millis(25);
         // count >> target: raw ratio < 0.8, so clamped to 0.8 × current.
         let next = adjust_interval(i, STREAM_TARGET_BATCH * 100);
-        assert_eq!(next, Duration::from_millis(80));
+        assert_eq!(next, Duration::from_millis(20));
     }
 
     #[test]
     fn adjust_interval_slows_down_when_under_target_capped_at_20pct() {
-        let i = Duration::from_millis(100);
+        let i = Duration::from_millis(25);
         // count << target (or zero): raw ratio > 1.2, so clamped to 1.2 × current.
         let next_zero = adjust_interval(i, 0);
-        assert_eq!(next_zero, Duration::from_millis(120));
+        assert_eq!(next_zero, Duration::from_millis(30));
         let next_one = adjust_interval(i, 1);
-        assert_eq!(next_one, Duration::from_millis(120));
+        assert_eq!(next_one, Duration::from_millis(30));
     }
 
     #[test]
     fn adjust_interval_takes_ratio_when_inside_20pct_band() {
         // count just above target: ratio inside [0.8, 1.2].
-        let i = Duration::from_millis(110);
+        let i = Duration::from_millis(25);
         let count = STREAM_TARGET_BATCH + STREAM_TARGET_BATCH / 10;
         let next = adjust_interval(i, count);
-        // 110 ms × target / count.
+        // 25 ms × target / count, with the raw value inside the
+        // ±20% band so neither the inner nor outer clamp fires.
         let expected = i.mul_f64(STREAM_TARGET_BATCH as f64 / count as f64);
         assert_eq!(next, expected);
     }

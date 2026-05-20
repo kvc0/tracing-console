@@ -76,29 +76,69 @@ fn series_legend(key: &[(String, String)]) -> String {
 /// the step (in seconds) and labels positioned at multiples of
 /// the step, ending at `now` (= 0).
 fn wall_clock_labels(span_secs: f64) -> Vec<ratatui::text::Span<'static>> {
-    let target_steps = 4.0;
-    let raw = (span_secs / target_steps).max(0.001);
-    let pow = 10f64.powf(raw.log10().floor());
-    let candidates = [1.0, 2.0, 5.0, 10.0];
-    let step = candidates
-        .iter()
-        .map(|c| c * pow)
-        .find(|s| span_secs / *s <= target_steps + 0.5)
-        .unwrap_or(raw);
-
-    let mut out = Vec::new();
-    let mut t = 0.0_f64;
-    while t <= span_secs + 1e-6 {
-        let label = if t < 1e-6 {
-            "now".into()
+    let (step, n) = wall_clock_label_step(span_secs);
+    let mut out = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = i as f64 * step;
+        let text = if i == 0 {
+            "now".to_string()
         } else {
-            format_seconds(t)
+            format!("-{}", format_seconds(t))
         };
-        out.push(ratatui::text::Span::raw(format!("-{}", label).replace("-now", "now")));
-        t += step;
+        out.push(ratatui::text::Span::raw(text));
     }
     out.reverse();
     out
+}
+
+/// Pick a `(step, n)` such that `n * step == span_secs` exactly and
+/// `n` falls in `[3, 8]`, preferring `n ≈ 4`.  The product
+/// equality is load-bearing: ratatui distributes axis labels
+/// evenly across the bounds, so if the labels' stated values
+/// don't span the bounds exactly, the leftmost label reads
+/// something smaller than the actual leftmost edge (the
+/// regression that made "lookback 2m" display as "-1.7m").
+///
+/// Falls back to `(span_secs / 4, 4)` when no nice round step
+/// divides `span_secs` — labels won't be at round numbers but
+/// they'll line up with the axis correctly.
+pub(super) fn wall_clock_label_step(span_secs: f64) -> (f64, usize) {
+    const NICE_STEPS: &[f64] = &[
+        0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5,
+        1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0,
+        60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0,
+    ];
+    const TARGET_N: f64 = 4.0;
+    const MIN_N: usize = 3;
+    const MAX_N: usize = 8;
+
+    let mut best: Option<(f64, usize)> = None;
+    for &step in NICE_STEPS {
+        if step > span_secs {
+            break;
+        }
+        let ratio = span_secs / step;
+        let n_round = ratio.round();
+        if !(MIN_N as f64..=MAX_N as f64).contains(&n_round) {
+            continue;
+        }
+        // Step must divide span_secs exactly (within float noise)
+        // — otherwise n*step ≠ span_secs and the leftmost label
+        // gets placed at the wrong axis position.
+        let tol = 1e-6 * span_secs.max(1.0);
+        if (ratio - n_round).abs() > tol {
+            continue;
+        }
+        let n = n_round as usize;
+        let score = (n_round - TARGET_N).abs();
+        let better = best.map_or(true, |(_, prev_n)| {
+            (prev_n as f64 - TARGET_N).abs() > score
+        });
+        if better {
+            best = Some((step, n));
+        }
+    }
+    best.unwrap_or_else(|| (span_secs / TARGET_N, TARGET_N as usize))
 }
 
 fn format_seconds(s: f64) -> String {
@@ -152,9 +192,9 @@ pub(super) fn render_graph(
 
     // Chart pane.  Project the series store into ratatui datasets;
     // x_max is "this many seconds of history we're willing to
-    // show" — capped so the chart isn't dominated by empty bins
-    // after the user just relocked / reset.
-    let x_max_secs = (gs.window_secs * 60.0).max(gs.window_secs);
+    // show" — driven by the `l` lookback knob and clamped to be
+    // at least one bin wide.
+    let x_max_secs = gs.lookback_secs.max(gs.window_secs);
     let projections = gs.store.project(gs.aggregation, x_max_secs);
     // Use `color_index_of` (= alphabetical rank) for colour
     // assignment so the chart's colours stay stable regardless
@@ -328,6 +368,55 @@ fn window_field_line(gs: &GraphState) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+/// Render the "lookback: …" detail-pane row.  Mirrors
+/// [`window_field_line`]; modal input box when editing, formatted
+/// value with edit hint otherwise.  Displays in minutes when the
+/// value is ≥ 60 s, seconds otherwise.
+fn lookback_field_line(gs: &GraphState) -> Line<'static> {
+    let mut spans = vec![TuiSpan::raw("lookback: ")];
+    match &gs.lookback_input {
+        Some(buf) => {
+            let body = if buf.is_empty() {
+                " ".to_string()
+            } else {
+                buf.clone()
+            };
+            spans.push(TuiSpan::styled(
+                body,
+                Style::default()
+                    .bg(Color::White)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(TuiSpan::styled(
+                "_",
+                Style::default()
+                    .bg(Color::White)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ));
+            spans.push(TuiSpan::raw(
+                "   (Ns / Nm; default seconds; Enter commit, Esc cancel)",
+            ));
+        }
+        None => {
+            spans.push(TuiSpan::raw(format!(
+                "{:<13}(press l to edit)",
+                format_lookback(gs.lookback_secs),
+            )));
+        }
+    }
+    Line::from(spans)
+}
+
+fn format_lookback(secs: f64) -> String {
+    if secs >= 60.0 {
+        format!("{:.2}m", secs / 60.0)
+    } else {
+        format!("{:.2}s", secs)
+    }
 }
 
 /// Build the columnar series-toggle table shown in both the
@@ -534,6 +623,7 @@ fn render_graph_details(
             metric_label(gs.metric)
         )));
         sticky.push(window_field_line(gs));
+        sticky.push(lookback_field_line(gs));
         if !gs.split_keys.is_empty() {
             sticky.push(Line::from(format!(
                 "splits:   {}",
@@ -658,8 +748,33 @@ fn render_graph_details(
             }
             None => row.push(TuiSpan::raw(format!("{:.2}s", gs.window_secs))),
         }
+        row.push(TuiSpan::raw("   lookback: "));
+        match &gs.lookback_input {
+            Some(buf) => {
+                let buf_body = if buf.is_empty() {
+                    " ".into()
+                } else {
+                    buf.clone()
+                };
+                row.push(TuiSpan::styled(
+                    buf_body,
+                    Style::default()
+                        .bg(Color::White)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                row.push(TuiSpan::styled(
+                    "_",
+                    Style::default()
+                        .bg(Color::White)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                ));
+            }
+            None => row.push(TuiSpan::raw(format_lookback(gs.lookback_secs))),
+        }
         row.push(TuiSpan::raw(
-            "   (a/w to edit, t to swap metric, Tab to split)",
+            "   (a/w/l to edit, t to swap metric, Tab to split)",
         ));
         sticky.push(Line::from(row));
 
@@ -714,5 +829,63 @@ fn render_graph_details(
             _ => 0,
         };
         f.render_widget(Paragraph::new(body).scroll((scroll, 0)), chunks[1]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wall_clock_label_step;
+
+    /// Direct values from the user-reported regression:
+    /// "with window 0.25s, lookback 2m shows -1.7m, 3m → -2.5m,
+    /// 4m → -3.3m".  Each of these must produce a step that
+    /// divides span_secs exactly, otherwise ratatui places the
+    /// leftmost label at the wrong axis position.
+    #[test]
+    fn wall_clock_label_step_evenly_divides_user_lookback_inputs() {
+        for &span in &[60.0_f64, 120.0, 180.0, 240.0, 300.0, 600.0] {
+            let (step, n) = wall_clock_label_step(span);
+            assert!(
+                (step * n as f64 - span).abs() < 1e-6,
+                "step={step} n={n} span={span}: step*n must equal span",
+            );
+            assert!(
+                (3..=8).contains(&n),
+                "n={n} out of [3,8] for span={span}",
+            );
+        }
+    }
+
+    #[test]
+    fn wall_clock_label_step_picks_nice_minutes_for_minute_spans() {
+        // The specific outputs the user expects to see.
+        assert_eq!(wall_clock_label_step(60.0), (15.0, 4));
+        assert_eq!(wall_clock_label_step(120.0), (30.0, 4));
+        assert_eq!(wall_clock_label_step(180.0), (60.0, 3));
+        assert_eq!(wall_clock_label_step(240.0), (60.0, 4));
+        assert_eq!(wall_clock_label_step(300.0), (60.0, 5));
+        assert_eq!(wall_clock_label_step(600.0), (120.0, 5));
+    }
+
+    #[test]
+    fn wall_clock_label_step_handles_sub_second_spans() {
+        // Window=0.25, lookback at floor — same correctness rule.
+        let (step, n) = wall_clock_label_step(0.25);
+        assert!((step * n as f64 - 0.25).abs() < 1e-9);
+        assert!((3..=8).contains(&n));
+
+        let (step, n) = wall_clock_label_step(1.0);
+        assert!((step * n as f64 - 1.0).abs() < 1e-9);
+        assert!((3..=8).contains(&n));
+    }
+
+    #[test]
+    fn wall_clock_label_step_fallback_when_no_nice_divisor() {
+        // A span that no nice step divides exactly (67s is prime
+        // among the candidates) — the fallback must still satisfy
+        // n*step == span so labels line up with the axis.
+        let span = 67.0_f64;
+        let (step, n) = wall_clock_label_step(span);
+        assert!((step * n as f64 - span).abs() < 1e-6);
     }
 }

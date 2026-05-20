@@ -355,6 +355,36 @@ fn window_ns_from_secs(secs: f64) -> u64 {
     }
 }
 
+/// Parse the lookback-input modal buffer.  Grammar:
+///
+/// * `<number>`       → seconds (the default unit)
+/// * `<number>s`      → seconds
+/// * `<number>m`      → minutes
+///
+/// `<number>` must be a finite positive `f64`.  Returns `None` for
+/// any other input (empty, non-positive, unknown suffix, garbage);
+/// the caller treats `None` as "leave the existing lookback
+/// unchanged".  Result is always in **seconds** so callers can
+/// assign directly to `lookback_secs`.
+pub fn parse_lookback_input(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, multiplier) = if let Some(rest) = s.strip_suffix('m') {
+        (rest, 60.0)
+    } else if let Some(rest) = s.strip_suffix('s') {
+        (rest, 1.0)
+    } else {
+        (s, 1.0)
+    };
+    let v: f64 = num.parse().ok()?;
+    if !v.is_finite() || v <= 0.0 {
+        return None;
+    }
+    Some(v * multiplier)
+}
+
 /// Parse the aggregation-input modal buffer.  Grammar:
 ///
 /// * `a` / `avg`                  → `Avg`
@@ -408,6 +438,11 @@ pub struct GraphState {
     pub aggregation: AggMode,
     pub metric: Metric,
     pub window_secs: f64,
+    /// Width of the chart's visible X-axis, in seconds.  Independent
+    /// of `window_secs` (which sets the bin width); lookback only
+    /// affects how far back in time the chart shows.  Edited via the
+    /// `l` modal — see [`parse_lookback_input`].
+    pub lookback_secs: f64,
     pub split_keys: BTreeSet<String>,
     /// Series the user has unchecked in the details pane.  Anything
     /// in this set is omitted from the chart but still recorded
@@ -432,6 +467,7 @@ pub struct GraphState {
     /// [`parse_agg_input`].
     pub agg_input: Option<String>,
     pub window_input: Option<String>,
+    pub lookback_input: Option<String>,
     /// Per-(series, bin) accumulators — see [`GraphSeriesStore`].
     /// Skipped from serde because it's transient: round-tripping
     /// the Model rebuilds an empty store and re-fills as spans
@@ -448,6 +484,10 @@ impl GraphState {
             aggregation: AggMode::Avg,
             metric: Metric::Total,
             window_secs,
+            // Default to one minute of history shown on the chart.
+            // Independent of the bin window — the user can pick a
+            // long lookback with a coarse window, or vice versa.
+            lookback_secs: 60.0,
             split_keys: BTreeSet::new(),
             hidden_series: BTreeSet::new(),
             details_selected: 0,
@@ -455,6 +495,7 @@ impl GraphState {
             sort_column: SortColumn::Count,
             agg_input: None,
             window_input: None,
+            lookback_input: None,
             store: GraphSeriesStore::new(window_secs),
         }
     }

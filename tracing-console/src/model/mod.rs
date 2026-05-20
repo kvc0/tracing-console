@@ -26,6 +26,6 @@ mod tests;
 pub use core::{ConnectionStatus, Focus, LEVEL_OPTIONS, Model, RateTracker, VisibleRow};
 pub use graph::{
     AggMode, GraphFocus, GraphSeriesStore, GraphState, Metric, SeriesProjection, SeriesSummary,
-    SortColumn, ViewMode, parse_agg_input,
+    SortColumn, ViewMode, parse_agg_input, parse_lookback_input,
 };
 pub use update::{Effect, Update};

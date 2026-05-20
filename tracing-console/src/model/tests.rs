@@ -420,6 +420,184 @@ fn graph_window_input_commits_positive_float() {
     assert!((current_graph(&m).window_secs - 0.5).abs() < 1e-9);
 }
 
+// ── Lookback (l) ────────────────────────────────────────────
+
+#[test]
+fn parse_lookback_input_accepts_bare_seconds_and_s_suffix() {
+    assert_eq!(parse_lookback_input("30"), Some(30.0));
+    assert_eq!(parse_lookback_input("30s"), Some(30.0));
+    assert_eq!(parse_lookback_input("0.5"), Some(0.5));
+    assert_eq!(parse_lookback_input("0.5s"), Some(0.5));
+    assert_eq!(parse_lookback_input("  45 "), Some(45.0));
+}
+
+#[test]
+fn parse_lookback_input_m_suffix_converts_to_seconds() {
+    assert_eq!(parse_lookback_input("1m"), Some(60.0));
+    assert_eq!(parse_lookback_input("5m"), Some(300.0));
+    assert_eq!(parse_lookback_input("1.5m"), Some(90.0));
+}
+
+#[test]
+fn parse_lookback_input_rejects_garbage_and_non_positive() {
+    assert!(parse_lookback_input("").is_none());
+    assert!(parse_lookback_input("0").is_none());
+    assert!(parse_lookback_input("0s").is_none());
+    assert!(parse_lookback_input("0m").is_none());
+    assert!(parse_lookback_input("-5").is_none());
+    assert!(parse_lookback_input("-5s").is_none());
+    assert!(parse_lookback_input("nan").is_none());
+    assert!(parse_lookback_input("infs").is_none());
+    assert!(parse_lookback_input("abc").is_none());
+    assert!(parse_lookback_input("5x").is_none());
+    assert!(parse_lookback_input("s").is_none());
+    assert!(parse_lookback_input("m").is_none());
+}
+
+#[test]
+fn graph_lookback_input_commits_bare_number_as_seconds() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::BeginGraphLookbackInput);
+    for c in "120".chars() {
+        m.apply(Update::GraphLookbackInputChar(c));
+    }
+    m.apply(Update::GraphLookbackInputCommit);
+    let gs = current_graph(&m);
+    assert!((gs.lookback_secs - 120.0).abs() < 1e-9);
+    assert!(gs.lookback_input.is_none());
+}
+
+#[test]
+fn graph_lookback_input_commits_minutes_suffix() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::BeginGraphLookbackInput);
+    for c in "5m".chars() {
+        m.apply(Update::GraphLookbackInputChar(c));
+    }
+    m.apply(Update::GraphLookbackInputCommit);
+    assert!((current_graph(&m).lookback_secs - 300.0).abs() < 1e-9);
+}
+
+#[test]
+fn graph_lookback_input_commits_seconds_suffix_same_as_bare() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::BeginGraphLookbackInput);
+    for c in "45s".chars() {
+        m.apply(Update::GraphLookbackInputChar(c));
+    }
+    m.apply(Update::GraphLookbackInputCommit);
+    assert!((current_graph(&m).lookback_secs - 45.0).abs() < 1e-9);
+}
+
+#[test]
+fn graph_lookback_input_rejects_zero_and_keeps_prior_value() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    let original = current_graph(&m).lookback_secs;
+    for bad in ["0", "0s", "0m", ""] {
+        m.apply(Update::BeginGraphLookbackInput);
+        for c in bad.chars() {
+            m.apply(Update::GraphLookbackInputChar(c));
+        }
+        m.apply(Update::GraphLookbackInputCommit);
+        assert!(
+            (current_graph(&m).lookback_secs - original).abs() < 1e-9,
+            "lookback changed on {:?}",
+            bad,
+        );
+        assert!(current_graph(&m).lookback_input.is_none());
+    }
+}
+
+#[test]
+fn graph_lookback_input_char_filter_drops_letters_and_extra_dots() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::BeginGraphLookbackInput);
+    // Mix in invalid characters; only digits, one '.', and a single
+    // trailing 's'/'m' should land in the buffer.
+    for c in "1z.2y.3xs".chars() {
+        m.apply(Update::GraphLookbackInputChar(c));
+    }
+    let buf = current_graph(&m).lookback_input.clone();
+    assert_eq!(buf.as_deref(), Some("1.23s"));
+    // Once a suffix is present, no further chars (including digits
+    // or another suffix) sneak in.
+    m.apply(Update::GraphLookbackInputChar('5'));
+    m.apply(Update::GraphLookbackInputChar('m'));
+    assert_eq!(
+        current_graph(&m).lookback_input.as_deref(),
+        Some("1.23s"),
+    );
+}
+
+#[test]
+fn graph_lookback_input_suffix_rejected_at_empty_buffer() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::BeginGraphLookbackInput);
+    // Leading 's' or 'm' alone is meaningless — must follow a digit.
+    m.apply(Update::GraphLookbackInputChar('s'));
+    m.apply(Update::GraphLookbackInputChar('m'));
+    assert_eq!(current_graph(&m).lookback_input.as_deref(), Some(""));
+}
+
+#[test]
+fn graph_lookback_input_backspace_and_cancel() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "a")));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::BeginGraphLookbackInput);
+    for c in "5m".chars() {
+        m.apply(Update::GraphLookbackInputChar(c));
+    }
+    m.apply(Update::GraphLookbackInputBackspace);
+    assert_eq!(current_graph(&m).lookback_input.as_deref(), Some("5"));
+    // Cancel drops the buffer without touching `lookback_secs`.
+    let original = current_graph(&m).lookback_secs;
+    m.apply(Update::GraphLookbackInputCancel);
+    assert!(current_graph(&m).lookback_input.is_none());
+    assert!((current_graph(&m).lookback_secs - original).abs() < 1e-9);
+}
+
+#[test]
+fn graph_lookback_input_does_not_rehydrate_store() {
+    // Lookback is a pure projection knob — changing it must NOT
+    // wipe or re-walk the series store (unlike window/metric which
+    // do call rehydrate).
+    let mut m = Model::new(16);
+    m.apply(Update::SpanReceived(timed_span(10, None, "a", 0, 100)));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::SpanReceived(timed_span(11, None, "a", 100, 250)));
+    let before = current_graph(&m).store.series.len();
+    let series_id_before = current_graph(&m)
+        .store
+        .series
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(before > 0);
+
+    m.apply(Update::BeginGraphLookbackInput);
+    for c in "5m".chars() {
+        m.apply(Update::GraphLookbackInputChar(c));
+    }
+    m.apply(Update::GraphLookbackInputCommit);
+    let gs = current_graph(&m);
+    assert_eq!(gs.store.series.len(), before, "store must not be wiped");
+    let series_id_after: Vec<_> = gs.store.series.keys().cloned().collect();
+    assert_eq!(series_id_before, series_id_after);
+}
+
 #[test]
 fn graph_metric_toggle_rehydrates_store() {
     let mut m = Model::new(8);
