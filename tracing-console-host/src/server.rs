@@ -1041,4 +1041,167 @@ mod tests {
 
         server.abort();
     }
+
+    // ── sampling_passes / filter_passes unit tests ───────────────────────────
+
+    use std::time::Instant;
+    use tracing::callsite::{Callsite, DefaultCallsite, Identifier};
+    use tracing::field::FieldSet;
+    use tracing::metadata::Kind;
+    use tracing_cache::{FieldList, SpanRecord};
+
+    static SAMPLING_CALLSITE: DefaultCallsite = {
+        static META: tracing::Metadata<'static> = tracing::Metadata::new(
+            "sampling_test",
+            "sampling::test",
+            tracing::Level::INFO,
+            None,
+            None,
+            None,
+            FieldSet::new(&[], Identifier(&SAMPLING_CALLSITE)),
+            Kind::SPAN,
+        );
+        DefaultCallsite::new(&META)
+    };
+
+    fn synth_span(id: u64, parent_id: Option<u64>) -> SpanRecord {
+        SpanRecord {
+            id,
+            parent_id,
+            metadata: SAMPLING_CALLSITE.metadata(),
+            fields: FieldList::default(),
+            events: Vec::new(),
+            opened_at: Instant::now(),
+            closed_at: Some(Instant::now()),
+        }
+    }
+
+    #[test]
+    fn sampling_passes_rate_one_short_circuits_true() {
+        // rate >= 1.0 must accept every span regardless of id hash.
+        for id in [0u64, 1, 17, u64::MAX, 0x9E37_79B9_7F4A_7C15] {
+            assert!(sampling_passes(&synth_span(id, None), 1.0));
+        }
+    }
+
+    #[test]
+    fn sampling_passes_rate_zero_short_circuits_false() {
+        for id in [0u64, 1, 17, u64::MAX] {
+            assert!(!sampling_passes(&synth_span(id, None), 0.0));
+        }
+    }
+
+    #[test]
+    fn sampling_passes_is_deterministic_per_root_id() {
+        // Repeating the call with the same record must yield the same
+        // answer — otherwise children inheriting a root's decision
+        // would race against their root's hash.
+        for id in 1u64..=20 {
+            let r = synth_span(id, None);
+            let first = sampling_passes(&r, 0.5);
+            for _ in 0..3 {
+                assert_eq!(sampling_passes(&r, 0.5), first, "id={id}");
+            }
+        }
+    }
+
+    #[test]
+    fn sampling_passes_children_inherit_parents_root_id_bucket() {
+        // Children with `parent_id = Some(root)` must hash on the
+        // root, not on their own id.  Pick a root id that does pass
+        // at rate=0.5 and demonstrate the child gets the same answer.
+        let root = synth_span(7, None);
+        let want = sampling_passes(&root, 0.5);
+        // Several different child ids, all under root=7 → all match.
+        for child_id in [100u64, 200, 300, u64::MAX] {
+            let child = synth_span(child_id, Some(7));
+            assert_eq!(sampling_passes(&child, 0.5), want);
+        }
+    }
+
+    #[test]
+    fn sampling_passes_partitions_population_near_target_rate() {
+        // Coarse distribution sanity-check — splitmix should produce
+        // close-to-uniform fractions, so rate=0.3 over a large pool
+        // should pass roughly 30% of distinct root ids.
+        let rate = 0.3;
+        let n = 5_000u64;
+        let mut passed = 0usize;
+        for id in 1..=n {
+            if sampling_passes(&synth_span(id, None), rate) {
+                passed += 1;
+            }
+        }
+        let frac = passed as f64 / n as f64;
+        assert!(
+            (frac - rate).abs() < 0.03,
+            "frac={frac} rate={rate} — hash distribution drifted",
+        );
+    }
+
+    #[test]
+    fn filter_passes_descendant_inherits_root_decision_via_memo() {
+        let filter = Some("alpha".to_string());
+        let roots: Arc<RwLock<HashMap<u64, bool>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        // Pre-populate the memo with parent=42 mapped to `false`.
+        roots.write().unwrap().insert(42, false);
+
+        // A child whose `parent_id = Some(42)` inherits the parent's
+        // `false` regardless of its own metadata name.
+        let child = synth_span(43, Some(42));
+        assert!(!filter_passes(&child, &filter, &roots));
+        // The child's id is now also memoised so its children inherit.
+        assert_eq!(roots.read().unwrap().get(&43).copied(), Some(false));
+    }
+
+    #[test]
+    fn filter_passes_root_caches_match_in_memo() {
+        // Root with name == "sampling_test" matches "sampling".
+        let filter = Some("sampling".to_string());
+        let roots: Arc<RwLock<HashMap<u64, bool>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let root = synth_span(10, None);
+        assert!(filter_passes(&root, &filter, &roots));
+        assert_eq!(roots.read().unwrap().get(&10).copied(), Some(true));
+    }
+
+    #[test]
+    fn filter_passes_empty_or_none_filter_accepts_everything() {
+        let roots: Arc<RwLock<HashMap<u64, bool>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let s = synth_span(1, None);
+        assert!(filter_passes(&s, &None, &roots));
+        assert!(filter_passes(&s, &Some(String::new()), &roots));
+        // Neither path should touch the memo.
+        assert!(roots.read().unwrap().is_empty());
+    }
+
+    // ── SetSamplingRate RPC validation ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_sampling_rate_rejects_out_of_range() {
+        let (cache, level_handle, chance_handle) = cache_with_spans(|| {});
+        let (addr, server) =
+            spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let client = connect_client(addr).await;
+
+        for bad in [1.5_f64, -0.1, f64::NAN] {
+            let resp = client
+                .send_unary(Request::new(RequestBody::SetSamplingRate(bad)))
+                .unwrap()
+                .await
+                .unwrap();
+            match resp.body {
+                ResponseBody::Error(msg) => {
+                    assert!(
+                        msg.contains("sampling rate"),
+                        "unexpected error message for {bad}: {msg}",
+                    );
+                }
+                other => panic!("expected Error for rate={bad}, got {other:?}"),
+            }
+        }
+        server.abort();
+    }
 }

@@ -175,7 +175,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
             capacity,
             batch_size: config.driver_batch,
             tick_interval: config.driver_interval,
-            side_events: std::collections::HashMap::new(),
+            side_events: std::collections::BTreeMap::new(),
         };
         (cache, driver)
     }

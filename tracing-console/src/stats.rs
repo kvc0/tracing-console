@@ -164,3 +164,57 @@ impl StatsAccumulator {
         let _ = std::io::stdout().flush();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_console_host::{WireLevel, WireSpan};
+
+    fn closed_span(id: u64) -> WireSpan {
+        WireSpan {
+            id,
+            parent_id: None,
+            name: "alpha".into(),
+            target: "test".into(),
+            level: WireLevel::Info,
+            fields: Vec::new(),
+            events: Vec::new(),
+            opened_at_ns: 0,
+            closed_at_ns: Some(100),
+        }
+    }
+
+    fn open_span(id: u64) -> WireSpan {
+        let mut s = closed_span(id);
+        s.closed_at_ns = None;
+        s
+    }
+
+    #[test]
+    fn stats_absorb_counts_open_spans_separately_from_received() {
+        let mut acc = StatsAccumulator::new(16);
+        acc.absorb(Update::SpanReceived(closed_span(10)));
+        acc.absorb(Update::SpanReceived(open_span(11)));
+        acc.absorb(Update::SpanReceived(closed_span(12)));
+        assert_eq!(acc.total_received, 3);
+        assert_eq!(acc.total_dropped_unfinished, 1);
+        // Only the two closed spans landed in the aggregator.
+        assert_eq!(acc.agg.len(), 2);
+    }
+
+    #[test]
+    fn stats_absorb_status_overwrites_last_status() {
+        let mut acc = StatsAccumulator::new(16);
+        acc.absorb(Update::Disconnected("network gone".into()));
+        assert!(!acc.connected);
+        assert_eq!(acc.last_status.as_deref(), Some("network gone"));
+        acc.absorb(Update::Status("retrying".into()));
+        assert_eq!(acc.last_status.as_deref(), Some("retrying"));
+        // Status arriving while disconnected doesn't flip connected back on.
+        assert!(!acc.connected);
+        acc.absorb(Update::Connected);
+        assert!(acc.connected);
+        // Connected clears the stale status string.
+        assert!(acc.last_status.is_none());
+    }
+}
