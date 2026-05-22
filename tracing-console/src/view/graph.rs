@@ -9,14 +9,11 @@ use ratatui::text::{Line, Span as TuiSpan};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
 
 use crate::model::{
-    AggMode, ConnectionStatus, GraphFocus, GraphState, Metric, Model, SeriesProjection,
-    SeriesSummary, SortColumn, TimeLabels,
+    AggMode, GraphFocus, GraphState, Metric, Model, SeriesProjection, SeriesSummary, SortColumn,
+    TimeLabels,
 };
 
-use super::header::{
-    GRAPH_HINT_WIDTH, chance_switcher_spans, format_span_rate, graph_toggle_hint,
-    level_switcher_spans,
-};
+use super::header::render_header_row;
 
 
 /// Same palette as the rest of the TUI, rotated round-robin per
@@ -228,7 +225,7 @@ pub(super) fn render_graph(
         .split(area);
 
     // Header: same connection/level/chance line as the table view.
-    render_header(f, chunks[0], model);
+    render_header_row(f, chunks[0], model);
 
     // Chart pane.  Project the series store into ratatui datasets;
     // x_max is "this many seconds of history we're willing to
@@ -297,42 +294,32 @@ pub(super) fn render_graph(
     render_graph_details(f, chunks[2], model, gs, colorize);
 }
 
-/// Re-render the header line (connection status + cache-level +
-/// chance + span count) used by both table and graph views.
-fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, model: &Model) {
-    let header = match &model.connection {
-        ConnectionStatus::Connecting => Line::from(vec![
-            TuiSpan::raw("[connecting] "),
-            TuiSpan::styled(
-                model.status.clone().unwrap_or_default(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]),
-        ConnectionStatus::Connected => {
-            let mut spans: Vec<TuiSpan<'static>> = vec![TuiSpan::raw("[connected]  ")];
-            level_switcher_spans(&mut spans, model);
-            spans.push(TuiSpan::raw("  "));
-            chance_switcher_spans(&mut spans, model);
-            spans.push(TuiSpan::raw(format!(
-                "   {n} spans / {rate}",
-                n = model.agg.len(),
-                rate = format_span_rate(model),
-            )));
-            Line::from(spans)
+// Header rendering lives in `super::header` — both views share it.
+
+/// Shared "modal value cell" renderer used by every detail-pane
+/// field that has an inline-edit modal (agg / window / lookback /
+/// chance).  Emits the white-bg + reversed-cursor input box when
+/// `buf.is_some()`, otherwise returns the idle-state span as
+/// produced by `idle()`.  Returning a `Vec<TuiSpan>` so callers
+/// can splice it into a larger line.
+fn modal_value_spans<F>(buf: &Option<String>, idle: F) -> Vec<TuiSpan<'static>>
+where
+    F: FnOnce() -> TuiSpan<'static>,
+{
+    match buf {
+        Some(buf) => {
+            let body = if buf.is_empty() { " ".to_string() } else { buf.clone() };
+            let base = Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD);
+            vec![
+                TuiSpan::styled(body, base),
+                TuiSpan::styled("_", base.add_modifier(Modifier::REVERSED)),
+            ]
         }
-        ConnectionStatus::Disconnected(reason) => {
-            Line::from(format!("[disconnected] {reason}"))
-        }
-    };
-    let header_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(GRAPH_HINT_WIDTH)])
-        .split(area);
-    f.render_widget(Paragraph::new(header), header_chunks[0]);
-    f.render_widget(
-        Paragraph::new(graph_toggle_hint(model)).alignment(ratatui::layout::Alignment::Right),
-        header_chunks[1],
-    );
+        None => vec![idle()],
+    }
 }
 
 /// Render the "agg:   …" detail-pane row.  When the input modal
@@ -341,35 +328,16 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, model:
 /// current aggregation label plus a short hint.
 fn agg_field_line(gs: &GraphState) -> Line<'static> {
     let mut spans = vec![TuiSpan::raw("agg:      ")];
-    match &gs.agg_input {
-        Some(buf) => {
-            let body = if buf.is_empty() {
-                " ".to_string()
-            } else {
-                buf.clone()
-            };
-            spans.push(TuiSpan::styled(
-                body,
-                Style::default()
-                    .bg(Color::White)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(TuiSpan::styled(
-                "_",
-                Style::default()
-                    .bg(Color::White)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
-            ));
-            spans.push(TuiSpan::raw("   (a/avg, min, max, pX[.XX]; Enter commit, Esc cancel)"));
-        }
-        None => {
-            spans.push(TuiSpan::raw(format!(
-                "{}            (press a to edit)",
-                agg_label(gs.aggregation)
-            )));
-        }
+    spans.extend(modal_value_spans(&gs.agg_input, || {
+        TuiSpan::raw(format!(
+            "{}            (press a to edit)",
+            agg_label(gs.aggregation)
+        ))
+    }));
+    if gs.agg_input.is_some() {
+        spans.push(TuiSpan::raw(
+            "   (a/avg, min, max, pX[.XX]; Enter commit, Esc cancel)",
+        ));
     }
     Line::from(spans)
 }
@@ -378,35 +346,16 @@ fn agg_field_line(gs: &GraphState) -> Line<'static> {
 /// highlighted-input treatment when its modal is active.
 fn window_field_line(gs: &GraphState) -> Line<'static> {
     let mut spans = vec![TuiSpan::raw("window:   ")];
-    match &gs.window_input {
-        Some(buf) => {
-            let body = if buf.is_empty() {
-                " ".to_string()
-            } else {
-                buf.clone()
-            };
-            spans.push(TuiSpan::styled(
-                body,
-                Style::default()
-                    .bg(Color::White)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(TuiSpan::styled(
-                "_",
-                Style::default()
-                    .bg(Color::White)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
-            ));
-            spans.push(TuiSpan::raw("   (positive seconds; Enter commit, Esc cancel)"));
-        }
-        None => {
-            spans.push(TuiSpan::raw(format!(
-                "{:.2}s            (press w to edit)",
-                gs.window_secs
-            )));
-        }
+    spans.extend(modal_value_spans(&gs.window_input, || {
+        TuiSpan::raw(format!(
+            "{:.2}s            (press w to edit)",
+            gs.window_secs
+        ))
+    }));
+    if gs.window_input.is_some() {
+        spans.push(TuiSpan::raw(
+            "   (positive seconds; Enter commit, Esc cancel)",
+        ));
     }
     Line::from(spans)
 }
@@ -417,37 +366,16 @@ fn window_field_line(gs: &GraphState) -> Line<'static> {
 /// value is ≥ 60 s, seconds otherwise.
 fn lookback_field_line(gs: &GraphState) -> Line<'static> {
     let mut spans = vec![TuiSpan::raw("lookback: ")];
-    match &gs.lookback_input {
-        Some(buf) => {
-            let body = if buf.is_empty() {
-                " ".to_string()
-            } else {
-                buf.clone()
-            };
-            spans.push(TuiSpan::styled(
-                body,
-                Style::default()
-                    .bg(Color::White)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(TuiSpan::styled(
-                "_",
-                Style::default()
-                    .bg(Color::White)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
-            ));
-            spans.push(TuiSpan::raw(
-                "   (Ns / Nm; default seconds; Enter commit, Esc cancel)",
-            ));
-        }
-        None => {
-            spans.push(TuiSpan::raw(format!(
-                "{:<13}(press l to edit)",
-                format_lookback(gs.lookback_secs),
-            )));
-        }
+    spans.extend(modal_value_spans(&gs.lookback_input, || {
+        TuiSpan::raw(format!(
+            "{:<13}(press l to edit)",
+            format_lookback(gs.lookback_secs),
+        ))
+    }));
+    if gs.lookback_input.is_some() {
+        spans.push(TuiSpan::raw(
+            "   (Ns / Nm; default seconds; Enter commit, Esc cancel)",
+        ));
     }
     Line::from(spans)
 }
@@ -733,87 +661,27 @@ fn render_graph_details(
             }
         }
     } else {
-        // Compact: agg/metric/window status line + table header
-        // are sticky; data rows scroll.
+        // Compact: agg/metric/window/lookback status line + table
+        // header are sticky; data rows scroll.  Each modal field
+        // uses the shared `modal_value_spans` renderer so the
+        // input-box treatment stays consistent with the expanded
+        // detail-line equivalents above.
         let mut row: Vec<TuiSpan<'static>> = Vec::new();
         row.push(TuiSpan::raw("agg: "));
-        match &gs.agg_input {
-            Some(buf) => {
-                let buf_body = if buf.is_empty() {
-                    " ".into()
-                } else {
-                    buf.clone()
-                };
-                row.push(TuiSpan::styled(
-                    buf_body,
-                    Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                row.push(TuiSpan::styled(
-                    "_",
-                    Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
-                ));
-            }
-            None => row.push(TuiSpan::raw(agg_label(gs.aggregation))),
-        }
+        row.extend(modal_value_spans(&gs.agg_input, || {
+            TuiSpan::raw(agg_label(gs.aggregation).to_string())
+        }));
         row.push(TuiSpan::raw(format!(
             "   metric: {}   window: ",
             metric_label(gs.metric)
         )));
-        match &gs.window_input {
-            Some(buf) => {
-                let buf_body = if buf.is_empty() {
-                    " ".into()
-                } else {
-                    buf.clone()
-                };
-                row.push(TuiSpan::styled(
-                    buf_body,
-                    Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                row.push(TuiSpan::styled(
-                    "_",
-                    Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
-                ));
-            }
-            None => row.push(TuiSpan::raw(format!("{:.2}s", gs.window_secs))),
-        }
+        row.extend(modal_value_spans(&gs.window_input, || {
+            TuiSpan::raw(format!("{:.2}s", gs.window_secs))
+        }));
         row.push(TuiSpan::raw("   lookback: "));
-        match &gs.lookback_input {
-            Some(buf) => {
-                let buf_body = if buf.is_empty() {
-                    " ".into()
-                } else {
-                    buf.clone()
-                };
-                row.push(TuiSpan::styled(
-                    buf_body,
-                    Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                row.push(TuiSpan::styled(
-                    "_",
-                    Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
-                ));
-            }
-            None => row.push(TuiSpan::raw(format_lookback(gs.lookback_secs))),
-        }
+        row.extend(modal_value_spans(&gs.lookback_input, || {
+            TuiSpan::raw(format_lookback(gs.lookback_secs))
+        }));
         row.push(TuiSpan::raw(
             "   (a/w/l to edit, t to swap metric, Tab to split)",
         ));

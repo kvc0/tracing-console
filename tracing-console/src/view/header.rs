@@ -1,12 +1,63 @@
 //! Header-row helpers shared between the table and graph views:
-//! the level switcher, the chance-input switcher, and the two
-//! formatters they call.
+//! the level switcher, the chance-input switcher, the two
+//! formatters they call, plus the full one-line connection
+//! header and its right-aligned `g graph` / `g stack` hint.
 
+use ratatui::Frame;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span as TuiSpan};
+use ratatui::widgets::Paragraph;
 use tracing_console_host::WireLevelFilter;
 
-use crate::model::{Model, ViewMode};
+use crate::model::{ConnectionStatus, Model, ViewMode};
+
+/// Build the one-line top-of-screen header for either view.
+/// Connecting / Connected / Disconnected branches; the Connected
+/// branch composes [`level_switcher_spans`] + [`chance_switcher_spans`]
+/// with the buffered-span count and rolling rate appended.
+pub(super) fn connection_header_line(model: &Model) -> Line<'static> {
+    match &model.connection {
+        ConnectionStatus::Connecting => Line::from(vec![
+            TuiSpan::raw("[connecting] "),
+            TuiSpan::styled(
+                model.status.clone().unwrap_or_default(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
+        ConnectionStatus::Connected => {
+            let mut spans: Vec<TuiSpan<'static>> = vec![TuiSpan::raw("[connected]  ")];
+            level_switcher_spans(&mut spans, model);
+            spans.push(TuiSpan::raw("  "));
+            chance_switcher_spans(&mut spans, model);
+            spans.push(TuiSpan::raw(format!(
+                "   {n} spans / {rate}",
+                n = model.agg.len(),
+                rate = format_span_rate(model),
+            )));
+            Line::from(spans)
+        }
+        ConnectionStatus::Disconnected(reason) => {
+            Line::from(format!("[disconnected] {reason}"))
+        }
+    }
+}
+
+/// Render the header line into `area` with the `g graph` / `g stack`
+/// hint right-aligned in the rightmost [`GRAPH_HINT_WIDTH`] columns.
+/// Used by both the table and graph views — same layout, same
+/// content rules.
+pub(super) fn render_header_row(f: &mut Frame<'_>, area: Rect, model: &Model) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(GRAPH_HINT_WIDTH)])
+        .split(area);
+    f.render_widget(Paragraph::new(connection_header_line(model)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(graph_toggle_hint(model)).alignment(Alignment::Right),
+        chunks[1],
+    );
+}
 
 /// Right-aligned `g graph` / `g stack` hint shown in the top-right
 /// of the header.  The `g` is underlined as the shortcut key; the

@@ -10,12 +10,9 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use tracing_console_host::{WireLevel, WireSpan};
 
 use crate::aggregate::fmt_ns;
-use crate::model::{ConnectionStatus, Focus, Model};
+use crate::model::{Focus, Model};
 
-use super::header::{
-    GRAPH_HINT_WIDTH, chance_switcher_spans, format_span_rate, graph_toggle_hint,
-    level_switcher_spans,
-};
+use super::header::render_header_row;
 
 fn level_str(level: WireLevel) -> &'static str {
     match level {
@@ -138,51 +135,10 @@ pub(super) fn render_table(
         .constraints([Constraint::Length(1), stacks_constraint, details_constraint])
         .split(area);
 
-    // Top: connection status + cache-level switcher.
-    //
-    // When connected, the header reads:
-    //   [connected]  Off Info Debug Trace   N spans buffered
-    //
-    // * The label matching `model.cache_level` is bold + green
-    //   (the server-confirmed current level).  Until the server
-    //   pushes its first `CacheLevel`, no label is highlighted.
-    // * Each label's first letter is underlined as a hint for
-    //   the Shift+letter shortcut that requests that level.  The
-    //   green selection only moves when the server confirms.
-    let header: Line = match &model.connection {
-        ConnectionStatus::Connecting => Line::from(vec![
-            TuiSpan::raw("[connecting] "),
-            TuiSpan::styled(
-                model.status.clone().unwrap_or_default(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]),
-        ConnectionStatus::Connected => {
-            let mut spans: Vec<TuiSpan<'static>> =
-                vec![TuiSpan::raw("[connected]  ")];
-            level_switcher_spans(&mut spans, model);
-            spans.push(TuiSpan::raw("  "));
-            chance_switcher_spans(&mut spans, model);
-            spans.push(TuiSpan::raw(format!(
-                "   {n} spans / {rate}",
-                n = model.agg.len(),
-                rate = format_span_rate(model),
-            )));
-            Line::from(spans)
-        }
-        ConnectionStatus::Disconnected(reason) => {
-            Line::from(format!("[disconnected] {reason}"))
-        }
-    };
-    let header_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(GRAPH_HINT_WIDTH)])
-        .split(chunks[0]);
-    f.render_widget(Paragraph::new(header), header_chunks[0]);
-    f.render_widget(
-        Paragraph::new(graph_toggle_hint(model)).alignment(Alignment::Right),
-        header_chunks[1],
-    );
+    // Top: connection status + cache-level switcher + right-aligned
+    // `g graph` hint.  Same line both views render — see
+    // [`render_header_row`] for the full content rules.
+    render_header_row(f, chunks[0], model);
 
     // Middle: hierarchical aggregated tree as a Table so the
     // measurement columns sit at fixed positions regardless of

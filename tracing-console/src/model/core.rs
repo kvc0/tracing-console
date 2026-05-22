@@ -16,6 +16,47 @@ use super::graph::{
 };
 use super::update::{Effect, Update};
 
+// ── Modal-input slot helpers ────────────────────────────────────
+//
+// Every text-input modal — chance, graph agg, graph window, graph
+// lookback — owns an `Option<String>` buffer that follows the same
+// Begin/Backspace/Cancel/Commit lifecycle.  These helpers collapse
+// the boilerplate so each reducer arm carries only the parser/
+// validator that's actually unique to its modal.
+
+/// Open a modal: set the slot to `Some("")`.
+fn open_modal(slot: &mut Option<String>) {
+    *slot = Some(String::new());
+}
+
+/// Close a modal without consuming the buffer.  Used for both
+/// Cancel and any "give up" path.
+fn close_modal(slot: &mut Option<String>) {
+    *slot = None;
+}
+
+/// Pop one character off the modal buffer if it's open.
+fn backspace_modal(slot: &mut Option<String>) {
+    if let Some(buf) = slot.as_mut() {
+        buf.pop();
+    }
+}
+
+/// Append `c` to `buf` if it's a digit, or if it's `.` and `buf`
+/// doesn't already have one.  Returns whether the char was kept.
+/// Shared by the chance / window / lookback char filters.
+fn push_digit_or_decimal(buf: &mut String, c: char) -> bool {
+    if c.is_ascii_digit() {
+        buf.push(c);
+        true
+    } else if c == '.' && !buf.contains('.') {
+        buf.push(c);
+        true
+    } else {
+        false
+    }
+}
+
 /// Half-second-bucket rolling-rate counter.  The model holds 9
 /// buckets — the in-progress one plus 8 older half-seconds (4 s of
 /// completed history).  `rate_hz` reports the average over the 8
@@ -339,29 +380,21 @@ impl Model {
                 Effect::None
             }
             Update::BeginChanceInput => {
-                self.chance_input = Some(String::new());
+                open_modal(&mut self.chance_input);
                 Effect::None
             }
             Update::ChanceInputChar(c) => {
                 if let Some(buf) = self.chance_input.as_mut() {
-                    // Accept only digits and a single decimal point.
-                    // Anything else (whitespace, letters, etc.) is
-                    // silently dropped — input mode never holds
-                    // garbage that the user could commit.
-                    if c.is_ascii_digit() || (c == '.' && !buf.contains('.')) {
-                        buf.push(c);
-                    }
+                    push_digit_or_decimal(buf, c);
                 }
                 Effect::None
             }
             Update::ChanceInputBackspace => {
-                if let Some(buf) = self.chance_input.as_mut() {
-                    buf.pop();
-                }
+                backspace_modal(&mut self.chance_input);
                 Effect::None
             }
             Update::ChanceInputCancel => {
-                self.chance_input = None;
+                close_modal(&mut self.chance_input);
                 Effect::None
             }
             Update::ChanceInputCommit => {
@@ -412,7 +445,7 @@ impl Model {
             }
             Update::BeginGraphAggInput => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    gs.agg_input = Some(String::new());
+                    open_modal(&mut gs.agg_input);
                 }
                 Effect::None
             }
@@ -438,15 +471,13 @@ impl Model {
             }
             Update::GraphAggInputBackspace => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    if let Some(buf) = gs.agg_input.as_mut() {
-                        buf.pop();
-                    }
+                    backspace_modal(&mut gs.agg_input);
                 }
                 Effect::None
             }
             Update::GraphAggInputCancel => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    gs.agg_input = None;
+                    close_modal(&mut gs.agg_input);
                 }
                 Effect::None
             }
@@ -466,31 +497,27 @@ impl Model {
             }
             Update::BeginGraphWindowInput => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    gs.window_input = Some(String::new());
+                    open_modal(&mut gs.window_input);
                 }
                 Effect::None
             }
             Update::GraphWindowInputChar(c) => {
                 if let ViewMode::Graph(gs) = &mut self.view {
                     if let Some(buf) = gs.window_input.as_mut() {
-                        if c.is_ascii_digit() || (c == '.' && !buf.contains('.')) {
-                            buf.push(c);
-                        }
+                        push_digit_or_decimal(buf, c);
                     }
                 }
                 Effect::None
             }
             Update::GraphWindowInputBackspace => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    if let Some(buf) = gs.window_input.as_mut() {
-                        buf.pop();
-                    }
+                    backspace_modal(&mut gs.window_input);
                 }
                 Effect::None
             }
             Update::GraphWindowInputCancel => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    gs.window_input = None;
+                    close_modal(&mut gs.window_input);
                 }
                 Effect::None
             }
@@ -510,24 +537,24 @@ impl Model {
             }
             Update::BeginGraphLookbackInput => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    gs.lookback_input = Some(String::new());
+                    open_modal(&mut gs.lookback_input);
                 }
                 Effect::None
             }
             Update::GraphLookbackInputChar(c) => {
                 if let ViewMode::Graph(gs) = &mut self.view {
                     if let Some(buf) = gs.lookback_input.as_mut() {
-                        // Already terminated by a unit suffix → reject
-                        // further input so the user can't type "5sm".
+                        // Once a unit suffix has landed, reject further
+                        // input so the user can't type "5sm".  Otherwise
+                        // accept a digit / single `.` / single trailing
+                        // `s`/`m` (the suffix needs a leading number).
                         let has_suffix =
                             buf.ends_with('s') || buf.ends_with('m');
-                        if has_suffix {
-                            // no-op
-                        } else if c.is_ascii_digit() {
-                            buf.push(c);
-                        } else if c == '.' && !buf.contains('.') {
-                            buf.push(c);
-                        } else if (c == 's' || c == 'm') && !buf.is_empty() {
+                        if !has_suffix
+                            && !push_digit_or_decimal(buf, c)
+                            && (c == 's' || c == 'm')
+                            && !buf.is_empty()
+                        {
                             buf.push(c);
                         }
                     }
@@ -536,15 +563,13 @@ impl Model {
             }
             Update::GraphLookbackInputBackspace => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    if let Some(buf) = gs.lookback_input.as_mut() {
-                        buf.pop();
-                    }
+                    backspace_modal(&mut gs.lookback_input);
                 }
                 Effect::None
             }
             Update::GraphLookbackInputCancel => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    gs.lookback_input = None;
+                    close_modal(&mut gs.lookback_input);
                 }
                 Effect::None
             }
