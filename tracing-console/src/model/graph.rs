@@ -564,15 +564,27 @@ impl GraphState {
         keys
     }
 
-    /// Stable colour-slot index for `key` — its position in
-    /// alphabetical order.  Returns `0` if the key isn't currently
-    /// in the store (shouldn't happen for keys that were just
-    /// looked up out of [`Self::series_keys`]).
+    /// Stable colour-slot index for `key` — deterministic hash of
+    /// the series identity (locked stack + split values).  Identical
+    /// series names produce identical colours across runs, across
+    /// re-entries to graph mode, and across whatever order the user
+    /// happens to enable splits in — the alphabetical-rank scheme
+    /// this replaces lost stability the moment a new split key
+    /// shifted everyone else's rank by one.
     pub fn color_index_of(&self, key: &[(String, String)]) -> usize {
-        self.alpha_series_keys()
-            .iter()
-            .position(|k| k.as_slice() == key)
-            .unwrap_or(0)
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Anchor colour to the locked stack as well, so the same
+        // (no-splits) series colour persists when the user toggles
+        // a split on then off.
+        for name in &self.locked_stack {
+            name.hash(&mut hasher);
+        }
+        for (k, v) in key {
+            k.hash(&mut hasher);
+            v.hash(&mut hasher);
+        }
+        hasher.finish() as usize
     }
 
     /// Sorted list of series keys for display.  Primary order is

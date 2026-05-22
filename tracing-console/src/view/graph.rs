@@ -13,7 +13,7 @@ use crate::model::{
     TimeLabels,
 };
 
-use super::header::render_header_row;
+use super::header::{focused_border_style, render_header_row};
 
 
 /// Same palette as the rest of the TUI, rotated round-robin per
@@ -35,6 +35,36 @@ fn series_color(idx: usize, colorize: bool) -> Color {
     } else {
         SERIES_PALETTE[idx % SERIES_PALETTE.len()]
     }
+}
+
+/// Deterministic palette-slot assignment for the current series
+/// set.  Each series asks for its hash-preferred slot
+/// (`gs.color_index_of` mod palette length) and a linear probe
+/// resolves collisions — alphabetical order decides who wins.
+///
+/// **Invariant**: when the series count is ≤ palette length, no
+/// two series share a slot.  Returning a `HashMap` keyed by the
+/// series identity so both the chart loop and the legend table
+/// can look up the same slot for the same key.
+fn assign_series_colors(
+    gs: &GraphState,
+) -> std::collections::HashMap<Vec<(String, String)>, usize> {
+    let palette = SERIES_PALETTE.len();
+    let mut occupied = vec![false; palette];
+    let mut assignment = std::collections::HashMap::new();
+    for key in gs.alpha_series_keys() {
+        let preferred = gs.color_index_of(&key) % palette;
+        let mut slot = preferred;
+        for _ in 0..palette {
+            if !occupied[slot] {
+                break;
+            }
+            slot = (slot + 1) % palette;
+        }
+        occupied[slot] = true;
+        assignment.insert(key, slot);
+    }
+    assignment
 }
 
 fn agg_label(mode: AggMode) -> String {
@@ -95,7 +125,10 @@ fn format_axis_label(secs_ago: f64, mode: TimeLabels, now: DateTime<Utc>) -> Str
     match mode {
         TimeLabels::Delta => {
             if secs_ago < 1e-9 {
-                "now".to_string()
+                // Right-edge tick reads as a number (`0s`) rather
+                // than the special word `now` so the axis labels
+                // are uniformly numeric across the whole row.
+                "0s".to_string()
             } else {
                 format!("-{}", format_seconds(secs_ago))
             }
@@ -112,20 +145,52 @@ fn format_axis_label(secs_ago: f64, mode: TimeLabels, now: DateTime<Utc>) -> Str
     }
 }
 
-/// Right-side title for the graph details block: `u-delta` /
-/// `u-unix` / `u-local`, with the leading `u` underlined as the
-/// shortcut hint.
-fn time_labels_hint(mode: TimeLabels) -> Line<'static> {
-    let label = match mode {
+/// Right-aligned hint row shown on the **expanded** graph details
+/// border.  Each entry writes the full action name (`agg`,
+/// `window`, `lookback`, `metric`, `unix`) with the shortcut
+/// letter underlined, and follows with the current value.
+/// Separator is a dim `│`.
+///
+/// In the minimized (chart-focused) state the same fields already
+/// appear in the compact status row, so this hint row is omitted
+/// there — see [`render_graph_details`].
+fn graph_details_hints(gs: &GraphState) -> Line<'static> {
+    let sep = TuiSpan::styled(" │ ", Style::default().add_modifier(Modifier::DIM));
+    let mut spans: Vec<TuiSpan<'static>> = vec![TuiSpan::raw(" ")];
+
+    let fields: [Vec<TuiSpan<'static>>; 5] = [
+        labeled_modal_field("a", "gg", &gs.agg_input, agg_label(gs.aggregation)),
+        labeled_modal_field(
+            "w",
+            "indow",
+            &gs.window_input,
+            format!("{:.2}s", gs.window_secs),
+        ),
+        labeled_modal_field(
+            "l",
+            "ookback",
+            &gs.lookback_input,
+            format_lookback(gs.lookback_secs),
+        ),
+        labeled_toggle_field("m", "etric", metric_label(gs.metric).to_string()),
+        labeled_toggle_field("u", "nix", time_labels_label(gs.time_labels).to_string()),
+    ];
+    for (i, group) in fields.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(sep.clone());
+        }
+        spans.extend(group);
+    }
+    spans.push(TuiSpan::raw(" "));
+    Line::from(spans)
+}
+
+fn time_labels_label(mode: TimeLabels) -> &'static str {
+    match mode {
         TimeLabels::Delta => "delta",
         TimeLabels::Unix => "unix",
         TimeLabels::Local => "local",
-    };
-    Line::from(vec![
-        TuiSpan::raw(" "),
-        TuiSpan::styled("u", Style::default().add_modifier(Modifier::UNDERLINED)),
-        TuiSpan::raw(format!("-{label} ")),
-    ])
+    }
 }
 
 /// Pick a `(step, n)` such that `n * step == span_secs` exactly and
@@ -233,12 +298,11 @@ pub(super) fn render_graph(
     // at least one bin wide.
     let x_max_secs = gs.lookback_secs.max(gs.window_secs);
     let projections = gs.store.project(gs.aggregation, x_max_secs);
-    // Use `color_index_of` (= alphabetical rank) for colour
-    // assignment so the chart's colours stay stable regardless
-    // of how the user sorts the details table or whether they
-    // hide some series — toggling visibility doesn't reshuffle
-    // the rest, and the chart line for a given series always
-    // matches its detail-pane row colour.
+    // Collision-avoiding palette assignment: when ≤ palette
+    // length series exist, every one is guaranteed a unique
+    // colour.  Both the chart and the legend pull from the same
+    // map so a line's hue matches its checkbox row.
+    let color_slots = assign_series_colors(gs);
     let series: Vec<(SeriesProjection, String, Color)> = projections
         .into_iter()
         .filter_map(|p| {
@@ -246,7 +310,8 @@ pub(super) fn render_graph(
                 None
             } else {
                 let label = series_legend(&p.key);
-                let color = series_color(gs.color_index_of(&p.key), colorize);
+                let slot = color_slots.get(&p.key).copied().unwrap_or(0);
+                let color = series_color(slot, colorize);
                 Some((p, label, color))
             }
         })
@@ -267,13 +332,31 @@ pub(super) fn render_graph(
         .flat_map(|(p, ..)| p.points.iter().map(|(_, y)| *y))
         .fold(0.0_f64, f64::max);
 
-    let title = format!(
-        " {label} — {agg} {metric} / {win:.2}s window ",
-        label = gs.locked_stack.join(" › "),
-        agg = agg_label(gs.aggregation),
-        metric = metric_label(gs.metric),
-        win = gs.window_secs,
-    );
+    // Verbose title for screenshot-friendliness: stack path, the
+    // active aggregation, metric, window, lookback, split keys (if
+    // any), and the number of currently-visible series.
+    let visible_series = series.len();
+    let title = {
+        let mut parts: Vec<String> = vec![format!(
+            " {label} — {agg} {metric} · window {win:.2}s · lookback {lookback}",
+            label = gs.locked_stack.join(" › "),
+            agg = agg_label(gs.aggregation),
+            metric = metric_label(gs.metric),
+            win = gs.window_secs,
+            lookback = format_lookback(gs.lookback_secs),
+        )];
+        if !gs.split_keys.is_empty() {
+            let keys: Vec<&str> = gs.split_keys.iter().map(String::as_str).collect();
+            parts.push(format!(
+                "split by {} ({} series)",
+                keys.join(", "),
+                visible_series,
+            ));
+        } else {
+            parts.push(format!("{visible_series} series"));
+        }
+        format!("{} ", parts.join(" · "))
+    };
 
     let now = Utc::now();
     let x_axis = Axis::default()
@@ -285,13 +368,19 @@ pub(super) fn render_graph(
         .bounds([0.0, y_max.max(1.0)])
         .labels(ns_axis_labels(y_max.max(1.0)));
 
+    let chart_focused = gs.focus == GraphFocus::Chart;
     let chart = Chart::new(datasets)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(focused_border_style(chart_focused)),
+        )
         .x_axis(x_axis)
         .y_axis(y_axis);
     f.render_widget(chart, chunks[1]);
 
-    render_graph_details(f, chunks[2], model, gs, colorize);
+    render_graph_details(f, chunks[2], model, gs, colorize, &color_slots);
 }
 
 // Header rendering lives in `super::header` — both views share it.
@@ -322,63 +411,59 @@ where
     }
 }
 
+/// Render `<u>letter</u>rest value` with the shortcut letter
+/// underlined.  When the modal `buf` is open (`Some`), the *whole*
+/// label gets the same white-bg highlight as the input box, so
+/// the active region reads as one contiguous "you're typing here"
+/// block — the visual cue we promised when the letter was pressed.
+fn labeled_modal_field(
+    letter: &'static str,
+    rest: &'static str,
+    buf: &Option<String>,
+    idle_value: String,
+) -> Vec<TuiSpan<'static>> {
+    let active = buf.is_some();
+    let label_style = if active {
+        Style::default()
+            .bg(Color::White)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![
+        TuiSpan::styled(letter, label_style.add_modifier(Modifier::UNDERLINED)),
+        TuiSpan::styled(rest, label_style),
+        TuiSpan::raw(" "),
+    ];
+    spans.extend(modal_value_spans(buf, move || TuiSpan::raw(idle_value)));
+    spans
+}
+
+/// Render `<u>letter</u>rest value` for keys that *toggle* state
+/// rather than open a modal (metric, time-labels mode).  No
+/// active-input highlight because there's no input mode to enter.
+fn labeled_toggle_field(
+    letter: &'static str,
+    rest: &'static str,
+    value: String,
+) -> Vec<TuiSpan<'static>> {
+    vec![
+        TuiSpan::styled(letter, Style::default().add_modifier(Modifier::UNDERLINED)),
+        TuiSpan::raw(rest),
+        TuiSpan::raw(" "),
+        TuiSpan::raw(value),
+    ]
+}
+
 /// Render the "agg:   …" detail-pane row.  When the input modal
 /// is active the value cell is shown as a white-on-default
 /// highlighted input box with a trailing cursor; otherwise the
 /// current aggregation label plus a short hint.
-fn agg_field_line(gs: &GraphState) -> Line<'static> {
-    let mut spans = vec![TuiSpan::raw("agg:      ")];
-    spans.extend(modal_value_spans(&gs.agg_input, || {
-        TuiSpan::raw(format!(
-            "{}            (press a to edit)",
-            agg_label(gs.aggregation)
-        ))
-    }));
-    if gs.agg_input.is_some() {
-        spans.push(TuiSpan::raw(
-            "   (a/avg, min, max, pX[.XX]; Enter commit, Esc cancel)",
-        ));
-    }
-    Line::from(spans)
-}
-
-/// Render the "window: …" detail-pane row, with the same
-/// highlighted-input treatment when its modal is active.
-fn window_field_line(gs: &GraphState) -> Line<'static> {
-    let mut spans = vec![TuiSpan::raw("window:   ")];
-    spans.extend(modal_value_spans(&gs.window_input, || {
-        TuiSpan::raw(format!(
-            "{:.2}s            (press w to edit)",
-            gs.window_secs
-        ))
-    }));
-    if gs.window_input.is_some() {
-        spans.push(TuiSpan::raw(
-            "   (positive seconds; Enter commit, Esc cancel)",
-        ));
-    }
-    Line::from(spans)
-}
-
-/// Render the "lookback: …" detail-pane row.  Mirrors
-/// [`window_field_line`]; modal input box when editing, formatted
-/// value with edit hint otherwise.  Displays in minutes when the
-/// value is ≥ 60 s, seconds otherwise.
-fn lookback_field_line(gs: &GraphState) -> Line<'static> {
-    let mut spans = vec![TuiSpan::raw("lookback: ")];
-    spans.extend(modal_value_spans(&gs.lookback_input, || {
-        TuiSpan::raw(format!(
-            "{:<13}(press l to edit)",
-            format_lookback(gs.lookback_secs),
-        ))
-    }));
-    if gs.lookback_input.is_some() {
-        spans.push(TuiSpan::raw(
-            "   (Ns / Nm; default seconds; Enter commit, Esc cancel)",
-        ));
-    }
-    Line::from(spans)
-}
+/// Detail-pane label width — all rows pad to this column so
+/// values align vertically.  `lookback` is the widest word (8) +
+/// 2-space gap → 10.
+const LABEL_W: usize = 10;
 
 fn format_lookback(secs: f64) -> String {
     if secs >= 60.0 {
@@ -404,6 +489,7 @@ fn series_table_lines(
     gs: &GraphState,
     cursor_series_idx: Option<usize>,
     colorize: bool,
+    color_slots: &std::collections::HashMap<Vec<(String, String)>, usize>,
 ) -> (Option<Line<'static>>, Vec<Line<'static>>, Option<usize>) {
     use std::fmt::Write;
 
@@ -426,16 +512,11 @@ fn series_table_lines(
     let mut split_widths: Vec<usize> =
         split_cols.iter().map(|k| k.chars().count()).collect();
 
-    // Stable colour slot per series (alphabetical rank) so
-    // re-sorting the table doesn't reshuffle colours on the
-    // chart.
-    let alpha = gs.alpha_series_keys();
-    let color_idx_of = |key: &[(String, String)]| -> usize {
-        alpha
-            .iter()
-            .position(|k| k.as_slice() == key)
-            .unwrap_or(0)
-    };
+    // Colour slot per series comes from the chart's already-
+    // computed assignment map, so legend and chart line agree
+    // even with the collision-avoiding probe.
+    let color_idx_of =
+        |key: &[(String, String)]| -> usize { color_slots.get(key).copied().unwrap_or(0) };
 
     struct Row {
         color_idx: usize,
@@ -567,6 +648,7 @@ fn render_graph_details(
     model: &Model,
     gs: &GraphState,
     colorize: bool,
+    color_slots: &std::collections::HashMap<Vec<(String, String)>, usize>,
 ) {
     let focused = gs.focus == GraphFocus::Details;
     let title = format!(" graph details{} ", if focused { " ◆" } else { "" });
@@ -580,23 +662,22 @@ fn render_graph_details(
     let mut body_cursor: Option<usize> = None;
 
     if focused {
-        // Sticky: the legend's config rows + the series help
-        // line + the table header.
+        // Sticky: the locked stack + active splits (the only bits
+        // not already on the border hint row), then the series
+        // help line and table header.  awltu state lives on the
+        // border so we don't repeat it here.
         sticky.push(Line::from(format!(
-            "stack:    {}",
-            gs.locked_stack.join(" › ")
+            "{:<w$}{stack}",
+            "stack",
+            w = LABEL_W,
+            stack = gs.locked_stack.join(" › "),
         )));
-        sticky.push(agg_field_line(gs));
-        sticky.push(Line::from(format!(
-            "metric:   {}            (press t to swap)",
-            metric_label(gs.metric)
-        )));
-        sticky.push(window_field_line(gs));
-        sticky.push(lookback_field_line(gs));
         if !gs.split_keys.is_empty() {
             sticky.push(Line::from(format!(
-                "splits:   {}",
-                gs.split_keys.iter().cloned().collect::<Vec<_>>().join(", ")
+                "{:<w$}{}",
+                "splits",
+                gs.split_keys.iter().cloned().collect::<Vec<_>>().join(", "),
+                w = LABEL_W,
             )));
         }
         sticky.push(Line::from(""));
@@ -624,7 +705,7 @@ fn render_graph_details(
         // Table.  Header goes into sticky; data rows + the
         // metadata-keys section go into body.
         let (table_header, table_rows, table_cursor) =
-            series_table_lines(gs, series_cursor, colorize);
+            series_table_lines(gs, series_cursor, colorize, color_slots);
         if let Some(h) = table_header {
             sticky.push(h);
         }
@@ -661,32 +742,8 @@ fn render_graph_details(
             }
         }
     } else {
-        // Compact: agg/metric/window/lookback status line + table
-        // header are sticky; data rows scroll.  Each modal field
-        // uses the shared `modal_value_spans` renderer so the
-        // input-box treatment stays consistent with the expanded
-        // detail-line equivalents above.
-        let mut row: Vec<TuiSpan<'static>> = Vec::new();
-        row.push(TuiSpan::raw("agg: "));
-        row.extend(modal_value_spans(&gs.agg_input, || {
-            TuiSpan::raw(agg_label(gs.aggregation).to_string())
-        }));
-        row.push(TuiSpan::raw(format!(
-            "   metric: {}   window: ",
-            metric_label(gs.metric)
-        )));
-        row.extend(modal_value_spans(&gs.window_input, || {
-            TuiSpan::raw(format!("{:.2}s", gs.window_secs))
-        }));
-        row.push(TuiSpan::raw("   lookback: "));
-        row.extend(modal_value_spans(&gs.lookback_input, || {
-            TuiSpan::raw(format_lookback(gs.lookback_secs))
-        }));
-        row.push(TuiSpan::raw(
-            "   (a/w/l to edit, t to swap metric, Tab to split)",
-        ));
-        sticky.push(Line::from(row));
-
+        // Compact: the awltu state lives on the border hint row;
+        // no need to repeat it inline.  Series body fills the pane.
         let series_count = gs.series_keys().len();
         let cursor_idx = if series_count == 0 {
             None
@@ -694,7 +751,7 @@ fn render_graph_details(
             Some(gs.details_selected.min(series_count - 1))
         };
         let (table_header, table_rows, table_cursor) =
-            series_table_lines(gs, cursor_idx, colorize);
+            series_table_lines(gs, cursor_idx, colorize, color_slots);
         if let Some(h) = table_header {
             sticky.push(h);
         }
@@ -706,12 +763,21 @@ fn render_graph_details(
     }
 
     // Draw the outer block first; subsequent paragraphs draw
-    // inside its inner rect.  Right-side title shows the X-axis
-    // label mode (`u-delta` / `u-unix` / `u-local`) — `u` cycles.
-    let block = Block::default()
+    // inside its inner rect.  Right-side title carries the
+    // keyboard shortcuts + their current values, separated by
+    // dim `│` glyphs — visible in both minimized and expanded
+    // states so the user can always read the active config off
+    // the pane chrome.  Bottom-of-block title surfaces the
+    // modal-help bar when an input is open, on the border itself
+    // so the surrounding panes don't re-layout.
+    let mut block = Block::default()
         .title(title)
-        .title(time_labels_hint(gs.time_labels).alignment(Alignment::Right))
-        .borders(Borders::ALL);
+        .title(graph_details_hints(gs).alignment(Alignment::Right))
+        .borders(Borders::ALL)
+        .border_style(focused_border_style(focused));
+    if let Some(help) = crate::view::header::modal_status_bar(model) {
+        block = block.title_bottom(help.right_aligned());
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -747,7 +813,8 @@ fn render_graph_details(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_axis_label, time_labels_hint, wall_clock_label_step};
+    use super::{format_axis_label, graph_details_hints, wall_clock_label_step};
+    use crate::model::GraphState;
     use crate::model::TimeLabels;
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -813,7 +880,7 @@ mod tests {
     #[test]
     fn format_axis_label_delta_mode_matches_legacy_format() {
         let now = fixed_now();
-        assert_eq!(format_axis_label(0.0, TimeLabels::Delta, now), "now");
+        assert_eq!(format_axis_label(0.0, TimeLabels::Delta, now), "0s");
         assert_eq!(format_axis_label(30.0, TimeLabels::Delta, now), "-30s");
         assert_eq!(format_axis_label(60.0, TimeLabels::Delta, now), "-1m");
     }
@@ -855,17 +922,120 @@ mod tests {
         let _ = chars.next();
     }
 
+    fn plain_line(line: ratatui::text::Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     #[test]
-    fn time_labels_hint_carries_the_active_mode_word() {
-        let plain = |line: ratatui::text::Line<'_>| -> String {
-            line.spans.iter().map(|s| s.content.as_ref()).collect()
-        };
-        assert!(plain(time_labels_hint(TimeLabels::Delta)).contains("delta"));
-        assert!(plain(time_labels_hint(TimeLabels::Unix)).contains("unix"));
-        assert!(plain(time_labels_hint(TimeLabels::Local)).contains("local"));
-        // All three variants prefix the letter `u-` as the shortcut.
+    fn graph_details_hints_carry_the_active_time_mode() {
+        let mut gs = GraphState::new(vec!["root".into()]);
         for mode in [TimeLabels::Delta, TimeLabels::Unix, TimeLabels::Local] {
-            assert!(plain(time_labels_hint(mode)).contains("u-"));
+            gs.time_labels = mode;
+            let rendered = plain_line(graph_details_hints(&gs));
+            // The `unix` label always appears as the toggle word.
+            assert!(rendered.contains("unix"), "missing unix label: {rendered}");
+            let expected_value = match mode {
+                TimeLabels::Delta => "delta",
+                TimeLabels::Unix => "unix",
+                TimeLabels::Local => "local",
+            };
+            // The current mode value sits next to the unix label.
+            assert!(
+                rendered.contains(&format!("unix {expected_value}")),
+                "expected `unix {expected_value}` in: {rendered}",
+            );
+        }
+    }
+
+    #[test]
+    fn graph_details_hints_include_all_shortcut_words() {
+        let gs = GraphState::new(vec!["root".into()]);
+        let rendered = plain_line(graph_details_hints(&gs));
+        // Every keybinding's full word appears.  The shortcut
+        // letter is the first character of each (underlined in
+        // the rendered output — invisible to plain_line, but the
+        // word presence is what users see).
+        for word in ["agg", "window", "lookback", "metric", "unix"] {
+            assert!(
+                rendered.contains(word),
+                "missing word {word:?} in: {rendered}",
+            );
+        }
+    }
+
+    #[test]
+    fn graph_details_hints_use_m_for_metric_not_t() {
+        // Regression: after the t→m rebinding, the hints must not
+        // surface a `t metric` or any other `t-` style.
+        let gs = GraphState::new(vec!["root".into()]);
+        let rendered = plain_line(graph_details_hints(&gs));
+        assert!(rendered.contains("metric"));
+        assert!(
+            !rendered.contains("t metric"),
+            "stale `t metric` in: {rendered}",
+        );
+    }
+
+    #[test]
+    fn assign_series_colors_gives_distinct_slots_when_below_palette_size() {
+        // Regression: hashing alone collided even with 3 series.
+        // The probing assignment must spread up-to-palette-length
+        // series across distinct slots.
+        use crate::model::{Model, Update, ViewMode};
+        use tracing_console_host::{WireFieldValue, WireLevel, WireSpan};
+
+        fn span_with_api(id: u64, api: &str) -> WireSpan {
+            WireSpan {
+                id,
+                parent_id: None,
+                name: "req".into(),
+                target: "test".into(),
+                level: WireLevel::Info,
+                fields: vec![("api".into(), WireFieldValue::Str(api.into()))],
+                events: vec![],
+                opened_at_ns: 0,
+                closed_at_ns: Some(100),
+            }
+        }
+
+        let mut m = Model::new(16);
+        m.apply(Update::SpanReceived(span_with_api(10, "fetch")));
+        m.apply(Update::ToggleGraph);
+        // Enable the api split so each value becomes its own series.
+        m.apply(Update::GraphSwitchFocus);
+        // Advance the cursor to the first split-key row and toggle.
+        // `series_keys().len()` is the cursor offset for the first
+        // candidate row in the combined Details cursor.
+        let series_offset = match &m.view {
+            ViewMode::Graph(gs) => gs.series_keys().len(),
+            _ => panic!("expected graph mode"),
+        };
+        for _ in 0..series_offset {
+            m.apply(Update::GraphSelectDown);
+        }
+        m.apply(Update::GraphToggleSplit);
+        // Three distinct series.
+        for (i, api) in ["fetch", "post", "delete"].iter().enumerate() {
+            m.apply(Update::SpanReceived(span_with_api(
+                20 + i as u64,
+                api,
+            )));
+        }
+        let gs = match &m.view {
+            ViewMode::Graph(gs) => gs,
+            _ => panic!("expected graph mode"),
+        };
+        assert_eq!(gs.series_keys().len(), 3);
+        let slots = super::assign_series_colors(gs);
+        let values: std::collections::HashSet<usize> = slots.values().copied().collect();
+        assert_eq!(
+            values.len(),
+            3,
+            "expected 3 distinct slots for 3 series, got {slots:?}",
+        );
+        // All slots must be valid palette indices.
+        for s in &values {
+            assert!(*s < super::SERIES_PALETTE.len());
         }
     }
 }

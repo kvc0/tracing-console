@@ -5,42 +5,132 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as TuiSpan};
 use ratatui::widgets::Paragraph;
 use tracing_console_host::WireLevelFilter;
 
 use crate::model::{ConnectionStatus, Model, ViewMode};
 
+/// Faint vertical separator between logical groups in the header
+/// row.  Same DIM `│` glyph used by the stacks-table column
+/// separators, so the eye doesn't have to learn two patterns.
+fn header_separator() -> TuiSpan<'static> {
+    TuiSpan::styled(" │ ", Style::default().add_modifier(Modifier::DIM))
+}
+
+/// Coloured status dot for the connection state.  Green when
+/// connected, red when disconnected, dim grey while connecting.
+fn connection_status_dot(model: &Model) -> TuiSpan<'static> {
+    let (glyph, style) = match &model.connection {
+        ConnectionStatus::Connected => (
+            "●",
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        ConnectionStatus::Disconnected(_) => (
+            "●",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        ConnectionStatus::Connecting => {
+            ("●", Style::default().add_modifier(Modifier::DIM))
+        }
+    };
+    TuiSpan::styled(glyph, style)
+}
+
 /// Build the one-line top-of-screen header for either view.
 /// Connecting / Connected / Disconnected branches; the Connected
 /// branch composes [`level_switcher_spans`] + [`chance_switcher_spans`]
 /// with the buffered-span count and rolling rate appended.
 pub(super) fn connection_header_line(model: &Model) -> Line<'static> {
+    let mut spans: Vec<TuiSpan<'static>> = vec![connection_status_dot(model), TuiSpan::raw(" ")];
     match &model.connection {
-        ConnectionStatus::Connecting => Line::from(vec![
-            TuiSpan::raw("[connecting] "),
-            TuiSpan::styled(
+        ConnectionStatus::Connecting => {
+            spans.push(TuiSpan::raw("connecting "));
+            spans.push(TuiSpan::styled(
                 model.status.clone().unwrap_or_default(),
                 Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]),
+            ));
+        }
         ConnectionStatus::Connected => {
-            let mut spans: Vec<TuiSpan<'static>> = vec![TuiSpan::raw("[connected]  ")];
             level_switcher_spans(&mut spans, model);
-            spans.push(TuiSpan::raw("  "));
+            spans.push(header_separator());
             chance_switcher_spans(&mut spans, model);
+            spans.push(header_separator());
             spans.push(TuiSpan::raw(format!(
-                "   {n} spans / {rate}",
+                "{n} spans / {rate}",
                 n = model.agg.len(),
                 rate = format_span_rate(model),
             )));
-            Line::from(spans)
         }
         ConnectionStatus::Disconnected(reason) => {
-            Line::from(format!("[disconnected] {reason}"))
+            // Highlight just the word so a glance across the screen
+            // immediately reads as broken.
+            spans.push(TuiSpan::styled(
+                "disconnected",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if !reason.is_empty() {
+                spans.push(TuiSpan::raw(format!(" {reason}")));
+            }
         }
     }
+    Line::from(spans)
+}
+
+/// Border style used by panes that can take keyboard focus.
+/// Bright + bold when focused, dim when not — the unmissable
+/// signal that the next keystroke targets this pane.
+pub(super) fn focused_border_style(is_focused: bool) -> Style {
+    if is_focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+}
+
+/// One-character underlined shortcut hint (used by the right-side
+/// border hints).  `"a"` → `a` (underlined).
+pub(super) fn shortcut(c: &'static str) -> TuiSpan<'static> {
+    TuiSpan::styled(c, Style::default().add_modifier(Modifier::UNDERLINED))
+}
+
+/// Build the bottom-of-screen modal-help bar.  Returns `None` when
+/// no modal is open; otherwise a one-line reminder of what's
+/// accepted plus Enter/Esc.
+pub(super) fn modal_status_bar(model: &Model) -> Option<Line<'static>> {
+    let mut spans: Vec<TuiSpan<'static>> = Vec::new();
+    let accept: &str = if model.chance_input.is_some() {
+        "digits and ."
+    } else if let ViewMode::Graph(gs) = &model.view {
+        if gs.agg_input.is_some() {
+            "a, avg, min, max, p0–p100"
+        } else if gs.window_input.is_some() {
+            "positive seconds"
+        } else if gs.lookback_input.is_some() {
+            "Ns or Nm"
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    spans.push(TuiSpan::styled(
+        "  input: ",
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    spans.push(TuiSpan::raw(accept));
+    spans.push(header_separator());
+    spans.push(shortcut("Enter"));
+    spans.push(TuiSpan::raw(" commit"));
+    spans.push(header_separator());
+    spans.push(shortcut("Esc"));
+    spans.push(TuiSpan::raw(" cancel"));
+    Some(Line::from(spans))
 }
 
 /// Render the header line into `area` with the `g graph` / `g stack`

@@ -16,6 +16,10 @@ use crate::model::{Model, ViewMode};
 
 pub fn render(f: &mut ratatui::Frame<'_>, model: &Model, colorize: bool) {
     let area = f.area();
+    // Modal-help text lives on the bottom border of the active
+    // pane (see `modal_status_bar` callers in `table.rs` and
+    // `graph.rs`) — never as a bottom-of-screen strip, because
+    // that would re-layout the panes the moment an input opens.
     match &model.view {
         ViewMode::Table => table::render_table(f, area, model, colorize),
         ViewMode::Graph(gs) => graph::render_graph(f, area, model, gs, colorize),

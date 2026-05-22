@@ -477,7 +477,7 @@ fn keyboard_loop(
                 // `a` opens the aggregation-input modal; the buffer
                 // accepts `a`/`avg`, `min`, `max`, or `pX[.XX]`.
                 KeyCode::Char('a') => Update::BeginGraphAggInput,
-                KeyCode::Char('t') => Update::ToggleGraphMetric,
+                KeyCode::Char('m') => Update::ToggleGraphMetric,
                 KeyCode::Char('w') => Update::BeginGraphWindowInput,
                 // `l` opens the lookback-input modal — sets how far
                 // back the chart's X axis extends.  Reserved for the

@@ -12,7 +12,7 @@ use tracing_console_host::{WireLevel, WireSpan};
 use crate::aggregate::fmt_ns;
 use crate::model::{Focus, Model};
 
-use super::header::render_header_row;
+use super::header::{focused_border_style, render_header_row};
 
 fn level_str(level: WireLevel) -> &'static str {
     match level {
@@ -168,6 +168,14 @@ pub(super) fn render_table(
         if !colorize {
             return None;
         }
+        // Drop the heat colour on the cursor row.  Otherwise the
+        // row_highlight_style REVERSED modifier reverses a saturated
+        // heat hue into a near-identical hue — and the cursor row
+        // (the most important visual signal) becomes the *least*
+        // legible cell in the table.
+        if selected == Some(row_idx) {
+            return None;
+        }
         color_map.get(row_idx).and_then(|cs| cs[col])
     };
     // Soft visual hint between column groups — a dim "│" lives in
@@ -272,7 +280,12 @@ pub(super) fn render_table(
     )
     .header(header)
     .column_spacing(1)
-    .block(Block::default().title(title).borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(focused_border_style(stacks_focused)),
+    )
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = TableState::default();
     state.select(selected);
@@ -421,11 +434,18 @@ pub(super) fn render_table(
             }
         }
     } else {
-        detail_lines.push(Line::from(
-            "(no spans yet — q quit, j/k move, →/l expand, Enter expand all, ←/h collapse, Tab focus details)",
-        ));
+        detail_lines.push(Line::from("(no spans yet)"));
     };
-    let detail = Paragraph::new(detail_lines)
-        .block(Block::default().title(details_title).borders(Borders::ALL));
+    // Modal help (e.g. chance input) goes on the *bottom border*
+    // of this pane — keeps the layout stable when the user opens
+    // the input, instead of carving a strip below the pane.
+    let mut details_block = Block::default()
+        .title(details_title)
+        .borders(Borders::ALL)
+        .border_style(focused_border_style(details_focused));
+    if let Some(help) = super::header::modal_status_bar(model) {
+        details_block = details_block.title_bottom(help.right_aligned());
+    }
+    let detail = Paragraph::new(detail_lines).block(details_block);
     f.render_widget(detail, chunks[2]);
 }
