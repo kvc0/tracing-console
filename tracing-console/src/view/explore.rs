@@ -13,7 +13,8 @@ use crate::aggregate::fmt_ns;
 use crate::model::{
     ExploreSortColumn, ExploreState, Model, TraceDetailState, TraceRow,
     explore::{
-        distinguishing_fields, field_string, latency_ns, matching_spans, visible_trace_rows,
+        distinguishing_fields, field_string, latency_ns, locked_stack_spans, matching_spans,
+        visible_trace_rows,
     },
 };
 
@@ -92,7 +93,12 @@ pub fn render_explore(
 
     // Body: span instance table.
     let spans = matching_spans(model, es);
-    let fields = distinguishing_fields(&spans);
+    // Compute the distinguishing-field columns from the *pre*-
+    // search span set so the column list doesn't flicker as the
+    // user types `/` — a search that narrows to a single row
+    // would otherwise leave each field with only one distinct
+    // value and collapse all distinguishing columns.
+    let fields = distinguishing_fields(&locked_stack_spans(model, es));
     // Display up to 3 distinguishing-field columns to leave room
     // for time + latency on narrow terminals.
     let max_field_cols = ((chunks[2].width as usize).saturating_sub(28) / 12).min(3);

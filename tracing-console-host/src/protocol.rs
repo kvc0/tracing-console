@@ -269,8 +269,8 @@ pub enum ResponseBody {
     CacheLevel(WireLevelFilter),
     /// Server-pushed notification of the current effective chance
     /// percentage `[0.0, 100.0]` for the cache's `ChancePredicate`.
-    /// Same lifecycle as [`CacheLevel`]: sent on `StartStream` and on
-    /// every change.
+    /// Same lifecycle as [`ResponseBody::CacheLevel`]: sent on
+    /// `StartStream` and on every change.
     CacheChance(f64),
     /// Acknowledgement of a unary command (Set*, StopStream).
     Ack,

@@ -66,7 +66,7 @@ pub enum Update {
     /// `a`: open the aggregation-expression modal.  The buffer
     /// accepts a freeform expression — `a`/`avg`, `min`, `max`,
     /// or `pX[.XX]` — that's parsed at commit time via
-    /// [`parse_agg_input`].
+    /// [`super::graph::parse_agg_input`].
     BeginGraphAggInput,
     GraphAggInputChar(char),
     GraphAggInputBackspace,

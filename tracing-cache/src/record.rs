@@ -123,9 +123,10 @@ pub fn field_get<'a>(fields: &'a FieldList, name: &str) -> Option<&'a FieldValue
 }
 
 /// One captured event.  `metadata` and `recorded_at` are `Option` purely
-/// so `EventRecord` can implement `Default` for the [`crate::ObjectPool`]
-/// — they are always `Some` once an event has been published through the
-/// subscriber.  Helper accessors `metadata()` / `recorded_at()` unwrap.
+/// so `EventRecord` can implement `Default` for the internal object
+/// pool — they are always `Some` once an event has been published
+/// through the subscriber.  Helper accessors `metadata()` /
+/// `recorded_at()` fall back to safe defaults rather than panic.
 #[derive(Clone, Debug, Default)]
 pub struct EventRecord {
     pub metadata: Option<&'static Metadata<'static>>,

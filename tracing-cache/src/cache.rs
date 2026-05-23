@@ -239,8 +239,8 @@ impl<P: EnabledPredicate> SpanCache<P> {
     }
 
     /// Returns a closed span by its actual_id (`SpanRecord.id`).  This is
-    /// the id stored in `parent_id` and used as the BTreeMap key.  For
-    /// in-flight spans, use [`get_active_span`].
+    /// the id stored in `parent_id` and used as the BTreeMap key.
+    /// Only closed spans are reachable here.
     pub fn get_span(&self, actual_id: u64) -> Option<SpanRecord> {
         #[allow(clippy::expect_used, reason = "poisoned lock")]
         let map = self.map.read().expect("lock must not be poisoned");
@@ -269,7 +269,7 @@ impl<P: EnabledPredicate> SpanCache<P> {
     }
 
     /// Returns closed spans in ascending actual_id order.  Open spans are
-    /// not included; call [`flush_pending`] + [`Driver::drain_sync`]
+    /// not included; call [`Self::flush_pending`] + [`Driver::drain_sync`]
     /// first if you need just-closed spans to appear.
     pub fn page(&self, after_id: u64, limit: usize) -> Vec<SpanRecord> {
         #[allow(clippy::expect_used, reason = "poisoned lock")]

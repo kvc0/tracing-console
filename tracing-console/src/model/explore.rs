@@ -235,17 +235,28 @@ fn walk_trace<'a>(
 // ── Pure data helpers (called from both the reducer and the
 //   view layer) ─────────────────────────────────────────────────
 
-/// All spans in the aggregator whose resolved stack matches
-/// `es.locked_stack`, filtered by `es.effective_query`, sorted by
-/// `(es.sort, es.direction)`.  Returns borrows from the
-/// aggregator's ring.
-pub fn matching_spans<'a>(model: &'a Model, es: &ExploreState) -> Vec<&'a WireSpan> {
-    let q = es.effective_query().to_ascii_lowercase();
-    let mut out: Vec<&WireSpan> = model
+/// Every span in the aggregator whose resolved stack matches
+/// `es.locked_stack`, *before* applying the `/`-search filter.
+/// The renderer uses this for distinguishing-field column
+/// discovery, which has to stay stable as the search narrows the
+/// row list (otherwise a single-result search collapses columns
+/// because each field now has only one distinct value).
+pub fn locked_stack_spans<'a>(model: &'a Model, es: &ExploreState) -> Vec<&'a WireSpan> {
+    model
         .agg
         .iter_with_stack()
         .filter(|(_, stack)| stack.as_slice() == es.locked_stack.as_slice())
         .map(|(s, _)| s)
+        .collect()
+}
+
+/// `locked_stack_spans` then narrowed by `es.effective_query` and
+/// sorted by `(es.sort, es.direction)` — the rows the table
+/// actually renders.
+pub fn matching_spans<'a>(model: &'a Model, es: &ExploreState) -> Vec<&'a WireSpan> {
+    let q = es.effective_query().to_ascii_lowercase();
+    let mut out: Vec<&WireSpan> = locked_stack_spans(model, es)
+        .into_iter()
         .filter(|s| q.is_empty() || span_matches_query(s, &q))
         .collect();
     sort_spans(&mut out, &es.sort, es.direction);

@@ -171,7 +171,8 @@ fn u8_to_filter(n: u8) -> LevelFilter {
 /// roll without needing a wake — the inner subscriber's existing
 /// `rebuild_interest_cache` invalidation isn't required either,
 /// since the dice are rerolled per span instance via
-/// [`new_span_enabled`], not at callsite-registration time.
+/// [`EnabledPredicate::new_span_enabled`], not at
+/// callsite-registration time.
 pub struct ChancePredicate<P: EnabledPredicate> {
     /// Bit-packed `f64` percentage in `[0.0, 100.0]`.
     chance_pct_bits: Arc<AtomicU64>,
