@@ -292,7 +292,7 @@ fn span_matches_query(s: &WireSpan, q: &str) -> bool {
 fn sort_spans(spans: &mut [&WireSpan], by: &ExploreSortColumn, direction: SortDirection) {
     match by {
         ExploreSortColumn::Timestamp => {
-            spans.sort_by(|a, b| a.opened_at_ns.cmp(&b.opened_at_ns));
+            spans.sort_by_key(|a| a.opened_at_ns);
         }
         ExploreSortColumn::Latency => {
             spans.sort_by_key(|a| latency_ns(a));

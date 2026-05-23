@@ -825,8 +825,16 @@ impl Model {
                 Effect::None
             }
             Update::ExploreSelectDown => {
-                if let ViewMode::Explore(es) = &mut self.view {
-                    es.selected = es.selected.saturating_add(1);
+                let row_count = if let ViewMode::Explore(es) = &self.view {
+                    super::explore::matching_spans(self, es).len()
+                } else {
+                    return Effect::None;
+                };
+                if let ViewMode::Explore(es) = &mut self.view
+                    && row_count > 0
+                    && es.selected + 1 < row_count
+                {
+                    es.selected += 1;
                 }
                 Effect::None
             }
@@ -928,10 +936,22 @@ impl Model {
                 Effect::None
             }
             Update::TraceDetailSelectDown => {
-                if let ViewMode::TraceDetail(td) = &mut self.view {
-                    // Cap is enforced at render time against the
-                    // visible-row count.  Saturate here.
-                    td.selected_idx = td.selected_idx.saturating_add(1);
+                // Cap against the current visible-row count.  Without
+                // this, holding ↓ past the bottom grows `selected_idx`
+                // unboundedly — and then ↑ has to undo every overshoot
+                // step before the cursor visibly moves, because the
+                // render-time `.min(rows.len() - 1)` keeps it pinned
+                // to the bottom row.
+                let row_count = if let ViewMode::TraceDetail(td) = &self.view {
+                    super::explore::visible_trace_rows(self, td).len()
+                } else {
+                    return Effect::None;
+                };
+                if let ViewMode::TraceDetail(td) = &mut self.view
+                    && row_count > 0
+                    && td.selected_idx + 1 < row_count
+                {
+                    td.selected_idx += 1;
                 }
                 Effect::None
             }

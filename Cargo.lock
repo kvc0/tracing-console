@@ -2323,6 +2323,7 @@ dependencies = [
  "protosocket-messagepack",
  "protosocket-rpc",
  "serde",
+ "spillway",
  "tokio",
  "tracing",
  "tracing-cache",

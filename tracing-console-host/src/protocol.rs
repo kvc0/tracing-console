@@ -204,10 +204,6 @@ pub enum RequestBody {
     /// Sample the stream — `1.0` = every span, `0.5` = ~half.  Applied per
     /// root-span family so a sampled root drops its whole subtree.
     SetSamplingRate(f64),
-    /// Substring filter applied to root span name + fields.  Applies
-    /// transitively: if the root matches, descendants stream too; if not,
-    /// none of the family is streamed.
-    SetFilter(Option<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,11 +5,16 @@
 //! span closes, its `SpanRecord` is moved to the per-thread `PENDING`
 //! buffer (`tls::pending_push`) and eventually flushed to the spillway
 //! channel that `Driver` consumes.
+//!
+//! Closed spans are streamed to consumers via [`SpanCache::subscribe`]
+//! — the driver fans each freshly-committed `SpanRecord` out to every
+//! live subscriber and then drops it.  The cache holds no historical
+//! state, so consumers that need history must subscribe before the
+//! spans of interest are emitted.  Subscribers that have dropped their
+//! receiver are pruned lazily on the next send.
 
-use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, Ordering, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use slab::Slab;
@@ -39,7 +44,7 @@ pub(crate) struct ShardLane {
     pub(crate) actual_ids: Box<[AtomicU64]>,
 }
 
-/// A `tracing::Subscriber` that holds spans in memory for inspection.
+/// A `tracing::Subscriber` that funnels closed spans to live consumers.
 ///
 /// Open spans live in a sharded `Box<[Mutex<Slab<SpanRecord>>]>`, with
 /// the lane count set by [`CacheConfig::lane_count`] (default
@@ -50,25 +55,29 @@ pub(crate) struct ShardLane {
 /// lookup.  When a span closes it moves to a per-thread buffer and is
 /// flushed to the [`Driver`] via a spillway channel.
 ///
-/// `SpanRecord.id` is an `actual_id` (separate from the tracing id) that
-/// serves as the `BTreeMap` key, since slab indices are reused.  IDs are
+/// The cache itself holds no closed spans — the driver fans each one
+/// out to [`SpanCache::subscribe`] receivers and then drops it.  Late
+/// events (an event whose parent span has already been fanned out)
+/// have nowhere to land and are dropped.
+///
+/// `SpanRecord.id` is an `actual_id` (separate from the tracing id),
 /// monotonic within a thread's `ID_BATCH`-sized reservation; across
-/// threads they interleave, so map order reflects allocation order
-/// per-thread but not strict global creation order.
+/// threads they interleave, so subscriber-observed order is
+/// driver-commit (close-time) order, not strict global open order.
 ///
 /// Create with [`SpanCache::new`] / [`SpanCache::with_predicate`]
 /// (defaults) or [`SpanCache::with_config`] /
 /// [`SpanCache::with_predicate_and_config`] (custom batch sizes & lane
 /// count).  Each returns `(SpanCache, Driver)`; spawn the [`Driver`] as
-/// a background task to commit closed spans.
+/// a background task to fan closed spans out to subscribers.
 pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
     pub(crate) in_flight: Box<[ShardLane]>,
-    pub(crate) map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
-    /// High-water mark for the `actual_id` space (the `SpanRecord.id` /
-    /// `BTreeMap` key, disjoint from the encoded tracing id space).
-    /// Threads claim `ID_BATCH`-sized slices via `fetch_add` and hand IDs
-    /// out from a thread-local reservation, so this counter is touched
-    /// roughly once per `ID_BATCH` spans rather than once per span.
+    /// High-water mark for the `actual_id` space — the `SpanRecord.id`
+    /// stored on every record and referenced via `parent_id`, disjoint
+    /// from the encoded tracing id space.  Threads claim `ID_BATCH`-
+    /// sized slices via `fetch_add` and hand IDs out from a thread-
+    /// local reservation, so this counter is touched roughly once per
+    /// `ID_BATCH` spans rather than once per span.
     pub(crate) id_high_water: AtomicU64,
     pub(crate) predicate: P,
     /// Per-shard capacity.  Total open-span budget is
@@ -82,10 +91,17 @@ pub struct SpanCache<P: EnabledPredicate = LevelPredicate> {
     /// Shared pool of pre-allocated `EventRecord`s.  `event()` acquires
     /// from the per-thread shard, fills the record, and pushes the
     /// `ReuseRef` onto the parent span's events vec.  When the
-    /// `SpanRecord` finally drops (BTreeMap eviction), each `ReuseRef`
+    /// `SpanRecord` finally drops (after fan-out), each `ReuseRef`
     /// returns its allocation to the pool — amortising away the
-    /// per-event `Box::new` cost the previous `Vec<EventRecord>` paid.
+    /// per-event `Box::new` cost.
     pub(crate) event_pool: Arc<ObjectPool<EventRecord>>,
+    /// Live consumers of closed spans.  [`SpanCache::subscribe`] pushes a
+    /// fresh `Sender` here and hands the matching `Receiver` to the
+    /// caller; the [`Driver`] holds an `Arc` clone of this `Mutex` and
+    /// fans out each committed `SpanRecord` to every entry.  Senders
+    /// that return `Error::Closed` (receiver dropped) are removed by
+    /// the driver on the next fan-out.
+    pub(crate) subscribers: Arc<Mutex<Vec<spillway::Sender<SpanRecord>>>>,
 }
 
 impl SpanCache<LevelPredicate> {
@@ -132,7 +148,6 @@ impl<P: EnabledPredicate> SpanCache<P> {
             spillway::channel_with_capacity_and_concurrency(config.channel_capacity, lane_count);
         let (event_sender, event_receiver) =
             spillway::channel_with_capacity_and_concurrency(config.channel_capacity, lane_count);
-        let map = Arc::new(RwLock::new(BTreeMap::new()));
         let shard_capacity = capacity.div_ceil(lane_count);
         let in_flight: Box<[ShardLane]> = (0..lane_count)
             .map(|_| ShardLane {
@@ -151,9 +166,10 @@ impl<P: EnabledPredicate> SpanCache<P> {
         // inline-8 FieldList), 256 × 16 lanes = ~1.5 MB worst case.
         let event_pool = ObjectPool::<EventRecord>::new(lane_count, 256);
 
+        let subscribers = Arc::new(Mutex::new(Vec::new()));
+
         let cache = SpanCache {
             in_flight,
-            map: Arc::clone(&map),
             // Initialise to ID_BATCH so every `fetch_add(ID_BATCH)`
             // returns a batch-aligned start; that's what makes the
             // mask-based "cursor at boundary ⇒ refill" check work in
@@ -167,13 +183,14 @@ impl<P: EnabledPredicate> SpanCache<P> {
             shard_mask,
             shard_shift,
             event_pool,
+            subscribers: Arc::clone(&subscribers),
         };
         let driver = Driver {
-            map,
             span_receiver,
             event_receiver,
             capacity,
             side_events: std::collections::BTreeMap::new(),
+            subscribers,
         };
         (cache, driver)
     }
@@ -238,29 +255,8 @@ impl<P: EnabledPredicate> SpanCache<P> {
         self.in_flight[shard].actual_ids[slab_idx].load(Ordering::Acquire)
     }
 
-    /// Returns a closed span by its actual_id (`SpanRecord.id`).  This is
-    /// the id stored in `parent_id` and used as the BTreeMap key.
-    /// Only closed spans are reachable here.
-    pub fn get_span(&self, actual_id: u64) -> Option<SpanRecord> {
-        #[allow(clippy::expect_used, reason = "poisoned lock")]
-        let map = self.map.read().expect("lock must not be poisoned");
-        map.get(&actual_id).cloned()
-    }
-
-    /// Drop every closed span currently in the BTreeMap.  Called by
-    /// the host when the cache-recording level transitions to `OFF`
-    /// so a paused host doesn't keep stale data around to confuse the
-    /// next session.  In-flight spans (still open in the slabs) are
-    /// not affected; if any close after this call they'll repopulate
-    /// the map as normal.
-    pub fn clear(&self) {
-        #[allow(clippy::expect_used, reason = "poisoned lock")]
-        let mut map = self.map.write().expect("lock must not be poisoned");
-        map.clear();
-    }
-
-    /// Resolve the `actual_id` (i.e. the [`SpanRecord::id`] used as the
-    /// `BTreeMap` key after close) for an in-flight span addressed by
+    /// Resolve the `actual_id` (i.e. the [`SpanRecord::id`] published
+    /// on the fan-out stream) for an in-flight span addressed by
     /// its `tracing::span::Id` u64.  Lock-free `Acquire` load from the
     /// per-shard sidecar — does not touch the slab `Mutex`.
     pub fn actual_id_for(&self, tracing_id: u64) -> Option<u64> {
@@ -268,20 +264,31 @@ impl<P: EnabledPredicate> SpanCache<P> {
         Some(self.load_actual_id(shard, slab_idx))
     }
 
-    /// Returns closed spans in ascending actual_id order.  Open spans are
-    /// not included; call [`Self::flush_pending`] + [`Driver::drain_sync`]
-    /// first if you need just-closed spans to appear.
-    pub fn page(&self, after_id: u64, limit: usize) -> Vec<SpanRecord> {
+    /// Register a new subscriber.  The returned `Receiver` yields
+    /// every closed span the cache produces from this call onward,
+    /// in the driver's commit (close-time) order.  The cache holds
+    /// no history — if you need to see spans from before the call,
+    /// subscribe earlier.
+    ///
+    /// Replaces the previous `page(after_id, _)` API, which keyed on
+    /// open-order `actual_id` and so silently dropped spans whenever
+    /// close order diverged from open order — the norm under async
+    /// workloads.
+    ///
+    /// `capacity` is the soft cap on in-flight spans for this
+    /// subscriber.  When the receiver falls behind by that much, the
+    /// driver logs and drops a whole batch — slow consumers don't back
+    /// up the pipeline.  Drop the receiver to unsubscribe; the driver
+    /// prunes the sender lazily on the next fan-out.
+    pub fn subscribe(&self, capacity: u64) -> spillway::Receiver<SpanRecord> {
+        // concurrency = 1: the driver is the only producer.
+        let (sender, receiver) = spillway::channel_with_capacity_and_concurrency(capacity, 1);
         #[allow(clippy::expect_used, reason = "poisoned lock")]
-        let map = self.map.read().expect("lock must not be poisoned");
-        if after_id == 0 {
-            map.values().take(limit).cloned().collect()
-        } else {
-            map.range((Excluded(after_id), Unbounded))
-                .take(limit)
-                .map(|(_, v)| v.clone())
-                .collect()
-        }
+        self.subscribers
+            .lock()
+            .expect("lock must not be poisoned")
+            .push(sender);
+        receiver
     }
 
     /// Drains the calling thread's two PENDING buffers (spans + events)

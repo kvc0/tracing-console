@@ -1,18 +1,21 @@
-//! Background task that drains closed spans and emitted events from two
-//! spillway channels, attaching events to their parent span and writing
-//! the result into the shared `BTreeMap`.
+//! Background task that drains closed spans and emitted events from
+//! two spillway channels, attaches events to their parent span, and
+//! fans the resulting `SpanRecord`s out to every live subscriber.
 //!
-//! Two channels (rather than one enum-typed channel) keep each pipeline
-//! type-pure: span-only workloads pay no enum-match cost on the driver
-//! side, and each spillway carries a homogeneous payload of the
-//! natural per-payload size.  Ordering across channels isn't preserved,
-//! but the side buffer below handles temporal misordering: if an event
-//! arrives before its parent has been inserted into the map, it parks
-//! in `side_events` keyed by `parent_actual_id`, and the span's
-//! arrival drains the buffer and attaches the events.
+//! Two channels (rather than one enum-typed channel) keep each
+//! pipeline type-pure: span-only workloads pay no enum-match cost on
+//! the driver side, and each spillway carries a homogeneous payload
+//! of the natural per-payload size.  Ordering across channels isn't
+//! preserved, but the side buffer below handles temporal misordering:
+//! if an event arrives at the driver before its parent span, it
+//! parks in `side_events` keyed by `parent_actual_id`, and the span's
+//! arrival drains the buffer and attaches the events.  Events that
+//! arrive *after* the parent has been fanned out have nowhere to land
+//! and are dropped — within a single thread `flush_pending` always
+//! sends events before the closing span, so this is rare in practice.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 use crate::object_pool::ReuseRef;
 use crate::record::{EventRecord, SpanRecord};
@@ -24,18 +27,22 @@ pub struct EventMessage {
 }
 
 pub struct Driver {
-    pub(crate) map: Arc<RwLock<BTreeMap<u64, SpanRecord>>>,
     pub(crate) span_receiver: spillway::Receiver<SpanRecord>,
     pub(crate) event_receiver: spillway::Receiver<EventMessage>,
+    /// Cap on distinct parent ids the orphan-event buffer can hold
+    /// while waiting for their span to land.  Once full, a new
+    /// parent's first event evicts the oldest entry via
+    /// `BTreeMap::pop_first` — and since `parent_actual_id`s are
+    /// monotonically allocated, the smallest key is the oldest span.
+    /// Evicted `ReuseRef`s drop back into the event pool.
     pub(crate) capacity: usize,
-    /// Events whose parent `SpanRecord` hasn't been inserted yet,
-    /// keyed by `parent_actual_id`.  Bounded by `capacity` distinct
-    /// parent ids; once full, a new parent's first event evicts the
-    /// oldest entry via `BTreeMap::pop_first` — and since
-    /// `parent_actual_id`s are monotonically allocated, the smallest
-    /// key is the oldest span.  Evicted `ReuseRef`s drop back into
-    /// the event pool.
+    /// Events whose parent `SpanRecord` hasn't been fanned out yet,
+    /// keyed by `parent_actual_id`.  See `capacity` for the bound.
     pub(crate) side_events: BTreeMap<u64, Vec<ReuseRef<EventRecord>>>,
+    /// Shared with [`crate::SpanCache::subscribers`].  Each closed
+    /// span the driver processes is cloned out to every entry; senders
+    /// that return `Error::Closed` are removed in place.
+    pub(crate) subscribers: Arc<Mutex<Vec<spillway::Sender<SpanRecord>>>>,
 }
 
 impl Driver {
@@ -43,31 +50,32 @@ impl Driver {
     /// has a batch ready next; terminates when both channels are closed.
     pub async fn run(self) {
         let Driver {
-            map,
             mut span_receiver,
             mut event_receiver,
             capacity,
             mut side_events,
+            subscribers,
         } = self;
 
         let mut span_closed = false;
         let mut event_closed = false;
         loop {
             tokio::select! {
-                span_batch = span_receiver.next_batch(), if !span_closed => {
-                    match span_batch {
-                        Some(batch) => Self::flush_span_batch(
-                            &map, &mut side_events, capacity, batch,
-                        ),
-                        None => span_closed = true,
-                    }
-                }
+                biased;
                 event_batch = event_receiver.next_batch(), if !event_closed => {
                     match event_batch {
                         Some(batch) => Self::flush_event_batch(
-                            &map, &mut side_events, capacity, batch,
+                            &mut side_events, capacity, batch,
                         ),
                         None => event_closed = true,
+                    }
+                }
+                span_batch = span_receiver.next_batch(), if !span_closed => {
+                    match span_batch {
+                        Some(batch) => Self::flush_span_batch(
+                            &mut side_events, &subscribers, batch,
+                        ),
+                        None => span_closed = true,
                     }
                 }
                 else => break,
@@ -84,56 +92,52 @@ impl Driver {
     /// drain's span batch lands in the side buffer in time.
     pub fn drain_sync(self) {
         let Driver {
-            map,
             mut span_receiver,
             mut event_receiver,
             capacity,
             mut side_events,
-            ..
+            subscribers,
         } = self;
 
         let mut events = Vec::new();
         while let Some(e) = event_receiver.try_next() {
             events.push(e);
         }
-        Self::flush_event_batch(&map, &mut side_events, capacity, events.into_iter());
+        Self::flush_event_batch(&mut side_events, capacity, events.into_iter());
 
         let mut spans = Vec::new();
         while let Some(s) = span_receiver.try_next() {
             spans.push(s);
         }
-        Self::flush_span_batch(&map, &mut side_events, capacity, spans.into_iter());
+        Self::flush_span_batch(&mut side_events, &subscribers, spans.into_iter());
     }
 
     pub(crate) fn flush_span_batch(
-        map: &RwLock<BTreeMap<u64, SpanRecord>>,
         side_events: &mut BTreeMap<u64, Vec<ReuseRef<EventRecord>>>,
-        capacity: usize,
+        subscribers: &Mutex<Vec<spillway::Sender<SpanRecord>>>,
         batch: impl ExactSizeIterator<Item = SpanRecord>,
     ) {
         if batch.len() == 0 {
             return;
         }
-        #[allow(clippy::expect_used, reason = "poisoned lock")]
-        let mut m = map.write().expect("lock must not be poisoned");
+        // Attach parked orphan events (if any) to each span before
+        // fan-out.  Done outside the subscribers lock so the visible
+        // critical section is just the send loop.
+        let mut prepared: Vec<SpanRecord> = Vec::with_capacity(batch.len());
         let any_side = !side_events.is_empty();
         for mut span in batch {
-            // Fast-path: skip the lookup when the side buffer has
-            // nothing in it at all (span-only workloads).
             if any_side && let Some(events) = side_events.remove(&span.id) {
                 span.events.extend(events);
             }
-            while m.len() >= capacity {
-                if m.pop_first().is_none() {
-                    break;
-                }
-            }
-            m.insert(span.id, span);
+            prepared.push(span);
         }
+
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
+        let mut subs = subscribers.lock().expect("lock must not be poisoned");
+        fanout_under_lock(&mut subs, prepared);
     }
 
     pub(crate) fn flush_event_batch(
-        map: &RwLock<BTreeMap<u64, SpanRecord>>,
         side_events: &mut BTreeMap<u64, Vec<ReuseRef<EventRecord>>>,
         capacity: usize,
         batch: impl ExactSizeIterator<Item = EventMessage>,
@@ -141,17 +145,11 @@ impl Driver {
         if batch.len() == 0 {
             return;
         }
-        #[allow(clippy::expect_used, reason = "poisoned lock")]
-        let mut m = map.write().expect("lock must not be poisoned");
         for EventMessage {
             parent_actual_id,
             record,
         } in batch
         {
-            if let Some(span) = m.get_mut(&parent_actual_id) {
-                span.events.push(record);
-                continue;
-            }
             if let Some(events) = side_events.get_mut(&parent_actual_id) {
                 events.push(record);
                 continue;
@@ -168,9 +166,28 @@ impl Driver {
     }
 }
 
+/// Send each prepared span to every live subscriber.  Caller already
+/// holds the subscribers lock.  Slow consumers (`Error::Full`) drop a
+/// whole batch with a debug log; dropped receivers (`Error::Closed`)
+/// are removed in place.  The typical case is one subscriber per
+/// console, so the unconditional `clone()` is a non-issue — it's the
+/// `Vec<ReuseRef<EventRecord>>` clones that dominate.
+fn fanout_under_lock(subs: &mut Vec<spillway::Sender<SpanRecord>>, prepared: Vec<SpanRecord>) {
+    if prepared.is_empty() {
+        return;
+    }
+    subs.retain(|sender| match sender.send_many(prepared.iter().cloned()) {
+        Ok(()) => true,
+        Err(spillway::Error::Closed(_)) => false,
+        Err(spillway::Error::Full(_)) => {
+            log::debug!("subscriber channel full; dropping a batch of closed spans");
+            true
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Instant;
 
     use tracing::callsite::{Callsite, DefaultCallsite, Identifier};
@@ -226,8 +243,8 @@ mod tests {
         }
     }
 
-    fn empty_map() -> Arc<RwLock<BTreeMap<u64, SpanRecord>>> {
-        Arc::new(RwLock::new(BTreeMap::new()))
+    fn no_subscribers() -> Mutex<Vec<spillway::Sender<SpanRecord>>> {
+        Mutex::new(Vec::new())
     }
 
     type Side = BTreeMap<u64, Vec<ReuseRef<EventRecord>>>;
@@ -241,25 +258,45 @@ mod tests {
         // Events for an unknown parent should park in `side_events`
         // and survive there until the matching span arrives.
         let pool = ObjectPool::<EventRecord>::new(1, 16);
-        let map = empty_map();
         let mut side: Side = BTreeMap::new();
 
         let events = vec![make_event(&pool, 99), make_event(&pool, 99)];
-        Driver::flush_event_batch(&map, &mut side, 8, events.into_iter());
+        Driver::flush_event_batch(&mut side, 8, events.into_iter());
         assert_eq!(bucket_len(&side, 99), Some(2));
-        assert!(
-            map.read().unwrap().is_empty(),
-            "events must not insert spans"
-        );
 
-        // Parent arrives → orphans attach and the side bucket is drained.
-        Driver::flush_span_batch(&map, &mut side, 8, std::iter::once(make_span(99)));
+        // Parent arrives → orphans attach (and the span is fanned out
+        // to subscribers — none here, so we just check side drains).
+        Driver::flush_span_batch(&mut side, &no_subscribers(), std::iter::once(make_span(99)));
         assert!(
             side.is_empty(),
             "side bucket for 99 must drain on span arrival"
         );
-        let m = map.read().unwrap();
-        let span = m.get(&99).expect("span 99 inserted");
+    }
+
+    #[test]
+    fn span_arrival_attaches_parked_events_to_fanout() {
+        // The span the subscriber receives carries the side-buffer
+        // events that were parked before it arrived — proving the
+        // events flow without going through a historical map.
+        let pool = ObjectPool::<EventRecord>::new(1, 16);
+        let mut side: Side = BTreeMap::new();
+        let subs = Mutex::new(Vec::new());
+
+        // Park two events for parent 99.
+        Driver::flush_event_batch(
+            &mut side,
+            8,
+            vec![make_event(&pool, 99), make_event(&pool, 99)].into_iter(),
+        );
+
+        // Subscriber connects, then parent 99 arrives.
+        let (sender, mut rx) = spillway::channel_with_capacity_and_concurrency(64, 1);
+        #[allow(clippy::expect_used, reason = "test")]
+        subs.lock().expect("test").push(sender);
+        Driver::flush_span_batch(&mut side, &subs, std::iter::once(make_span(99)));
+
+        let span = rx.try_next().expect("subscriber should receive span 99");
+        assert_eq!(span.id, 99);
         assert_eq!(span.events.len(), 2);
     }
 
@@ -271,24 +308,18 @@ mod tests {
         // monotonic actual_id allocation — and keep the rest.
         const CAP: usize = 4;
         let pool = ObjectPool::<EventRecord>::new(1, 16);
-        let map = empty_map();
         let mut side: Side = BTreeMap::new();
 
         let mut fill: Vec<EventMessage> = Vec::new();
         for parent in [10u64, 20, 30, 40] {
             fill.push(make_event(&pool, parent));
         }
-        Driver::flush_event_batch(&map, &mut side, CAP, fill.into_iter());
+        Driver::flush_event_batch(&mut side, CAP, fill.into_iter());
         assert_eq!(side.len(), CAP);
         let ids: Vec<u64> = side.keys().copied().collect();
         assert_eq!(ids, vec![10, 20, 30, 40]);
 
-        Driver::flush_event_batch(
-            &map,
-            &mut side,
-            CAP,
-            std::iter::once(make_event(&pool, 999)),
-        );
+        Driver::flush_event_batch(&mut side, CAP, std::iter::once(make_event(&pool, 999)));
         let ids: Vec<u64> = side.keys().copied().collect();
         assert_eq!(ids, vec![20, 30, 40, 999], "smallest id must be evicted");
         assert_eq!(bucket_len(&side, 999), Some(1));
@@ -301,11 +332,9 @@ mod tests {
         // its vec — no eviction, since no new parent slot is claimed.
         const CAP: usize = 2;
         let pool = ObjectPool::<EventRecord>::new(1, 16);
-        let map = empty_map();
         let mut side: Side = BTreeMap::new();
 
         Driver::flush_event_batch(
-            &map,
             &mut side,
             CAP,
             vec![make_event(&pool, 1), make_event(&pool, 2)].into_iter(),
@@ -317,7 +346,6 @@ mod tests {
         // stays at CAP; parent 1's bucket grows to 3.  Parent 2 is
         // untouched.
         Driver::flush_event_batch(
-            &map,
             &mut side,
             CAP,
             vec![make_event(&pool, 1), make_event(&pool, 1)].into_iter(),
@@ -333,11 +361,9 @@ mod tests {
         // accumulate in its vec without growing the buffer length.
         const CAP: usize = 8;
         let pool = ObjectPool::<EventRecord>::new(1, 16);
-        let map = empty_map();
         let mut side: Side = BTreeMap::new();
 
         Driver::flush_event_batch(
-            &map,
             &mut side,
             CAP,
             vec![
@@ -358,13 +384,11 @@ mod tests {
         // the pool together.
         const CAP: usize = 2;
         let pool = ObjectPool::<EventRecord>::new(1, 16);
-        let map = empty_map();
         let mut side: Side = BTreeMap::new();
 
         // Parent 1 accumulates 3 events; parent 2 has 1.  Both
         // buckets exist; buffer is at CAP.
         Driver::flush_event_batch(
-            &map,
             &mut side,
             CAP,
             vec![
@@ -379,7 +403,7 @@ mod tests {
 
         // New parent 7 evicts parent 1's *entire* bucket — all
         // three events go, not just one.
-        Driver::flush_event_batch(&map, &mut side, CAP, std::iter::once(make_event(&pool, 7)));
+        Driver::flush_event_batch(&mut side, CAP, std::iter::once(make_event(&pool, 7)));
         let ids: Vec<u64> = side.keys().copied().collect();
         assert_eq!(ids, vec![2, 7]);
         assert!(bucket_len(&side, 1).is_none());

@@ -46,16 +46,42 @@ fn make_cache(capacity: usize) -> (Arc<SpanCache>, Driver) {
     (Arc::new(cache), driver)
 }
 
-/// Runs `f` under `cache` as the active subscriber, then flushes and drains
-/// so all closed spans are committed to the map before returning.
-fn run_with_drain<F, T>(cache: &Arc<SpanCache>, driver: Driver, f: F) -> T
+/// Registers a subscriber, runs `f` under `cache` as the active
+/// subscriber, then flushes and drains so the subscriber sees every
+/// closed span before returning.  Returns whatever `f` produced plus
+/// the spans the subscriber collected (in driver commit order).
+///
+/// `subscribe` must happen before `f` runs — the cache holds no
+/// history, so a subscriber that connects late doesn't see earlier
+/// spans.
+fn run_with_drain_collect<F, T>(
+    cache: &Arc<SpanCache>,
+    driver: Driver,
+    f: F,
+) -> (T, Vec<crate::record::SpanRecord>)
 where
     F: FnOnce() -> T,
 {
+    let mut rx = cache.subscribe(65_536);
     let result = tracing::subscriber::with_default(Arc::clone(cache), f);
     cache.flush_pending();
     driver.drain_sync();
-    result
+    let mut collected = Vec::new();
+    while let Some(s) = rx.try_next() {
+        collected.push(s);
+    }
+    (result, collected)
+}
+
+/// Look up a captured span by its `actual_id` — replaces the previous
+/// `cache.get_span(id).unwrap()` pattern now that the cache holds no
+/// historical state.
+#[track_caller]
+fn find_span(spans: &[SpanRecord], actual_id: u64) -> &SpanRecord {
+    spans
+        .iter()
+        .find(|s| s.id == actual_id)
+        .unwrap_or_else(|| panic!("no span with id {actual_id} in collected stream"))
 }
 
 fn span_id(span: &tracing::Span) -> Option<u64> {
@@ -91,22 +117,22 @@ impl EnabledPredicate for DisableByName {
 #[test]
 fn basic_span_creation_and_retrieval() {
     let (cache, driver) = make_cache(10);
-    let actual_id = run_with_drain(&cache, driver, || {
+    let (actual_id, collected) = run_with_drain_collect(&cache, driver, || {
         let span = tracing::span!(parent: None, Level::INFO, "root", field = "value");
         let actual_id = actual_id_of(&cache, &span);
         let _g = span.enter();
         actual_id
     });
-    let record = cache.get_span(actual_id).unwrap();
+    let record = find_span(&collected, actual_id);
     assert_eq!(record.id, actual_id);
     assert_eq!(record.metadata.name(), "root");
-    assert_eq!(span_field(&record, "field").as_deref(), Some("value"));
+    assert_eq!(span_field(record, "field").as_deref(), Some("value"));
 }
 
 #[test]
 fn closed_at_set_after_drop() {
     let (cache, driver) = make_cache(10);
-    let actual_id = run_with_drain(&cache, driver, || {
+    let (actual_id, collected) = run_with_drain_collect(&cache, driver, || {
         let span = tracing::span!(parent: None, Level::INFO, "root");
         let tracing_id = span_id(&span).unwrap();
         let actual_id = cache.actual_id_for(tracing_id).unwrap();
@@ -116,9 +142,8 @@ fn closed_at_set_after_drop() {
         actual_id
         // span drops here → try_close → PENDING
     });
-    // After drain: lookup by actual_id finds the BTreeMap entry.
     assert!(
-        cache.get_span(actual_id).unwrap().closed_at.is_some(),
+        find_span(&collected, actual_id).closed_at.is_some(),
         "should be closed after Span drops"
     );
 }
@@ -161,43 +186,6 @@ fn root_span_with_active_stack_is_disabled() {
         assert_eq!(span_id(&root_b), Some(DISABLED));
     });
     drop(driver);
-}
-
-#[test]
-fn eviction_removes_closed_spans() {
-    // Single-lane so capacity=2 means "2 in-flight", not "2 lanes × 1
-    // each".  With thread-id sharding all spans on this thread go to the
-    // same shard, so a multi-lane setup with capacity=2 could only fit 1
-    // in-flight per thread — not what this test wants to verify.
-    let (cache, driver) = SpanCache::with_config(
-        2,
-        CacheConfig {
-            lane_count: 1,
-            ..CacheConfig::default()
-        },
-    );
-    let cache = Arc::new(cache);
-    let (a, b, c) = run_with_drain(&cache, driver, || {
-        let span_a = tracing::span!(parent: None, Level::INFO, "a");
-        let a = actual_id_of(&cache, &span_a);
-        let span_b = tracing::span!(parent: None, Level::INFO, "b");
-        let b = actual_id_of(&cache, &span_b);
-        drop(span_a);
-        drop(span_b);
-        // in_flight is empty; C is allowed.
-        let span_c = tracing::span!(parent: None, Level::INFO, "c");
-        assert_ne!(span_id(&span_c), Some(DISABLED), "C should be enabled");
-        let c = actual_id_of(&cache, &span_c);
-        (a, b, c)
-    });
-    // Driver inserted A, B, then C: capacity=2, so A was evicted when C was inserted.
-    assert!(cache.get_span(a).is_none(), "A should have been evicted");
-    assert!(cache.get_span(b).is_some(), "B should still be in cache");
-    assert!(cache.get_span(c).is_some(), "C should be in cache");
-    let page_ids: Vec<u64> = cache.page(0, 10).iter().map(|s| s.id).collect();
-    assert!(!page_ids.contains(&a));
-    assert!(page_ids.contains(&b));
-    assert!(page_ids.contains(&c));
 }
 
 #[test]
@@ -318,9 +306,13 @@ fn lane_count_is_clamped_and_rounded_to_power_of_two() {
 }
 
 #[test]
-fn pagination() {
+fn subscribe_yields_closed_spans_in_commit_order() {
+    // Replaces the old `pagination` test.  Each span is opened and
+    // then immediately closed in sequence on a single thread, so
+    // commit order coincides with open order and the subscriber
+    // sees every closed span.
     let (cache, driver) = make_cache(10);
-    let ids: Vec<u64> = run_with_drain(&cache, driver, || {
+    let (ids, collected) = run_with_drain_collect(&cache, driver, || {
         let mut ids = Vec::new();
         for _ in 0..5usize {
             let span = tracing::span!(parent: None, Level::INFO, "s");
@@ -330,32 +322,21 @@ fn pagination() {
         ids
     });
     assert_eq!(ids.len(), 5);
-
-    let p1 = cache.page(0, 3);
-    assert_eq!(p1.len(), 3);
-    assert_eq!(p1[0].id, ids[0]);
-    assert_eq!(p1[2].id, ids[2]);
-
-    let last = p1.last().unwrap().id;
-    let p2 = cache.page(last, 3);
-    assert_eq!(p2.len(), 2);
-    assert_eq!(p2[0].id, ids[3]);
-    assert_eq!(p2[1].id, ids[4]);
-
-    assert!(cache.page(ids[4] + 1000, 3).is_empty());
+    let observed_ids: Vec<u64> = collected.iter().map(|s| s.id).collect();
+    assert_eq!(observed_ids, ids);
 }
 
 #[test]
 fn event_attached_to_current_span() {
     let (cache, driver) = make_cache(10);
-    let actual_id = run_with_drain(&cache, driver, || {
+    let (actual_id, collected) = run_with_drain_collect(&cache, driver, || {
         let span = tracing::span!(parent: None, Level::INFO, "root");
         let actual_id = actual_id_of(&cache, &span);
         let _g = span.enter();
         tracing::event!(Level::INFO, "test event happened");
         actual_id
     });
-    let record = cache.get_span(actual_id).unwrap();
+    let record = find_span(&collected, actual_id);
     assert_eq!(record.events.len(), 1);
     assert!(
         record.events[0].field("message").is_some(),
@@ -366,17 +347,19 @@ fn event_attached_to_current_span() {
 #[test]
 fn event_dropped_with_no_active_span() {
     let (cache, driver) = make_cache(10);
-    tracing::subscriber::with_default(Arc::clone(&cache), || {
+    let (_, collected) = run_with_drain_collect(&cache, driver, || {
         tracing::event!(Level::INFO, "orphan event");
     });
-    drop(driver);
-    assert!(cache.page(0, 10).is_empty());
+    assert!(
+        collected.is_empty(),
+        "an orphan event must not create a span",
+    );
 }
 
 #[test]
 fn field_capture() {
     let (cache, driver) = make_cache(10);
-    let actual_id = run_with_drain(&cache, driver, || {
+    let (actual_id, collected) = run_with_drain_collect(&cache, driver, || {
         let span = tracing::span!(
             parent: None,
             Level::INFO,
@@ -387,10 +370,10 @@ fn field_capture() {
         );
         actual_id_of(&cache, &span)
     });
-    let record = cache.get_span(actual_id).unwrap();
-    assert_eq!(span_field(&record, "str_field").as_deref(), Some("hello"));
-    assert_eq!(span_field(&record, "int_field").as_deref(), Some("42"));
-    assert_eq!(span_field(&record, "bool_field").as_deref(), Some("true"));
+    let record = find_span(&collected, actual_id);
+    assert_eq!(span_field(record, "str_field").as_deref(), Some("hello"));
+    assert_eq!(span_field(record, "int_field").as_deref(), Some("42"));
+    assert_eq!(span_field(record, "bool_field").as_deref(), Some("true"));
 }
 
 // ── API-handler-shape coverage ────────────────────────────────────────────
@@ -400,7 +383,7 @@ fn record_updates_span_fields_after_creation() {
     // Common API-handler pattern: span!(...) declares a field with no value
     // up front, then span.record() fills it in once the operation finishes.
     let (cache, driver) = make_cache(10);
-    let actual_id = run_with_drain(&cache, driver, || {
+    let (actual_id, collected) = run_with_drain_collect(&cache, driver, || {
         let span = tracing::span!(
             parent: None,
             Level::INFO,
@@ -412,15 +395,15 @@ fn record_updates_span_fields_after_creation() {
         span.record("status", "success");
         actual_id
     });
-    let record = cache.get_span(actual_id).unwrap();
-    assert_eq!(span_field(&record, "initial").as_deref(), Some("ready"));
-    assert_eq!(span_field(&record, "status").as_deref(), Some("success"));
+    let record = find_span(&collected, actual_id);
+    assert_eq!(span_field(record, "initial").as_deref(), Some("ready"));
+    assert_eq!(span_field(record, "status").as_deref(), Some("success"));
 }
 
 #[test]
 fn multiple_events_recorded_in_order() {
     let (cache, driver) = make_cache(10);
-    let actual_id = run_with_drain(&cache, driver, || {
+    let (actual_id, collected) = run_with_drain_collect(&cache, driver, || {
         let span = tracing::span!(parent: None, Level::INFO, "op");
         let actual_id = actual_id_of(&cache, &span);
         let _g = span.enter();
@@ -429,7 +412,7 @@ fn multiple_events_recorded_in_order() {
         tracing::event!(Level::INFO, step = "third");
         actual_id
     });
-    let record = cache.get_span(actual_id).unwrap();
+    let record = find_span(&collected, actual_id);
     assert_eq!(record.events.len(), 3);
     let steps: Vec<String> = record
         .events
@@ -451,7 +434,7 @@ fn sibling_spans_share_parent_actual_id() {
     // 4 spans alive simultaneously on one thread (root + 3 siblings).
     // With 16 lanes that needs per-shard cap ≥ 4, so capacity ≥ 64.
     let (cache, driver) = make_cache(64);
-    let (root_id, sibling_ids) = run_with_drain(&cache, driver, || {
+    let ((root_id, sibling_ids), collected) = run_with_drain_collect(&cache, driver, || {
         let root = tracing::span!(parent: None, Level::INFO, "root");
         let root_id = actual_id_of(&cache, &root);
         let _g = root.enter();
@@ -464,7 +447,7 @@ fn sibling_spans_share_parent_actual_id() {
         (root_id, ids)
     });
     for (i, &sid) in sibling_ids.iter().enumerate() {
-        let s = cache.get_span(sid).unwrap();
+        let s = find_span(&collected, sid);
         assert_eq!(s.parent_id, Some(root_id), "sibling #{i} parent_id");
         assert_eq!(s.metadata.name(), "child");
     }
@@ -499,7 +482,7 @@ fn api_handler_lifecycle() {
     // its own field, one with two events), a deferred record() on the
     // root once everything finishes.
     let (cache, driver) = make_cache(20);
-    let request_id = run_with_drain(&cache, driver, || {
+    let (request_id, pages) = run_with_drain_collect(&cache, driver, || {
         let request = tracing::span!(
             parent: None,
             Level::INFO,
@@ -528,15 +511,14 @@ fn api_handler_lifecycle() {
         request_id
     });
 
-    let pages = cache.page(0, 100);
     assert_eq!(pages.len(), 3, "request, validate, db_query all present");
 
-    let request = cache.get_span(request_id).unwrap();
+    let request = find_span(&pages, request_id);
     assert_eq!(request.metadata.name(), "request");
     assert_eq!(request.parent_id, None);
-    assert_eq!(span_field(&request, "method").as_deref(), Some("GET"));
-    assert_eq!(span_field(&request, "path").as_deref(), Some("/users/42"));
-    assert_eq!(span_field(&request, "status").as_deref(), Some("200"));
+    assert_eq!(span_field(request, "method").as_deref(), Some("GET"));
+    assert_eq!(span_field(request, "path").as_deref(), Some("/users/42"));
+    assert_eq!(span_field(request, "status").as_deref(), Some("200"));
 
     let validate = pages
         .iter()
@@ -593,11 +575,11 @@ fn public_api_reexports_are_reachable() {
     let (cache, driver): (ReexportedSpanCache, ReexportedDriver) =
         ReexportedSpanCache::with_config(8, cfg);
     let cache = Arc::new(cache);
-    let _id = run_with_drain(&cache, driver, || {
-        let s = tracing::span!(parent: None, Level::INFO, "smoke");
-        actual_id_of(&cache, &s)
-    });
-    let pages: Vec<ReexportedSpanRecord> = cache.page(0, 4);
+    let (_id, pages): (_, Vec<ReexportedSpanRecord>) =
+        run_with_drain_collect(&cache, driver, || {
+            let s = tracing::span!(parent: None, Level::INFO, "smoke");
+            actual_id_of(&cache, &s)
+        });
     let _: Option<&ReexportedEventRecord> =
         pages.first().and_then(|s| s.events.first().map(|e| &**e));
 }
@@ -613,6 +595,7 @@ fn async_instrumented_tasks_with_overlapping_spans() {
     // under thread-id sharding.  capacity=64 / 16 lanes → per-shard cap 4.
     let (cache, driver) = make_cache(64);
 
+    let mut rx = cache.subscribe(65_536);
     tracing::subscriber::with_default(Arc::clone(&cache), || {
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -655,7 +638,10 @@ fn async_instrumented_tasks_with_overlapping_spans() {
     cache.flush_pending();
     driver.drain_sync();
 
-    let all = cache.page(0, 20);
+    let mut all = Vec::new();
+    while let Some(s) = rx.try_next() {
+        all.push(s);
+    }
     assert_eq!(all.len(), 4, "task_a, acquire, task_b, release");
     assert!(
         all.iter().all(|s| s.closed_at.is_some()),

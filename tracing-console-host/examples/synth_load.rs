@@ -160,6 +160,10 @@ fn emit_fetch_user(counter: u64) {
             let c = tracing::span!(Level::INFO, "cache_lookup");
             let _c = c.enter();
         }
+        {
+            let c = tracing::span!(Level::INFO, "cache_lookup");
+            let _c = c.enter();
+        }
     }
     {
         let s = tracing::span!(Level::INFO, "serialize_response");

@@ -1,10 +1,8 @@
 //! protosocket-rpc server that streams closed spans from a [`tracing_cache::SpanCache`].
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use protosocket::TcpSocketListener;
 use protosocket_messagepack::{MessagePackDecoder, MessagePackSerializer};
@@ -21,33 +19,11 @@ use crate::wire::{TimeBase, span_to_wire};
 //   server reads `Request`, writes `Response`.
 type ServerCodec = (MessagePackSerializer<Response>, MessagePackDecoder<Request>);
 
-// Tunables — kept inline since this is the only place they're used.
-//
-// Polling adapts toward `STREAM_TARGET_BATCH` spans per poll: each tick the
-// interval is scaled by `target / observed`, then clamped to ±20% of the
-// previous interval and bounded by `STREAM_MIN_INTERVAL` / `STREAM_MAX_INTERVAL`.
-// `STREAM_BATCH` is the per-page cap fed to `cache.page()`; it must exceed
-// the target so observed counts above target signal a backlog.
-const STREAM_POLL_INTERVAL_INITIAL: Duration = Duration::from_millis(50);
-// Per-poll page cap.  Sets the maximum throughput the loop can move per
-// tick — at high arrival rates the adaptive interval bottoms out near
-// the timer granularity (~1 ms on macOS, ~10–100 µs on Linux), so the
-// per-tick cap times the timer rate is the throughput ceiling.  Set big
-// enough that a single tick can drain the typical inter-tick backlog.
-const STREAM_BATCH: usize = 4096;
-// Target spans per poll.  Adaptive controller scales the interval to
-// keep observed batch ≈ target — small target = low visibility latency
-// at typical loads.  Under sustained overload the interval bottoms out
-// at `STREAM_MIN_INTERVAL` and the per-tick `STREAM_BATCH` cap takes
-// over as the throughput limit.
-const STREAM_TARGET_BATCH: usize = 32;
-/// Floor for the adaptive page interval.  Set to `ZERO` so that
-/// under sustained overload the controller drops to "no sleep at
-/// all" — the polling loop just yields to the scheduler and pages
-/// again, which is the highest sustainable throughput.
-const STREAM_MIN_INTERVAL: Duration = Duration::ZERO;
-const STREAM_MAX_INTERVAL: Duration = Duration::from_millis(50);
-const STREAM_ADJUST_RATIO: f64 = 0.2; // ±20% per tick
+/// Per-stream subscriber buffer.  Sized so a brief client stall doesn't
+/// cost us spans.  When the receiver falls behind by this much, the
+/// driver logs and drops a whole batch (see
+/// `tracing_cache::driver::fanout_to_subscribers`).
+const STREAM_SUBSCRIBER_CAPACITY: u64 = 65_536;
 
 /// Per-connection mutable state.  Read by the streaming RPC, mutated by the
 /// `Set*` RPCs and `StartStream` / `StopStream`.
@@ -56,8 +32,6 @@ struct StreamState {
     streaming: bool,
     min_level: Option<WireLevel>,
     sampling_rate: f64,
-    /// Substring filter applied to root span name + field values.
-    root_filter: Option<String>,
 }
 
 impl StreamState {
@@ -66,7 +40,6 @@ impl StreamState {
             streaming: false,
             min_level: None,
             sampling_rate: 1.0,
-            root_filter: None,
         }
     }
 }
@@ -89,20 +62,11 @@ pub(crate) struct CacheLevelBroadcast {
     level_tx: watch::Sender<WireLevelFilter>,
     chance_handle: ChanceHandle,
     chance_tx: watch::Sender<f64>,
-    /// Trait-erased "clear the cache's BTreeMap of closed spans"
-    /// hook.  Fired whenever the level transitions to `OFF` —
-    /// explicit `SetCacheLevel` or the last-disconnect reset — so
-    /// a paused host doesn't keep stale recordings around.
-    clear_cache: Arc<dyn Fn() + Send + Sync>,
     active_streams: Arc<AtomicUsize>,
 }
 
 impl CacheLevelBroadcast {
-    pub fn new(
-        level_handle: LevelHandle,
-        chance_handle: ChanceHandle,
-        clear_cache: Arc<dyn Fn() + Send + Sync>,
-    ) -> Self {
+    pub fn new(level_handle: LevelHandle, chance_handle: ChanceHandle) -> Self {
         let initial_level = WireLevelFilter::from_tracing(level_handle.get());
         let initial_chance = chance_handle.get();
         let (level_tx, _) = watch::channel(initial_level);
@@ -112,15 +76,11 @@ impl CacheLevelBroadcast {
             level_tx,
             chance_handle,
             chance_tx,
-            clear_cache,
             active_streams: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn set_level(&self, filter: WireLevelFilter) {
-        if filter == WireLevelFilter::Off {
-            (self.clear_cache)();
-        }
         self.level_handle.set(filter.to_tracing());
         let _ = self.level_tx.send(filter);
     }
@@ -149,11 +109,11 @@ impl CacheLevelBroadcast {
     /// Register a new console *streaming session* (one StartStream
     /// RPC).  Returns a guard whose `Drop` decrements the counter;
     /// when the counter hits zero (the last streaming RPC ended),
-    /// the level resets to `OFF`, the cache is cleared, and the
-    /// new state is broadcast so any still-active stream picks it
-    /// up.  Scoped to the streaming RPC (not the connection) so
-    /// liveness probes that open + close a TCP socket without
-    /// issuing StartStream don't trigger a spurious reset.
+    /// the level resets to `OFF` and the new state is broadcast so
+    /// any still-active stream picks it up.  Scoped to the streaming
+    /// RPC (not the connection) so liveness probes that open + close
+    /// a TCP socket without issuing StartStream don't trigger a
+    /// spurious reset.
     fn enter_stream(&self) -> StreamGuard {
         self.active_streams.fetch_add(1, Ordering::SeqCst);
         StreamGuard {
@@ -177,9 +137,8 @@ impl Drop for StreamGuard {
         if prev == 1 {
             // Last active streaming session — drop the cache back to
             // OFF so an idle host pays nothing for tracing dispatch,
-            // wipe recorded spans, and reset chance to 100% so the
-            // next console reconnects to a clean slate.
-            (self.broadcast.clear_cache)();
+            // and reset chance to 100% so the next console reconnects
+            // to a clean slate.
             self.broadcast.level_handle.set(LevelFilter::OFF);
             let _ = self.broadcast.level_tx.send(WireLevelFilter::Off);
             self.broadcast.chance_handle.set(100.0);
@@ -191,7 +150,8 @@ impl Drop for StreamGuard {
 // ── Per-connection service ───────────────────────────────────────────────────
 
 /// One per active client connection.  Holds an `Arc` to the shared cache so
-/// it can page closed spans, plus its own filter / sampling / level state.
+/// it can subscribe to closed-span fan-out, plus its own filter / sampling /
+/// level state.
 pub(crate) struct ConnectionState<P: EnabledPredicate> {
     cache: Arc<SpanCache<P>>,
     base: TimeBase,
@@ -204,10 +164,6 @@ pub(crate) struct ConnectionState<P: EnabledPredicate> {
     /// console always sends StartStream once, so its connection's
     /// drop reliably fires the reset.
     stream_guard: Option<StreamGuard>,
-    /// Memo of which root-span actual_ids the filter accepted (so descendants
-    /// inherit transitively without rechecking the filter against fields the
-    /// child doesn't carry).  Bounded — drops oldest entries when over budget.
-    root_decisions: Arc<RwLock<HashMap<u64, bool>>>,
 }
 
 impl<P: EnabledPredicate> ConnectionState<P> {
@@ -218,7 +174,6 @@ impl<P: EnabledPredicate> ConnectionState<P> {
             state: Arc::new(RwLock::new(StreamState::new())),
             level_bus,
             stream_guard: None,
-            root_decisions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -248,12 +203,11 @@ impl<P: EnabledPredicate> ConnectionService for ConnectionState<P> {
                 }
                 let cache = Arc::clone(&self.cache);
                 let state = Arc::clone(&self.state);
-                let roots = Arc::clone(&self.root_decisions);
                 let base = self.base;
                 let level_rx = self.level_bus.subscribe_level();
                 let chance_rx = self.level_bus.subscribe_chance();
                 tokio::spawn(responder.stream(span_stream(
-                    cache, state, roots, base, level_rx, chance_rx, request_id,
+                    cache, state, base, level_rx, chance_rx, request_id,
                 )));
             }
             RequestBody::StopStream => {
@@ -290,21 +244,6 @@ impl<P: EnabledPredicate> ConnectionService for ConnectionState<P> {
                     .write()
                     .expect("lock must not be poisoned")
                     .sampling_rate = rate;
-                self.root_decisions
-                    .write()
-                    .expect("lock must not be poisoned")
-                    .clear();
-                responder.immediate(Response::ack().with_id(request_id));
-            }
-            RequestBody::SetFilter(f) => {
-                self.state
-                    .write()
-                    .expect("lock must not be poisoned")
-                    .root_filter = f;
-                self.root_decisions
-                    .write()
-                    .expect("lock must not be poisoned")
-                    .clear();
                 responder.immediate(Response::ack().with_id(request_id));
             }
             RequestBody::Noop => {}
@@ -324,7 +263,6 @@ impl<P: EnabledPredicate> ConnectionService for ConnectionState<P> {
 fn span_stream<P: EnabledPredicate>(
     cache: Arc<SpanCache<P>>,
     state: Arc<RwLock<StreamState>>,
-    roots: Arc<RwLock<HashMap<u64, bool>>>,
     base: TimeBase,
     mut level_rx: watch::Receiver<WireLevelFilter>,
     mut chance_rx: watch::Receiver<f64>,
@@ -338,110 +276,55 @@ fn span_stream<P: EnabledPredicate>(
         let initial_chance = *chance_rx.borrow_and_update();
         yield Response::cache_chance(initial_chance).with_id(request_id);
 
-        let mut cursor: u64 = 0;
-        let mut interval = STREAM_POLL_INTERVAL_INITIAL;
+        // Register a subscriber — the driver fans every closed span
+        // into this receiver in commit (close-time) order, replacing
+        // the previous open-time `page(after_id, _)` cursor that
+        // silently dropped spans whenever close order diverged from
+        // open order (typical for async workloads).  Dropping this
+        // receiver (e.g. when the stream future ends) tells the
+        // driver to prune the sender on its next fan-out.
+        let mut span_rx = cache.subscribe(STREAM_SUBSCRIBER_CAPACITY);
+
         loop {
-            if interval.is_zero() {
-                // Saturated path: don't sleep at all.  Poll the
-                // watches non-blocking and immediately page again.
-                // `yield_now` is the only cooperative point so we
-                // don't starve other tokio tasks on this runtime.
-                if level_rx.has_changed().unwrap_or(false) {
+            tokio::select! {
+                changed = level_rx.changed() => {
+                    if changed.is_err() { break; }
                     let lvl = *level_rx.borrow_and_update();
                     yield Response::cache_level(lvl).with_id(request_id);
-                    continue;
                 }
-                if chance_rx.has_changed().unwrap_or(false) {
+                changed = chance_rx.changed() => {
+                    if changed.is_err() { break; }
                     let pct = *chance_rx.borrow_and_update();
                     yield Response::cache_chance(pct).with_id(request_id);
-                    continue;
                 }
-                tokio::task::yield_now().await;
-            } else {
-                tokio::select! {
-                    changed = level_rx.changed() => {
-                        if changed.is_err() { break; }
-                        let lvl = *level_rx.borrow_and_update();
-                        yield Response::cache_level(lvl).with_id(request_id);
+                batch = span_rx.next_batch() => {
+                    let Some(batch) = batch else { break };
+                    let (streaming, min_level, sampling_rate) = {
+                        #[allow(clippy::expect_used, reason = "poisoned lock")]
+                        let s = state.read().expect("lock must not be poisoned");
+                        (s.streaming, s.min_level, s.sampling_rate)
+                    };
+                    if !streaming {
+                        // StopStream is in effect — keep draining the
+                        // batch (so the subscriber channel doesn't
+                        // back up) but discard.
+                        drop(batch);
                         continue;
                     }
-                    changed = chance_rx.changed() => {
-                        if changed.is_err() { break; }
-                        let pct = *chance_rx.borrow_and_update();
-                        yield Response::cache_chance(pct).with_id(request_id);
-                        continue;
+                    for record in batch {
+                        if let Some(min) = min_level
+                            && !level_at_least(record.metadata.level(), min)
+                        {
+                            continue;
+                        }
+                        if !sampling_passes(&record, sampling_rate) {
+                            continue;
+                        }
+                        yield Response::span(span_to_wire(&record, base)).with_id(request_id);
                     }
-                    _ = tokio::time::sleep(interval) => {}
                 }
             }
-            // Snapshot the streaming flag + filter under the lock, then drop
-            // it before paging the cache so the page isn't holding two locks.
-            let (streaming, min_level, sampling_rate, root_filter) = {
-                #[allow(clippy::expect_used, reason = "poisoned lock")]
-                let s = state.read().expect("lock must not be poisoned");
-                (s.streaming, s.min_level, s.sampling_rate, s.root_filter.clone())
-            };
-            if !streaming {
-                // Don't adapt while paused — `count == 0` here means the
-                // client said stop, not "nothing was produced".
-                continue;
-            }
-            let batch = cache.page(cursor, STREAM_BATCH);
-            let count = batch.len();
-            for record in batch {
-                cursor = record.id;
-                if let Some(min) = min_level
-                    && !level_at_least(record.metadata.level(), min)
-                {
-                    continue;
-                }
-                if !sampling_passes(&record, sampling_rate) {
-                    continue;
-                }
-                if !filter_passes(&record, &root_filter, &roots) {
-                    continue;
-                }
-                yield Response::span(span_to_wire(&record, base)).with_id(request_id);
-            }
-            interval = adjust_interval(interval, count);
         }
-    }
-}
-
-/// Scale `current` toward yielding `STREAM_TARGET_BATCH` spans on the next
-/// poll, capped at ±`STREAM_ADJUST_RATIO` per call and clamped to
-/// `[STREAM_MIN_INTERVAL, STREAM_MAX_INTERVAL]`.  An observation of zero
-/// spans treats the ratio as if `count = 1` (i.e., grow by the maximum
-/// allowed amount).
-fn adjust_interval(current: Duration, count: usize) -> Duration {
-    // ZERO is a fixed point for multiplicative scaling — `ZERO.mul_f64(x)`
-    // is always ZERO, so once the controller lands on the no-sleep path it
-    // can't climb back out by itself.  That's only the right steady state
-    // when pages are genuinely full; otherwise we burn per-page lock cost
-    // on 1-span batches.  Seed back to 1 µs so the next adjustment has a
-    // non-zero base to scale from.
-    if current.is_zero() {
-        return if count >= STREAM_TARGET_BATCH {
-            Duration::ZERO
-        } else {
-            Duration::from_micros(1)
-        };
-    }
-    let ratio = STREAM_TARGET_BATCH as f64 / count.max(1) as f64;
-    let raw = current.mul_f64(ratio);
-    let max_up = current.mul_f64(1.0 + STREAM_ADJUST_RATIO);
-    let min_down = current.mul_f64(1.0 - STREAM_ADJUST_RATIO);
-    let clamped = raw.clamp(min_down, max_up);
-    let bounded = clamped.clamp(STREAM_MIN_INTERVAL, STREAM_MAX_INTERVAL);
-    // Below the OS's practical sleep resolution (~1 µs is a hard
-    // floor for tokio anyway), snap to ZERO so the loop hits the
-    // no-sleep fast path.  Without this, `mul_f64`'s round-to-
-    // -nearest gets stuck at 1 ns when shrinking by a constant
-    // ratio and the controller never crosses into "saturated".
-    if bounded < Duration::from_micros(1) {
-        Duration::ZERO
-    } else {
-        bounded
     }
 }
 
@@ -473,56 +356,6 @@ fn sampling_passes(record: &SpanRecord, rate: f64) -> bool {
     x ^= x >> 29;
     let frac = (x as f64) / (u64::MAX as f64);
     frac < rate
-}
-
-/// Filter applies to root spans only and propagates transitively.  A span
-/// passes if its root passed.  We memoise the per-root decision in
-/// `root_decisions` so descendants don't re-evaluate.
-fn filter_passes(
-    record: &SpanRecord,
-    filter: &Option<String>,
-    roots: &Arc<RwLock<HashMap<u64, bool>>>,
-) -> bool {
-    let needle = match filter {
-        None => return true,
-        Some(s) if s.is_empty() => return true,
-        Some(s) => s.as_str(),
-    };
-    // Spans without a parent are roots.  For descendants we look up the root's
-    // decision — but `parent_id` only points one level up, not at the root.
-    // Use the cache walk: if we don't have a memo for this id, and it has a
-    // parent, inherit the parent's decision (which itself was memoised when
-    // the parent was streamed earlier in this monotonic-id-ordered scan).
-    #[allow(clippy::expect_used, reason = "poisoned lock")]
-    let Some(parent_id) = record.parent_id else {
-        let decision = root_matches(record, needle);
-        roots
-            .write()
-            .expect("lock must not be poisoned")
-            .insert(record.id, decision);
-        return decision;
-    };
-    // Descendant: inherit the chain.
-    let parent_decision = {
-        #[allow(clippy::expect_used, reason = "poisoned lock")]
-        let memo = roots.read().expect("lock must not be poisoned");
-        memo.get(&parent_id).copied()
-    };
-    let decision = parent_decision.unwrap_or(false);
-    // Propagate the decision down so this span's children find it directly.
-    #[allow(clippy::expect_used, reason = "poisoned lock")]
-    roots
-        .write()
-        .expect("lock must not be poisoned")
-        .insert(record.id, decision);
-    decision
-}
-
-fn root_matches(record: &SpanRecord, needle: &str) -> bool {
-    if record.metadata.name().contains(needle) {
-        return true;
-    }
-    record.fields.iter().any(|(_, v)| v.contains(needle))
 }
 
 // ── Top-level acceptor ───────────────────────────────────────────────────────
@@ -596,14 +429,10 @@ pub async fn serve<P: EnabledPredicate>(
     // listen(addr, listen_backlog, accept_timeout) — last two are optional knobs.
     let listener = TcpSocketListener::listen(addr, 1024, None)?;
 
-    let clear_cache: Arc<dyn Fn() + Send + Sync> = {
-        let cache = Arc::clone(&cache);
-        Arc::new(move || cache.clear())
-    };
     let service = Service {
         cache,
         base: TimeBase::now(),
-        level_bus: CacheLevelBroadcast::new(level_handle, chance_handle, clear_cache),
+        level_bus: CacheLevelBroadcast::new(level_handle, chance_handle),
     };
     let server: SocketRpcServer<Service<P>, _> = SocketRpcServer::new(
         listener,
@@ -633,87 +462,6 @@ mod tests {
 
     type ClientCodec = (MessagePackSerializer<Request>, MessagePackDecoder<Response>);
 
-    // ── adjust_interval unit tests ───────────────────────────────────────────
-
-    #[test]
-    fn adjust_interval_holds_steady_at_target() {
-        let i = Duration::from_millis(50);
-        // count == target: ratio == 1.0, no change.
-        assert_eq!(adjust_interval(i, STREAM_TARGET_BATCH), i);
-    }
-
-    #[test]
-    fn adjust_interval_speeds_up_when_over_target_capped_at_20pct() {
-        // Pick a starting interval comfortably inside [MIN, MAX] so
-        // the ±20% adjustment isn't clipped by the outer clamp.
-        let i = Duration::from_millis(25);
-        // count >> target: raw ratio < 0.8, so clamped to 0.8 × current.
-        let next = adjust_interval(i, STREAM_TARGET_BATCH * 100);
-        assert_eq!(next, Duration::from_millis(20));
-    }
-
-    #[test]
-    fn adjust_interval_slows_down_when_under_target_capped_at_20pct() {
-        let i = Duration::from_millis(25);
-        // count << target (or zero): raw ratio > 1.2, so clamped to 1.2 × current.
-        let next_zero = adjust_interval(i, 0);
-        assert_eq!(next_zero, Duration::from_millis(30));
-        let next_one = adjust_interval(i, 1);
-        assert_eq!(next_one, Duration::from_millis(30));
-    }
-
-    #[test]
-    fn adjust_interval_takes_ratio_when_inside_20pct_band() {
-        // count just above target: ratio inside [0.8, 1.2].
-        let i = Duration::from_millis(25);
-        let count = STREAM_TARGET_BATCH + STREAM_TARGET_BATCH / 10;
-        let next = adjust_interval(i, count);
-        // 25 ms × target / count, with the raw value inside the
-        // ±20% band so neither the inner nor outer clamp fires.
-        let expected = i.mul_f64(STREAM_TARGET_BATCH as f64 / count as f64);
-        assert_eq!(next, expected);
-    }
-
-    #[test]
-    fn adjust_interval_clamps_to_min_floor() {
-        // At the ZERO floor with saturated batches: stays at ZERO.
-        let i = STREAM_MIN_INTERVAL;
-        let next = adjust_interval(i, STREAM_TARGET_BATCH * 100);
-        assert_eq!(next, STREAM_MIN_INTERVAL);
-    }
-
-    #[test]
-    fn adjust_interval_escapes_zero_when_batches_undersized() {
-        // At ZERO but pages are tiny: re-seed at 1 µs so multiplicative
-        // scaling has a non-zero base to climb from.
-        let next = adjust_interval(Duration::ZERO, 1);
-        assert_eq!(next, Duration::from_micros(1));
-    }
-
-    #[test]
-    fn adjust_interval_clamps_to_max_ceiling() {
-        // Already at the ceiling and observing zero spans: stays at ceiling.
-        let i = STREAM_MAX_INTERVAL;
-        let next = adjust_interval(i, 0);
-        assert_eq!(next, STREAM_MAX_INTERVAL);
-    }
-
-    #[test]
-    fn adjust_interval_reaches_min_in_bounded_steps_under_overload() {
-        // Sustained overload: each step shrinks by exactly 20%, so
-        // from 50 ms down to `STREAM_MIN_INTERVAL` (= ZERO) takes
-        // ~log_0.8(1 ns / 50 ms) ≈ 80 steps before nanosecond
-        // precision rounds the result to zero.
-        let mut i = Duration::from_millis(50);
-        let mut steps = 0;
-        while i > STREAM_MIN_INTERVAL && steps < 1000 {
-            i = adjust_interval(i, STREAM_TARGET_BATCH * 1000);
-            steps += 1;
-        }
-        assert_eq!(i, STREAM_MIN_INTERVAL);
-        assert!(steps < 100, "took {steps} steps to reach floor");
-    }
-
     /// Bind a std listener to ephemeral port, capture the port, drop it.  The
     /// next bind on this port (by `serve`) reuses it (SO_REUSEADDR is set).
     /// There's a tiny race window — fine on a developer box and CI.
@@ -724,18 +472,15 @@ mod tests {
         format!("127.0.0.1:{port}").parse().unwrap()
     }
 
-    /// Build a SpanCache, emit spans by running `f` under it, then synchronously
-    /// drain so the BTreeMap has every closed span before any test assertion.
-    fn cache_with_spans<F>(
-        f: F,
-    ) -> (
+    /// Build a SpanCache and spawn its driver so the subscriber model
+    /// can fan out closed spans live.  Tests emit spans *after*
+    /// subscribing — the cache holds no history, so anything emitted
+    /// before the first `StartStream` is lost.
+    fn prepare_cache() -> (
         Arc<SpanCache<ChancePredicate<tracing_cache::LevelPredicate>>>,
         LevelHandle,
         ChanceHandle,
-    )
-    where
-        F: FnOnce(),
-    {
+    ) {
         let level =
             tracing_cache::LevelPredicate::with_filter(tracing::metadata::LevelFilter::TRACE);
         let level_handle = level.handle();
@@ -743,10 +488,43 @@ mod tests {
         let chance_handle = predicate.handle();
         let (cache, driver) = SpanCache::with_predicate(1024, predicate);
         let cache = Arc::new(cache);
-        tracing::subscriber::with_default(Arc::clone(&cache), f);
-        cache.flush_pending();
-        driver.drain_sync();
+        tokio::spawn(driver.run());
         (cache, level_handle, chance_handle)
+    }
+
+    /// Run `f` with `cache` as the active tracing subscriber, then
+    /// flush this thread's PENDING buffer so the spans leave for the
+    /// driver immediately.
+    fn emit_under<P: EnabledPredicate>(cache: &Arc<SpanCache<P>>, f: impl FnOnce()) {
+        tracing::subscriber::with_default(Arc::clone(cache), f);
+        cache.flush_pending();
+    }
+
+    /// Drain the initial `CacheLevel` and `CacheChance` messages
+    /// `span_stream` always pushes before subscribing.  Receiving
+    /// both is the sync point that proves the subscriber is
+    /// registered, so any span emitted afterward will be fanned
+    /// out into this stream.
+    async fn wait_for_initial(
+        stream: &mut (impl futures::Stream<Item = Result<Response, protosocket_rpc::Error>> + Unpin),
+    ) {
+        let mut got_level = false;
+        let mut got_chance = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !(got_level && got_chance) && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
+                Ok(Some(Ok(resp))) => match resp.body {
+                    ResponseBody::CacheLevel(_) => got_level = true,
+                    ResponseBody::CacheChance(_) => got_chance = true,
+                    _ => {}
+                },
+                _ => break,
+            }
+        }
+        assert!(
+            got_level && got_chance,
+            "stream did not yield initial CacheLevel/CacheChance",
+        );
     }
 
     /// Spawn `serve` on a free port; return the address and a JoinHandle for
@@ -809,13 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_stream_delivers_closed_spans() {
-        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
-            for _ in 0..3 {
-                let span = tracing::span!(parent: None, tracing::Level::INFO, "test_a");
-                let _g = span.enter();
-            }
-        });
-
+        let (cache, level_handle, chance_handle) = prepare_cache();
         let (addr, server) = spawn_server(
             Arc::clone(&cache),
             level_handle.clone(),
@@ -826,11 +598,18 @@ mod tests {
         let mut stream = client
             .send_streaming(Request::new(RequestBody::StartStream))
             .unwrap();
+        wait_for_initial(&mut stream).await;
+
+        emit_under(&cache, || {
+            for _ in 0..3 {
+                let span = tracing::span!(parent: None, tracing::Level::INFO, "test_a");
+                let _g = span.enter();
+            }
+        });
 
         let received = collect_spans(&mut stream, 3, Duration::from_secs(2)).await;
         assert_eq!(received.len(), 3);
         assert!(received.iter().all(|s| s.name == "test_a"));
-        // Times present and consistent.
         assert!(received.iter().all(|s| s.closed_at_ns.is_some()));
 
         server.abort();
@@ -838,13 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_stream_halts_delivery() {
-        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
-            for _ in 0..5 {
-                let span = tracing::span!(parent: None, tracing::Level::INFO, "test_b");
-                let _g = span.enter();
-            }
-        });
-
+        let (cache, level_handle, chance_handle) = prepare_cache();
         let (addr, server) = spawn_server(
             Arc::clone(&cache),
             level_handle.clone(),
@@ -855,28 +628,37 @@ mod tests {
         let mut stream = client
             .send_streaming(Request::new(RequestBody::StartStream))
             .unwrap();
+        wait_for_initial(&mut stream).await;
 
-        // Drain at least one span so we know streaming is live.
+        // First wave: emit one span and confirm it flows through.
+        emit_under(&cache, || {
+            let _g = tracing::span!(parent: None, tracing::Level::INFO, "test_b").entered();
+        });
         let initial = collect_spans(&mut stream, 1, Duration::from_secs(2)).await;
         assert_eq!(initial.len(), 1);
 
-        // Send StopStream as a unary RPC, expect Ack.
+        // Pause delivery.
         let ack = client
             .send_unary(Request::new(RequestBody::StopStream))
             .unwrap()
             .await
             .unwrap();
         assert!(matches!(ack.body, ResponseBody::Ack));
+        // Give the streaming task a chance to observe streaming=false.
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Two ticks (50ms each) should be enough for the loop to read
-        // streaming=false. Then ensure no further spans arrive in 300ms.
-        let drained_after_stop = collect_spans(&mut stream, 100, Duration::from_millis(300)).await;
-        // The race window allows up to a single tick's batch in flight; assert
-        // the stream eventually quiesces rather than that exactly zero land.
+        // Second wave: emit 5 spans; the server should drain them but
+        // not forward any to the client.
+        emit_under(&cache, || {
+            for _ in 0..5 {
+                let _g = tracing::span!(parent: None, tracing::Level::INFO, "test_b").entered();
+            }
+        });
+        let drained_after_stop = collect_spans(&mut stream, 5, Duration::from_millis(300)).await;
         assert!(
             drained_after_stop.len() < 5,
             "stream did not stop: got {} more spans after StopStream",
-            drained_after_stop.len()
+            drained_after_stop.len(),
         );
 
         server.abort();
@@ -884,15 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_level_filters_below_threshold() {
-        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
-            // The cache predicate is TRACE so DEBUG is captured; the host's
-            // SetLevel must be the thing that filters DEBUG on the wire.
-            let span_info = tracing::span!(parent: None, tracing::Level::INFO, "info_span");
-            drop(span_info);
-            let span_debug = tracing::span!(parent: None, tracing::Level::DEBUG, "debug_span");
-            drop(span_debug);
-        });
-
+        let (cache, level_handle, chance_handle) = prepare_cache();
         let (addr, server) = spawn_server(
             Arc::clone(&cache),
             level_handle.clone(),
@@ -911,8 +685,16 @@ mod tests {
         let mut stream = client
             .send_streaming(Request::new(RequestBody::StartStream))
             .unwrap();
-        let received = collect_spans(&mut stream, 5, Duration::from_millis(500)).await;
+        wait_for_initial(&mut stream).await;
 
+        // The cache predicate is TRACE so both spans reach the driver;
+        // the host's SetLevel must be what filters DEBUG on the wire.
+        emit_under(&cache, || {
+            drop(tracing::span!(parent: None, tracing::Level::INFO, "info_span"));
+            drop(tracing::span!(parent: None, tracing::Level::DEBUG, "debug_span"));
+        });
+
+        let received = collect_spans(&mut stream, 2, Duration::from_millis(500)).await;
         let names: Vec<_> = received.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["info_span"], "got: {names:?}");
 
@@ -921,13 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_sampling_rate_zero_drops_all() {
-        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
-            for _ in 0..5 {
-                let span = tracing::span!(parent: None, tracing::Level::INFO, "sampled");
-                let _g = span.enter();
-            }
-        });
-
+        let (cache, level_handle, chance_handle) = prepare_cache();
         let (addr, server) = spawn_server(
             Arc::clone(&cache),
             level_handle.clone(),
@@ -944,55 +720,19 @@ mod tests {
         let mut stream = client
             .send_streaming(Request::new(RequestBody::StartStream))
             .unwrap();
+        wait_for_initial(&mut stream).await;
+
+        emit_under(&cache, || {
+            for _ in 0..5 {
+                let _g = tracing::span!(parent: None, tracing::Level::INFO, "sampled").entered();
+            }
+        });
 
         let received = collect_spans(&mut stream, 5, Duration::from_millis(400)).await;
         assert!(
             received.is_empty(),
-            "rate=0 should drop everything; got {received:?}"
+            "rate=0 should drop everything; got {received:?}",
         );
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn set_filter_matches_root_and_inherits_to_children() {
-        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
-            // Two trees; "alpha" matches the filter, "beta" doesn't.
-            {
-                let root = tracing::span!(parent: None, tracing::Level::INFO, "alpha");
-                let _g = root.enter();
-                let _child = tracing::span!(tracing::Level::INFO, "alpha_child");
-            }
-            {
-                let root = tracing::span!(parent: None, tracing::Level::INFO, "beta");
-                let _g = root.enter();
-                let _child = tracing::span!(tracing::Level::INFO, "beta_child");
-            }
-        });
-
-        let (addr, server) = spawn_server(
-            Arc::clone(&cache),
-            level_handle.clone(),
-            chance_handle.clone(),
-        )
-        .await;
-        let client = connect_client(addr).await;
-
-        client
-            .send_unary(Request::new(RequestBody::SetFilter(Some(
-                "alpha".to_string(),
-            ))))
-            .unwrap()
-            .await
-            .unwrap();
-        let mut stream = client
-            .send_streaming(Request::new(RequestBody::StartStream))
-            .unwrap();
-
-        let received = collect_spans(&mut stream, 4, Duration::from_millis(500)).await;
-        let mut names: Vec<_> = received.iter().map(|s| s.name.clone()).collect();
-        names.sort();
-        assert_eq!(names, vec!["alpha".to_string(), "alpha_child".to_string()]);
 
         server.abort();
     }
@@ -1002,11 +742,7 @@ mod tests {
     /// existing stream and continue streaming spans after.
     #[tokio::test]
     async fn set_cache_level_keeps_stream_open() {
-        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
-            // Pre-populate a span so the stream has content to deliver.
-            let s = tracing::span!(parent: None, tracing::Level::INFO, "pre_level");
-            drop(s);
-        });
+        let (cache, level_handle, chance_handle) = prepare_cache();
         let (addr, server) = spawn_server(
             Arc::clone(&cache),
             level_handle.clone(),
@@ -1070,10 +806,7 @@ mod tests {
     /// the initial CacheLevel is OFF.
     #[tokio::test]
     async fn level_resets_to_off_when_last_console_disconnects() {
-        let (cache, level_handle, chance_handle) = cache_with_spans(|| {
-            let s = tracing::span!(parent: None, tracing::Level::INFO, "anchor");
-            drop(s);
-        });
+        let (cache, level_handle, chance_handle) = prepare_cache();
         // Start at INFO via the cache predicate handle.
         level_handle.set(LevelFilter::INFO);
 
@@ -1109,7 +842,7 @@ mod tests {
         server.abort();
     }
 
-    // ── sampling_passes / filter_passes unit tests ───────────────────────────
+    // ── sampling_passes unit tests ───────────────────────────────────────────
 
     use std::time::Instant;
     use tracing::callsite::{Callsite, DefaultCallsite, Identifier};
@@ -1206,46 +939,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filter_passes_descendant_inherits_root_decision_via_memo() {
-        let filter = Some("alpha".to_string());
-        let roots: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
-        // Pre-populate the memo with parent=42 mapped to `false`.
-        roots.write().unwrap().insert(42, false);
-
-        // A child whose `parent_id = Some(42)` inherits the parent's
-        // `false` regardless of its own metadata name.
-        let child = synth_span(43, Some(42));
-        assert!(!filter_passes(&child, &filter, &roots));
-        // The child's id is now also memoised so its children inherit.
-        assert_eq!(roots.read().unwrap().get(&43).copied(), Some(false));
-    }
-
-    #[test]
-    fn filter_passes_root_caches_match_in_memo() {
-        // Root with name == "sampling_test" matches "sampling".
-        let filter = Some("sampling".to_string());
-        let roots: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
-        let root = synth_span(10, None);
-        assert!(filter_passes(&root, &filter, &roots));
-        assert_eq!(roots.read().unwrap().get(&10).copied(), Some(true));
-    }
-
-    #[test]
-    fn filter_passes_empty_or_none_filter_accepts_everything() {
-        let roots: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
-        let s = synth_span(1, None);
-        assert!(filter_passes(&s, &None, &roots));
-        assert!(filter_passes(&s, &Some(String::new()), &roots));
-        // Neither path should touch the memo.
-        assert!(roots.read().unwrap().is_empty());
-    }
-
     // ── SetSamplingRate RPC validation ───────────────────────────────────────
 
     #[tokio::test]
     async fn set_sampling_rate_rejects_out_of_range() {
-        let (cache, level_handle, chance_handle) = cache_with_spans(|| {});
+        let (cache, level_handle, chance_handle) = prepare_cache();
         let (addr, server) = spawn_server(
             Arc::clone(&cache),
             level_handle.clone(),
