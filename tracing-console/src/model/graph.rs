@@ -18,6 +18,12 @@ use crate::aggregate::Aggregator;
 pub enum ViewMode {
     Table,
     Graph(GraphState),
+    /// `e` from the stacks table — lists each individual span
+    /// instance whose stack matches the highlighted bucket.
+    Explore(super::explore::ExploreState),
+    /// Enter on an explore row — the full trace tree rooted at
+    /// the selected span's root.
+    TraceDetail(super::explore::TraceDetailState),
 }
 
 /// Which sample a span contributes to the graph.  `Total` is the

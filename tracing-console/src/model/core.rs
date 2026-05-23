@@ -42,6 +42,27 @@ fn backspace_modal(slot: &mut Option<String>) {
     }
 }
 
+/// Resolve the span id at the trace-detail cursor.  Returns
+/// `None` if the cursor is parked on an event row, or if the
+/// trace tree is empty (e.g. the root has been evicted).
+/// Split out so the Expand / Collapse arms can borrow the model
+/// immutably for `visible_trace_rows`, then re-borrow mutably to
+/// flip the collapsed set.
+fn trace_selected_span_id(model: &Model) -> Option<u64> {
+    let ViewMode::TraceDetail(td) = &model.view else {
+        return None;
+    };
+    let rows = super::explore::visible_trace_rows(model, td);
+    if rows.is_empty() {
+        return None;
+    }
+    let idx = td.selected_idx.min(rows.len() - 1);
+    match rows[idx] {
+        super::explore::TraceRow::Span { id, .. } => Some(id),
+        super::explore::TraceRow::Event { .. } => None,
+    }
+}
+
 /// Append `c` to `buf` if it's a digit, or if it's `.` and `buf`
 /// doesn't already have one.  Returns whether the char was kept.
 /// Shared by the chance / window / lookback char filters.
@@ -417,7 +438,8 @@ impl Model {
                         Some(row) => ViewMode::Graph(GraphState::new(row.key.stack)),
                         None => ViewMode::Table,
                     },
-                    ViewMode::Graph(_) => ViewMode::Table,
+                    // From any non-table view, `g` returns to the stack table.
+                    _ => ViewMode::Table,
                 };
                 // If we just entered graph mode, prime the store
                 // from the aggregator's ring so the chart isn't empty
@@ -754,6 +776,234 @@ impl Model {
                         _ => cols.first().cloned().unwrap_or(SortColumn::Count),
                     };
                     gs.sort_column = next;
+                }
+                Effect::None
+            }
+            // ── Explore view ────────────────────────────────────
+            Update::EnterExplore => {
+                // Resolve the locked stack from whichever view we're
+                // in, so `e` works consistently from anywhere:
+                //   * Table — the cursor row's bucket.
+                //   * Graph — the graph's locked stack.
+                //   * TraceDetail — the embedded explore state, just
+                //     pop back up (no fresh level capture).
+                //   * Explore — no-op.
+                let locked_stack = match &self.view {
+                    ViewMode::Table => {
+                        let Some(row) = self.selected_visible_row() else {
+                            return Effect::None;
+                        };
+                        row.key.stack
+                    }
+                    ViewMode::Graph(gs) => gs.locked_stack.clone(),
+                    ViewMode::TraceDetail(_) => {
+                        if let ViewMode::TraceDetail(td) =
+                            std::mem::replace(&mut self.view, ViewMode::Table)
+                        {
+                            self.view = ViewMode::Explore(td.explore);
+                        }
+                        return Effect::None;
+                    }
+                    ViewMode::Explore(_) => return Effect::None,
+                };
+                let restore = self.cache_level;
+                let es = super::explore::ExploreState::new(locked_stack, restore);
+                self.view = ViewMode::Explore(es);
+                // Set the cache level to Off so the screen doesn't
+                // churn while the user explores.  Restored on exit.
+                Effect::RequestSetLevel(WireLevelFilter::Off)
+            }
+            Update::ExitExplore => {
+                let es = match std::mem::replace(&mut self.view, ViewMode::Table) {
+                    ViewMode::Explore(es) => Some(es),
+                    ViewMode::TraceDetail(td) => Some(td.explore),
+                    other => {
+                        self.view = other;
+                        None
+                    }
+                };
+                if let Some(es) = es {
+                    let restore = es.restore_level.unwrap_or(WireLevelFilter::Trace);
+                    return Effect::RequestSetLevel(restore);
+                }
+                Effect::None
+            }
+            Update::ExploreSelectUp => {
+                if let ViewMode::Explore(es) = &mut self.view {
+                    es.selected = es.selected.saturating_sub(1);
+                }
+                Effect::None
+            }
+            Update::ExploreSelectDown => {
+                if let ViewMode::Explore(es) = &mut self.view {
+                    es.selected = es.selected.saturating_add(1);
+                }
+                Effect::None
+            }
+            Update::ExploreSortLeft | Update::ExploreSortRight => {
+                let delta_right = matches!(update, Update::ExploreSortRight);
+                let fields = if let ViewMode::Explore(es) = &self.view {
+                    let spans =
+                        super::explore::matching_spans(self, es);
+                    super::explore::distinguishing_fields(&spans)
+                } else {
+                    return Effect::None;
+                };
+                if let ViewMode::Explore(es) = &mut self.view {
+                    if delta_right {
+                        super::explore::cycle_sort_right(es, &fields);
+                    } else {
+                        super::explore::cycle_sort_left(es, &fields);
+                    }
+                }
+                Effect::None
+            }
+            Update::ExploreInvertSort => {
+                if let ViewMode::Explore(es) = &mut self.view {
+                    es.direction = es.direction.flip();
+                }
+                Effect::None
+            }
+            Update::BeginExploreSearch => {
+                if let ViewMode::Explore(es) = &mut self.view {
+                    open_modal(&mut es.search_input);
+                    es.selected = 0;
+                }
+                Effect::None
+            }
+            Update::ExploreSearchChar(c) => {
+                if let ViewMode::Explore(es) = &mut self.view {
+                    if let Some(buf) = es.search_input.as_mut() {
+                        if !c.is_control() {
+                            buf.push(c);
+                        }
+                    }
+                }
+                Effect::None
+            }
+            Update::ExploreSearchBackspace => {
+                if let ViewMode::Explore(es) = &mut self.view {
+                    backspace_modal(&mut es.search_input);
+                }
+                Effect::None
+            }
+            Update::ExploreSearchCancel => {
+                if let ViewMode::Explore(es) = &mut self.view {
+                    close_modal(&mut es.search_input);
+                    es.selected = 0;
+                }
+                Effect::None
+            }
+            Update::ExploreSearchCommit => {
+                if let ViewMode::Explore(es) = &mut self.view {
+                    if let Some(buf) = es.search_input.take() {
+                        es.query = buf;
+                        es.selected = 0;
+                    }
+                }
+                Effect::None
+            }
+            Update::ExploreOpenTrace => {
+                let (span_id, es) = if let ViewMode::Explore(es) = &self.view {
+                    let spans =
+                        super::explore::matching_spans(self, es);
+                    if spans.is_empty() {
+                        return Effect::None;
+                    }
+                    let idx = es.selected.min(spans.len() - 1);
+                    (spans[idx].id, es.clone())
+                } else {
+                    return Effect::None;
+                };
+                let Some(root_id) =
+                    super::explore::find_root_id(self, span_id)
+                else {
+                    return Effect::None;
+                };
+                self.view = ViewMode::TraceDetail(super::explore::TraceDetailState {
+                    root_id,
+                    selected_idx: 0,
+                    collapsed: std::collections::BTreeSet::new(),
+                    explore: es,
+                });
+                Effect::None
+            }
+            Update::ExitTraceDetail => {
+                if let ViewMode::TraceDetail(td) =
+                    std::mem::replace(&mut self.view, ViewMode::Table)
+                {
+                    self.view = ViewMode::Explore(td.explore);
+                }
+                Effect::None
+            }
+            Update::TraceDetailSelectUp => {
+                if let ViewMode::TraceDetail(td) = &mut self.view {
+                    td.selected_idx = td.selected_idx.saturating_sub(1);
+                }
+                Effect::None
+            }
+            Update::TraceDetailSelectDown => {
+                if let ViewMode::TraceDetail(td) = &mut self.view {
+                    // Cap is enforced at render time against the
+                    // visible-row count.  Saturate here.
+                    td.selected_idx = td.selected_idx.saturating_add(1);
+                }
+                Effect::None
+            }
+            Update::TraceDetailExpand => {
+                if let Some(id) = trace_selected_span_id(self) {
+                    if let ViewMode::TraceDetail(td) = &mut self.view {
+                        td.collapsed.remove(&id);
+                    }
+                }
+                Effect::None
+            }
+            Update::TraceDetailCollapse => {
+                if let Some(id) = trace_selected_span_id(self) {
+                    if let ViewMode::TraceDetail(td) = &mut self.view {
+                        td.collapsed.insert(id);
+                    }
+                }
+                Effect::None
+            }
+            Update::EnterTable => {
+                let prior = std::mem::replace(&mut self.view, ViewMode::Table);
+                match prior {
+                    ViewMode::Explore(es) => {
+                        let restore = es.restore_level.unwrap_or(WireLevelFilter::Trace);
+                        Effect::RequestSetLevel(restore)
+                    }
+                    ViewMode::TraceDetail(td) => {
+                        let restore = td.explore.restore_level.unwrap_or(WireLevelFilter::Trace);
+                        Effect::RequestSetLevel(restore)
+                    }
+                    _ => Effect::None,
+                }
+            }
+            Update::EnterGraph => {
+                // Source: current view's locked stack.  Also
+                // captures whether we need to restore the cache
+                // level (only if leaving Explore / TraceDetail).
+                let (locked, restore) = match &self.view {
+                    ViewMode::Table => match self.selected_visible_row() {
+                        Some(row) => (row.key.stack, None),
+                        None => return Effect::None,
+                    },
+                    ViewMode::Graph(_) => return Effect::None,
+                    ViewMode::Explore(es) => (
+                        es.locked_stack.clone(),
+                        Some(es.restore_level.unwrap_or(WireLevelFilter::Trace)),
+                    ),
+                    ViewMode::TraceDetail(td) => (
+                        td.explore.locked_stack.clone(),
+                        Some(td.explore.restore_level.unwrap_or(WireLevelFilter::Trace)),
+                    ),
+                };
+                let mut gs = GraphState::new(locked);
+                gs.rehydrate(&self.agg);
+                self.view = ViewMode::Graph(gs);
+                if let Some(level) = restore {
+                    return Effect::RequestSetLevel(level);
                 }
                 Effect::None
             }

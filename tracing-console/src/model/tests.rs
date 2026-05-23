@@ -253,7 +253,7 @@ fn timed_span_with_field(
 fn current_graph(m: &Model) -> &GraphState {
     match &m.view {
         ViewMode::Graph(gs) => gs,
-        ViewMode::Table => panic!("expected graph view, got table"),
+        other => panic!("expected graph view, got {other:?}"),
     }
 }
 
@@ -1465,4 +1465,327 @@ fn graph_window_input_commit_rejects_nan_and_inf_at_commit_stage() {
         );
         assert!(gs.window_input.is_none(), "buffer must drain on commit");
     }
+}
+
+// ── Explore mode ────────────────────────────────────────────
+
+fn current_explore(m: &Model) -> &ExploreState {
+    match &m.view {
+        ViewMode::Explore(es) => es,
+        other => panic!("expected explore view, got {other:?}"),
+    }
+}
+
+#[test]
+fn enter_explore_requires_a_selected_row_and_sets_level_off() {
+    let mut m = Model::new(8);
+    // No rows yet — pressing `e` is a no-op.
+    let eff = m.apply(Update::EnterExplore);
+    assert_eq!(eff, Effect::None);
+    assert!(matches!(m.view, ViewMode::Table));
+
+    // With a row present, EnterExplore locks onto its stack and
+    // emits a `RequestSetLevel(Off)` so producers stop streaming.
+    m.apply(Update::SpanReceived(span(10, "root")));
+    let eff = m.apply(Update::EnterExplore);
+    assert_eq!(eff, Effect::RequestSetLevel(WireLevelFilter::Off));
+    let es = current_explore(&m);
+    assert_eq!(es.locked_stack, vec!["root".to_string()]);
+}
+
+#[test]
+fn exit_explore_restores_the_prior_cache_level() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "root")));
+    // Pretend the server confirmed Info before we entered.
+    m.apply(Update::CacheLevelReceived(WireLevelFilter::Info));
+    m.apply(Update::EnterExplore);
+    let eff = m.apply(Update::ExitExplore);
+    assert_eq!(eff, Effect::RequestSetLevel(WireLevelFilter::Info));
+    assert!(matches!(m.view, ViewMode::Table));
+}
+
+#[test]
+fn exit_explore_with_unknown_prior_level_defaults_to_trace() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "root")));
+    // No CacheLevelReceived yet → restore_level == None.
+    m.apply(Update::EnterExplore);
+    let eff = m.apply(Update::ExitExplore);
+    assert_eq!(eff, Effect::RequestSetLevel(WireLevelFilter::Trace));
+}
+
+#[test]
+fn explore_search_filters_by_field_value() {
+    let mut m = Model::new(16);
+    m.apply(Update::SpanReceived(span_with_field(10, "root", None, "api", "fetch")));
+    m.apply(Update::SpanReceived(span_with_field(11, "root", None, "api", "post")));
+    m.apply(Update::SpanReceived(span_with_field(12, "root", None, "api", "delete")));
+    m.apply(Update::EnterExplore);
+    // No filter → all 3 visible.
+    let es = current_explore(&m);
+    assert_eq!(crate::model::explore::matching_spans(&m, es).len(), 3);
+
+    // Live-filter by typing "fe" — only `fetch` matches.
+    m.apply(Update::BeginExploreSearch);
+    m.apply(Update::ExploreSearchChar('f'));
+    m.apply(Update::ExploreSearchChar('e'));
+    let es = current_explore(&m);
+    assert_eq!(crate::model::explore::matching_spans(&m, es).len(), 1);
+
+    // Commit then cancel resets selected to 0; filter persists.
+    m.apply(Update::ExploreSearchCommit);
+    let es = current_explore(&m);
+    assert!(es.search_input.is_none());
+    assert_eq!(es.query, "fe");
+    assert_eq!(crate::model::explore::matching_spans(&m, es).len(), 1);
+}
+
+#[test]
+fn explore_search_cancel_keeps_prior_committed_query() {
+    let mut m = Model::new(16);
+    m.apply(Update::SpanReceived(span_with_field(10, "root", None, "api", "fetch")));
+    m.apply(Update::EnterExplore);
+    // Commit "fetch" then open a fresh search and Esc — original
+    // query is preserved.
+    m.apply(Update::BeginExploreSearch);
+    for c in "fetch".chars() {
+        m.apply(Update::ExploreSearchChar(c));
+    }
+    m.apply(Update::ExploreSearchCommit);
+    assert_eq!(current_explore(&m).query, "fetch");
+    m.apply(Update::BeginExploreSearch);
+    m.apply(Update::ExploreSearchChar('x'));
+    m.apply(Update::ExploreSearchCancel);
+    assert_eq!(current_explore(&m).query, "fetch");
+}
+
+#[test]
+fn explore_open_trace_swaps_to_trace_detail_keeping_explore_state() {
+    let mut m = Model::new(16);
+    let mut s = span(10, "root");
+    s.opened_at_ns = 0;
+    s.closed_at_ns = Some(100);
+    m.apply(Update::SpanReceived(s));
+    m.apply(Update::EnterExplore);
+    m.apply(Update::ExploreOpenTrace);
+    match &m.view {
+        ViewMode::TraceDetail(td) => {
+            assert_eq!(td.root_id, 10);
+            assert_eq!(td.selected_idx, 0);
+            assert!(td.collapsed.is_empty());
+            assert_eq!(td.explore.locked_stack, vec!["root".to_string()]);
+        }
+        other => panic!("expected trace detail, got {other:?}"),
+    }
+    // Esc goes back to explore with the same locked stack.
+    m.apply(Update::ExitTraceDetail);
+    assert_eq!(current_explore(&m).locked_stack, vec!["root".to_string()]);
+}
+
+#[test]
+fn explore_sort_cycle_walks_time_latency_then_field_columns() {
+    let mut m = Model::new(16);
+    // Two distinct field values → "api" becomes a distinguishing column.
+    m.apply(Update::SpanReceived(span_with_field(10, "root", None, "api", "a")));
+    m.apply(Update::SpanReceived(span_with_field(11, "root", None, "api", "b")));
+    m.apply(Update::EnterExplore);
+    assert_eq!(current_explore(&m).sort, ExploreSortColumn::Timestamp);
+    m.apply(Update::ExploreSortRight);
+    assert_eq!(current_explore(&m).sort, ExploreSortColumn::Latency);
+    m.apply(Update::ExploreSortRight);
+    assert_eq!(
+        current_explore(&m).sort,
+        ExploreSortColumn::Field("api".into()),
+    );
+    // Wraps back to Timestamp.
+    m.apply(Update::ExploreSortRight);
+    assert_eq!(current_explore(&m).sort, ExploreSortColumn::Timestamp);
+    // Left goes the other direction.
+    m.apply(Update::ExploreSortLeft);
+    assert_eq!(
+        current_explore(&m).sort,
+        ExploreSortColumn::Field("api".into()),
+    );
+}
+
+#[test]
+fn explore_invert_sort_flips_direction_and_reorders() {
+    let mut m = Model::new(16);
+    let mut a = span(10, "root");
+    a.opened_at_ns = 0;
+    a.closed_at_ns = Some(100);
+    let mut b = span(11, "root");
+    b.opened_at_ns = 500;
+    b.closed_at_ns = Some(600);
+    m.apply(Update::SpanReceived(a));
+    m.apply(Update::SpanReceived(b));
+    m.apply(Update::EnterExplore);
+    // Time defaults to descending — newest first.
+    let ids: Vec<u64> = crate::model::explore::matching_spans(&m, current_explore(&m))
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec![11, 10]);
+    // `i` flips to ascending — oldest first.
+    m.apply(Update::ExploreInvertSort);
+    let ids: Vec<u64> = crate::model::explore::matching_spans(&m, current_explore(&m))
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec![10, 11]);
+}
+
+#[test]
+fn explore_cycle_sort_resets_direction_to_new_columns_default() {
+    let mut m = Model::new(16);
+    m.apply(Update::SpanReceived(span_with_field(10, "root", None, "api", "a")));
+    m.apply(Update::SpanReceived(span_with_field(11, "root", None, "api", "b")));
+    m.apply(Update::EnterExplore);
+    // Time default = descending; flip to ascending.
+    m.apply(Update::ExploreInvertSort);
+    assert_eq!(
+        current_explore(&m).direction,
+        crate::model::explore::SortDirection::Asc,
+    );
+    // Cycling to Latency resets direction to *its* default (Desc).
+    m.apply(Update::ExploreSortRight);
+    assert_eq!(current_explore(&m).sort, ExploreSortColumn::Latency);
+    assert_eq!(
+        current_explore(&m).direction,
+        crate::model::explore::SortDirection::Desc,
+    );
+    // Field columns default to ascending.
+    m.apply(Update::ExploreSortRight);
+    assert_eq!(
+        current_explore(&m).sort,
+        ExploreSortColumn::Field("api".into()),
+    );
+    assert_eq!(
+        current_explore(&m).direction,
+        crate::model::explore::SortDirection::Asc,
+    );
+}
+
+#[test]
+fn explore_default_sort_orders_newest_span_first() {
+    // Regression: time sort must be descending (newest at the
+    // top) so the user reads down chronologically backward.
+    let mut m = Model::new(16);
+    let mut a = span(10, "root");
+    a.opened_at_ns = 0;
+    a.closed_at_ns = Some(100);
+    let mut b = span(11, "root");
+    b.opened_at_ns = 500;
+    b.closed_at_ns = Some(600);
+    let mut c = span(12, "root");
+    c.opened_at_ns = 1000;
+    c.closed_at_ns = Some(1100);
+    m.apply(Update::SpanReceived(a));
+    m.apply(Update::SpanReceived(b));
+    m.apply(Update::SpanReceived(c));
+    m.apply(Update::EnterExplore);
+    let es = current_explore(&m);
+    let ids: Vec<u64> = crate::model::explore::matching_spans(&m, es)
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec![12, 11, 10]);
+}
+
+#[test]
+fn enter_table_from_explore_restores_level() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "root")));
+    m.apply(Update::CacheLevelReceived(WireLevelFilter::Debug));
+    m.apply(Update::EnterExplore);
+    let eff = m.apply(Update::EnterTable);
+    assert_eq!(eff, Effect::RequestSetLevel(WireLevelFilter::Debug));
+    assert!(matches!(m.view, ViewMode::Table));
+}
+
+#[test]
+fn enter_table_from_trace_detail_pops_all_the_way_up() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "root")));
+    m.apply(Update::CacheLevelReceived(WireLevelFilter::Info));
+    m.apply(Update::EnterExplore);
+    m.apply(Update::ExploreOpenTrace);
+    assert!(matches!(m.view, ViewMode::TraceDetail(_)));
+    // `s` from trace-detail must skip explore entirely and land
+    // on the stacks table, while still restoring the level.
+    let eff = m.apply(Update::EnterTable);
+    assert_eq!(eff, Effect::RequestSetLevel(WireLevelFilter::Info));
+    assert!(matches!(m.view, ViewMode::Table));
+}
+
+#[test]
+fn enter_explore_from_graph_carries_locked_stack_and_sets_level_off() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "root")));
+    m.apply(Update::CacheLevelReceived(WireLevelFilter::Info));
+    m.apply(Update::ToggleGraph);
+    assert!(matches!(m.view, ViewMode::Graph(_)));
+    // `e` from graph mode opens explore on the graph's locked
+    // stack and silences ingest until exit.
+    let eff = m.apply(Update::EnterExplore);
+    assert_eq!(eff, Effect::RequestSetLevel(WireLevelFilter::Off));
+    let es = current_explore(&m);
+    assert_eq!(es.locked_stack, vec!["root".to_string()]);
+    assert_eq!(es.restore_level, Some(WireLevelFilter::Info));
+}
+
+#[test]
+fn enter_graph_from_explore_carries_locked_stack_and_restores_level() {
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(span(10, "root")));
+    m.apply(Update::CacheLevelReceived(WireLevelFilter::Trace));
+    m.apply(Update::EnterExplore);
+    let eff = m.apply(Update::EnterGraph);
+    // Leaving Explore re-enables the previously-confirmed level.
+    assert_eq!(eff, Effect::RequestSetLevel(WireLevelFilter::Trace));
+    match &m.view {
+        ViewMode::Graph(gs) => assert_eq!(gs.locked_stack, vec!["root".to_string()]),
+        other => panic!("expected graph, got {other:?}"),
+    }
+}
+
+#[test]
+fn trace_detail_collapse_then_expand_round_trip() {
+    let mut m = Model::new(16);
+    let mut root = span(10, "root");
+    root.opened_at_ns = 0;
+    root.closed_at_ns = Some(100);
+    let mut child = span_with_parent(11, "child", Some(10));
+    child.opened_at_ns = 10;
+    child.closed_at_ns = Some(50);
+    m.apply(Update::SpanReceived(root));
+    m.apply(Update::SpanReceived(child));
+    m.apply(Update::EnterExplore);
+    m.apply(Update::ExploreOpenTrace);
+    // Cursor sits on the root by default.  Collapse hides the
+    // child; expand reveals it again.
+    let before = match &m.view {
+        ViewMode::TraceDetail(td) => crate::model::explore::visible_trace_rows(&m, td).len(),
+        _ => panic!("expected trace detail"),
+    };
+    assert_eq!(before, 2);
+    m.apply(Update::TraceDetailCollapse);
+    let after_collapse = match &m.view {
+        ViewMode::TraceDetail(td) => {
+            assert!(td.collapsed.contains(&10));
+            crate::model::explore::visible_trace_rows(&m, td).len()
+        }
+        _ => panic!("expected trace detail"),
+    };
+    assert_eq!(after_collapse, 1, "child must hide when root collapses");
+    m.apply(Update::TraceDetailExpand);
+    let after_expand = match &m.view {
+        ViewMode::TraceDetail(td) => {
+            assert!(td.collapsed.is_empty());
+            crate::model::explore::visible_trace_rows(&m, td).len()
+        }
+        _ => panic!("expected trace detail"),
+    };
+    assert_eq!(after_expand, 2);
 }

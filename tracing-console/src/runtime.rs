@@ -279,27 +279,28 @@ async fn run_tui(
     history_budget: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     // Two flags the keyboard loop reads to dispatch correctly:
     //
-    //   modal_kind — which numeric-input modal (if any) currently
+    //   modal_kind — which text-input modal (if any) currently
     //   owns the keystroke set: digits / `.` / Backspace / Enter /
-    //   Esc.  Encoded as a small enum (see MODAL_* constants).
+    //   Esc, plus the free-form explore search.  Encoded as a
+    //   small enum (see MODAL_* constants).
     //
-    //   in_graph_view — whether the table or graph view is active.
-    //   Controls which top-level binding table applies (e.g. `a`
-    //   is bound in graph mode but free in table mode).
+    //   current_view — which top-level view is active.  Controls
+    //   which top-level binding table applies (e.g. `a` is bound
+    //   in graph mode, free in table, search-input in explore).
     //
     // The runtime keeps both in sync with `model` after each
     // `model.apply`.
     let modal_kind = Arc::new(AtomicU8::new(MODAL_NONE));
-    let in_graph_view = Arc::new(AtomicBool::new(false));
+    let current_view = Arc::new(AtomicU8::new(VIEW_TABLE));
 
     let kb_tx = tx.clone();
     let kb_modal = Arc::clone(&modal_kind);
-    let kb_graph = Arc::clone(&in_graph_view);
-    std::thread::spawn(move || keyboard_loop(kb_tx, kb_modal, kb_graph));
+    let kb_view = Arc::clone(&current_view);
+    std::thread::spawn(move || keyboard_loop(kb_tx, kb_modal, kb_view));
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -347,14 +348,23 @@ async fn run_tui(
                                     } else {
                                         MODAL_NONE
                                     }
+                                } else if let ViewMode::Explore(es) = &model.view {
+                                    if es.search_input.is_some() {
+                                        MODAL_EXPLORE_SEARCH
+                                    } else {
+                                        MODAL_NONE
+                                    }
                                 } else {
                                     MODAL_NONE
                                 };
                                 modal_kind.store(kind, Ordering::Relaxed);
-                                in_graph_view.store(
-                                    matches!(model.view, ViewMode::Graph(_)),
-                                    Ordering::Relaxed,
-                                );
+                                let view_tag = match &model.view {
+                                    ViewMode::Table => VIEW_TABLE,
+                                    ViewMode::Graph(_) => VIEW_GRAPH,
+                                    ViewMode::Explore(_) => VIEW_EXPLORE,
+                                    ViewMode::TraceDetail(_) => VIEW_TRACE_DETAIL,
+                                };
+                                current_view.store(view_tag, Ordering::Relaxed);
                             }
                         }
                         None => return Ok(()),
@@ -383,11 +393,20 @@ const MODAL_CHANCE: u8 = 1;
 const MODAL_GRAPH_AGG: u8 = 2;
 const MODAL_GRAPH_WINDOW: u8 = 3;
 const MODAL_GRAPH_LOOKBACK: u8 = 4;
+const MODAL_EXPLORE_SEARCH: u8 = 5;
+
+// `current_view` mirrors `model.view`'s variant tag.  The
+// keyboard loop reads this to pick the right binding table for
+// non-modal keys.
+const VIEW_TABLE: u8 = 0;
+const VIEW_GRAPH: u8 = 1;
+const VIEW_EXPLORE: u8 = 2;
+const VIEW_TRACE_DETAIL: u8 = 3;
 
 fn keyboard_loop(
     tx: spillway::Sender<Update>,
     modal_kind: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    in_graph_view: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    current_view: std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -438,6 +457,10 @@ fn keyboard_loop(
                 (MODAL_GRAPH_LOOKBACK, KeyCode::Backspace) => Update::GraphLookbackInputBackspace,
                 (MODAL_GRAPH_LOOKBACK, KeyCode::Enter) => Update::GraphLookbackInputCommit,
                 (MODAL_GRAPH_LOOKBACK, KeyCode::Esc) => Update::GraphLookbackInputCancel,
+                (MODAL_EXPLORE_SEARCH, KeyCode::Char(c)) => Update::ExploreSearchChar(c),
+                (MODAL_EXPLORE_SEARCH, KeyCode::Backspace) => Update::ExploreSearchBackspace,
+                (MODAL_EXPLORE_SEARCH, KeyCode::Enter) => Update::ExploreSearchCommit,
+                (MODAL_EXPLORE_SEARCH, KeyCode::Esc) => Update::ExploreSearchCancel,
                 _ => continue,
             };
             if send_or_exit(update).is_break() {
@@ -464,16 +487,22 @@ fn keyboard_loop(
             continue;
         }
 
-        let in_graph = in_graph_view.load(Ordering::Relaxed);
+        let view = current_view.load(Ordering::Relaxed);
+
         // Graph-mode bindings.  `g` and `Esc` exit graph mode; the
         // rest configure the view.  When `gs.focus == Details` the
         // model itself routes j/k/Space to the split-keys cursor;
         // we always emit GraphSelectUp/Down/Toggle here.  When in
         // Chart focus, `Tab` switches focus into Details.
-        if in_graph {
+        if view == VIEW_GRAPH {
             let update = match k.code {
                 KeyCode::Char('q') => Update::Quit,
-                KeyCode::Char('g') | KeyCode::Esc => Update::ToggleGraph,
+                KeyCode::Esc => Update::ToggleGraph,
+                // View switcher: `s` → stacks, `e` → explore on the
+                // graph's currently-locked stack.  The hint hides
+                // `g` (current view) but shows both `s` and `e`.
+                KeyCode::Char('s') => Update::EnterTable,
+                KeyCode::Char('e') => Update::EnterExplore,
                 // `a` opens the aggregation-input modal; the buffer
                 // accepts `a`/`avg`, `min`, `max`, or `pX[.XX]`.
                 KeyCode::Char('a') => Update::BeginGraphAggInput,
@@ -503,6 +532,57 @@ fn keyboard_loop(
             continue;
         }
 
+        // Explore mode: list of span instances + `/`-search +
+        // sortable columns.  Enter opens trace-detail on the
+        // current row; `Esc` returns to stacks (one pop up).
+        // View switcher: `s` → stacks, `g` → graph on the same
+        // locked stack.  `e` is the *current* view so it has no
+        // action here (the hint hides it).
+        if view == VIEW_EXPLORE {
+            let update = match k.code {
+                KeyCode::Char('q') => Update::Quit,
+                KeyCode::Esc => Update::ExitExplore,
+                KeyCode::Char('s') => Update::EnterTable,
+                KeyCode::Char('g') => Update::EnterGraph,
+                KeyCode::Char('/') => Update::BeginExploreSearch,
+                KeyCode::Char('i') => Update::ExploreInvertSort,
+                KeyCode::Down | KeyCode::Char('j') => Update::ExploreSelectDown,
+                KeyCode::Up | KeyCode::Char('k') => Update::ExploreSelectUp,
+                KeyCode::Left | KeyCode::Char('h') => Update::ExploreSortLeft,
+                KeyCode::Right | KeyCode::Char('l') => Update::ExploreSortRight,
+                KeyCode::Enter => Update::ExploreOpenTrace,
+                _ => continue,
+            };
+            if send_or_exit(update).is_break() {
+                return;
+            }
+            continue;
+        }
+
+        // Trace-detail view: collapsible single-trace tree with
+        // selection.  Arrows navigate (no j/k — they pun against
+        // the tree's selection model), Right/Left expand/collapse,
+        // Esc pops back up to explore.  `s` / `g` / `e` jump to
+        // their respective views.
+        if view == VIEW_TRACE_DETAIL {
+            let update = match k.code {
+                KeyCode::Char('q') => Update::Quit,
+                KeyCode::Esc => Update::ExitTraceDetail,
+                KeyCode::Char('s') => Update::EnterTable,
+                KeyCode::Char('g') => Update::EnterGraph,
+                KeyCode::Char('e') => Update::ExitTraceDetail,
+                KeyCode::Down => Update::TraceDetailSelectDown,
+                KeyCode::Up => Update::TraceDetailSelectUp,
+                KeyCode::Right => Update::TraceDetailExpand,
+                KeyCode::Left => Update::TraceDetailCollapse,
+                _ => continue,
+            };
+            if send_or_exit(update).is_break() {
+                return;
+            }
+            continue;
+        }
+
         // Table-mode bindings (the original set + the new `g`).
         let update = match k.code {
             KeyCode::Char('q') | KeyCode::Esc => Update::Quit,
@@ -520,6 +600,10 @@ fn keyboard_loop(
             KeyCode::Char('C') => Update::BeginChanceInput,
             // `g` enters graph mode locked onto the current row.
             KeyCode::Char('g') => Update::ToggleGraph,
+            // `e` enters explore mode locked onto the current row.
+            // The reducer requests RequestSetLevel(Off) so the
+            // screen doesn't keep churning while you read.
+            KeyCode::Char('e') => Update::EnterExplore,
             _ => continue,
         };
         if send_or_exit(update).is_break() {

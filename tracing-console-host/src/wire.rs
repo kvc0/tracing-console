@@ -1,6 +1,6 @@
 //! Conversion from in-memory `SpanRecord` / `EventRecord` to the wire types.
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tracing_cache::{EventRecord, FieldValue, SpanRecord};
 
@@ -19,21 +19,37 @@ fn field_to_wire(value: &FieldValue) -> WireFieldValue {
     }
 }
 
-/// Reference point used to serialize `Instant`s as `u64` nanoseconds.  Each
-/// host owns one of these, captured at server start.  Clients see absolute
-/// "ns since this host started" timestamps.
+/// Reference points used to serialize `Instant`s as Unix-epoch
+/// nanoseconds.  Each host owns one of these, captured at server
+/// start.  `Instant` is monotonic but not wall-clock-anchored, so
+/// we also snapshot `SystemTime` at start and add the
+/// instant-delta to get a wall-clock value.  Clients receive
+/// nanoseconds since the Unix epoch — convertible directly via
+/// `chrono::DateTime::from_timestamp_nanos`.
 #[derive(Debug, Clone, Copy)]
-pub struct TimeBase(pub Instant);
+pub struct TimeBase {
+    instant_at_start: Instant,
+    systime_at_start: SystemTime,
+}
 
 impl TimeBase {
     pub fn now() -> Self {
-        Self(Instant::now())
+        Self {
+            instant_at_start: Instant::now(),
+            systime_at_start: SystemTime::now(),
+        }
     }
 
     fn ns(self, t: Instant) -> u64 {
-        // `Instant` arithmetic saturates at zero — fine: events captured
-        // pre-server-start (impossible in practice) would just appear at 0.
-        t.saturating_duration_since(self.0).as_nanos() as u64
+        // Convert the monotonic Instant into a wall-clock SystemTime
+        // by adding its offset from `instant_at_start` to the wall
+        // clock at start.  Result is ns since Unix epoch; events
+        // pre-server-start (impossible in practice) saturate to 0.
+        let offset = t.saturating_duration_since(self.instant_at_start);
+        let wall = self.systime_at_start + offset;
+        wall.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
     }
 }
 

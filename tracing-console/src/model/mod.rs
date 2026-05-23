@@ -17,6 +17,7 @@
 //!   `parse_agg_input`.
 
 mod core;
+pub(crate) mod explore;
 mod graph;
 mod update;
 
@@ -24,6 +25,7 @@ mod update;
 mod tests;
 
 pub use core::{ConnectionStatus, Focus, LEVEL_OPTIONS, Model, RateTracker, VisibleRow};
+pub use explore::{ExploreSortColumn, ExploreState, TraceDetailState, TraceRow};
 pub use graph::{
     AggMode, GraphFocus, GraphSeriesStore, GraphState, Metric, SeriesProjection, SeriesSummary,
     SortColumn, TimeLabels, ViewMode, parse_agg_input, parse_lookback_input,

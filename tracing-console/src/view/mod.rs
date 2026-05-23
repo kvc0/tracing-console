@@ -8,6 +8,7 @@
 //! * [`table`] — the stacks + details two-pane layout.
 //! * [`graph`] — the chart + columnar legend layout.
 
+mod explore;
 mod graph;
 mod header;
 mod table;
@@ -23,5 +24,7 @@ pub fn render(f: &mut ratatui::Frame<'_>, model: &Model, colorize: bool) {
     match &model.view {
         ViewMode::Table => table::render_table(f, area, model, colorize),
         ViewMode::Graph(gs) => graph::render_graph(f, area, model, gs, colorize),
+        ViewMode::Explore(es) => explore::render_explore(f, area, model, es, colorize),
+        ViewMode::TraceDetail(td) => explore::render_trace_detail(f, area, model, td),
     }
 }

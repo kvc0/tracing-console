@@ -88,6 +88,48 @@ pub enum Update {
     /// `u`: cycle the chart's X-axis label format
     /// (`Delta → Unix → Local → Delta`).
     ToggleGraphTimeLabels,
+    /// `e` from the stacks table: open explore mode on the
+    /// currently-selected bucket.  Sends a `RequestSetLevel(Off)`
+    /// effect so the cache stops growing while the user reads.
+    EnterExplore,
+    /// `e` / `Esc` from explore mode: return to the previous
+    /// view and restore the cache level captured on entry.
+    ExitExplore,
+    ExploreSelectUp,
+    ExploreSelectDown,
+    /// `Left` / `Right` in explore: cycle the leading sort column
+    /// (time → latency → field cols → time).
+    ExploreSortLeft,
+    ExploreSortRight,
+    /// `i` in explore: invert the active sort direction
+    /// (ascending ↔ descending) without changing column.
+    ExploreInvertSort,
+    /// `/`: open the search modal.  Live-filters the row list as
+    /// the user types.
+    BeginExploreSearch,
+    ExploreSearchChar(char),
+    ExploreSearchBackspace,
+    ExploreSearchCancel,
+    ExploreSearchCommit,
+    /// `Enter` on a row: open the trace-detail view of the
+    /// selected span's root.
+    ExploreOpenTrace,
+    /// `Esc` from trace-detail: back to explore.
+    ExitTraceDetail,
+    TraceDetailSelectUp,
+    TraceDetailSelectDown,
+    /// Right / `l`: expand the selected span's subtree.
+    TraceDetailExpand,
+    /// Left / `h`: collapse the selected span's subtree.
+    TraceDetailCollapse,
+    /// `s`: jump to the stacks table from any other view.  Pops
+    /// out of Explore / TraceDetail with the level restore that
+    /// `ExitExplore` would do.
+    EnterTable,
+    /// `g` from any non-Graph view: lock onto the current view's
+    /// stack (cursor row for Table, locked_stack for Explore /
+    /// TraceDetail) and open the graph.
+    EnterGraph,
     /// `Tab` inside graph mode.  Swaps focus between Chart and
     /// Details panes (graph-mode analogue of `SwitchFocus`).
     GraphSwitchFocus,

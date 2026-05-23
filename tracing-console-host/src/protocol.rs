@@ -94,7 +94,7 @@ pub struct WireEvent {
     pub name: String,
     pub level: WireLevel,
     pub fields: Vec<(String, WireFieldValue)>,
-    /// Nanoseconds since the host's `Instant` reference.
+    /// Nanoseconds since the Unix epoch.
     pub recorded_at_ns: u64,
 }
 
@@ -107,7 +107,7 @@ pub struct WireSpan {
     pub level: WireLevel,
     pub fields: Vec<(String, WireFieldValue)>,
     pub events: Vec<WireEvent>,
-    /// Nanoseconds since the host's `Instant` reference.
+    /// Nanoseconds since the Unix epoch.
     pub opened_at_ns: u64,
     /// `None` if still in flight at snapshot time (currently only closed spans
     /// are streamed, so this is `Some` in practice).

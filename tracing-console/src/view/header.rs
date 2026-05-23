@@ -116,6 +116,12 @@ pub(super) fn modal_status_bar(model: &Model) -> Option<Line<'static>> {
         } else {
             return None;
         }
+    } else if let ViewMode::Explore(es) = &model.view {
+        if es.search_input.is_some() {
+            "search: name / field / event"
+        } else {
+            return None;
+        }
     } else {
         return None;
     };
@@ -149,26 +155,48 @@ pub(super) fn render_header_row(f: &mut Frame<'_>, area: Rect, model: &Model) {
     );
 }
 
-/// Right-aligned `g graph` / `g stack` hint shown in the top-right
-/// of the header.  The `g` is underlined as the shortcut key; the
-/// label names the *destination* view (so the table shows "graph"
-/// and the graph shows "stack").
+/// Right-aligned view-switcher hint shown in the top-right of
+/// the header.  Lists the *other* top-level views as `<letter>
+/// <word>` with the shortcut letter underlined.  The current
+/// view is omitted so the user can't accidentally try to "switch
+/// to where they already are."  Trace detail counts as a sub-
+/// view of explore for hint purposes — all three options stay
+/// visible to surface the way back up.
 pub(super) fn graph_toggle_hint(model: &Model) -> Line<'static> {
-    let label = match model.view {
-        ViewMode::Graph(_) => "stack",
-        ViewMode::Table => "graph",
+    let current = match &model.view {
+        ViewMode::Table => Some("stack"),
+        ViewMode::Graph(_) => Some("graph"),
+        ViewMode::Explore(_) => Some("explore"),
+        ViewMode::TraceDetail(_) => None,
     };
-    Line::from(vec![
-        TuiSpan::styled("g", Style::default().add_modifier(Modifier::UNDERLINED)),
-        TuiSpan::raw(" "),
-        TuiSpan::raw(label),
-    ])
+    let entries: &[(&'static str, &'static str)] =
+        &[("s", "stack"), ("g", "graph"), ("e", "explore")];
+    let sep = TuiSpan::styled(" │ ", Style::default().add_modifier(Modifier::DIM));
+    let mut spans: Vec<TuiSpan<'static>> = vec![TuiSpan::raw(" ")];
+    let mut first = true;
+    for (letter, word) in entries {
+        if Some(*word) == current {
+            continue;
+        }
+        if !first {
+            spans.push(sep.clone());
+        }
+        first = false;
+        spans.push(TuiSpan::styled(
+            *letter,
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        ));
+        spans.push(TuiSpan::raw(format!(" {word}")));
+    }
+    spans.push(TuiSpan::raw(" "));
+    Line::from(spans)
 }
 
-/// Fixed column width reserved on the right of the header for
-/// [`graph_toggle_hint`].  Long-form label is `g stack` / `g graph`
-/// — both 7 chars; round up to 8 for a one-cell gutter.
-pub(super) const GRAPH_HINT_WIDTH: u16 = 8;
+/// Width reserved on the right of the header for
+/// [`graph_toggle_hint`].  Worst case is `s stack │ g graph │ e
+/// explore` ≈ 30 cells (trace detail / sub-view); allow a small
+/// gutter past that.
+pub(super) const GRAPH_HINT_WIDTH: u16 = 32;
 
 /// Format a chance percentage like the user asked: `100%`, `2%`,
 /// `.001%`, `0.5%` — drop trailing zeros, drop the leading `0`
