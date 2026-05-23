@@ -67,10 +67,7 @@ fn trace_selected_span_id(model: &Model) -> Option<u64> {
 /// doesn't already have one.  Returns whether the char was kept.
 /// Shared by the chance / window / lookback char filters.
 fn push_digit_or_decimal(buf: &mut String, c: char) -> bool {
-    if c.is_ascii_digit() {
-        buf.push(c);
-        true
-    } else if c == '.' && !buf.contains('.') {
+    if c.is_ascii_digit() || (c == '.' && !buf.contains('.')) {
         buf.push(c);
         true
     } else {
@@ -252,12 +249,11 @@ impl Model {
                 let span_id = span.id;
                 self.agg.absorb(span);
                 self.rate.record(Instant::now());
-                if let (ViewMode::Graph(gs), Some(cloned)) = (&mut self.view, graph_clone) {
-                    if let Some(stack) = self.agg.resolved_stack(span_id) {
-                        if stack == gs.locked_stack.as_slice() {
-                            gs.record_span(&self.agg, &cloned);
-                        }
-                    }
+                if let (ViewMode::Graph(gs), Some(cloned)) = (&mut self.view, graph_clone)
+                    && let Some(stack) = self.agg.resolved_stack(span_id)
+                    && stack == gs.locked_stack.as_slice()
+                {
+                    gs.record_span(&self.agg, &cloned);
                 }
                 Effect::None
             }
@@ -284,10 +280,10 @@ impl Model {
             Update::ExpandSelected => {
                 if self.focus == Focus::Stacks {
                     let rows = self.visible_rows();
-                    if let Some(r) = rows.get(self.selected) {
-                        if r.has_children {
-                            self.expanded.insert(r.key.clone());
-                        }
+                    if let Some(r) = rows.get(self.selected)
+                        && r.has_children
+                    {
+                        self.expanded.insert(r.key.clone());
                     }
                 }
                 Effect::None
@@ -471,20 +467,20 @@ impl Model {
                 Effect::None
             }
             Update::GraphAggInputChar(c) => {
-                if let ViewMode::Graph(gs) = &mut self.view {
-                    if let Some(buf) = gs.agg_input.as_mut() {
-                        // Accept lowercase letters, digits, and a
-                        // single `.`.  Anything else is silently
-                        // dropped so the user can't escape the modal
-                        // with a stray keystroke.  Uppercase letters
-                        // are lowered so `Min` / `MAX` / `Avg` work.
-                        let c = c.to_ascii_lowercase();
-                        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' {
-                            if c == '.' && buf.contains('.') {
-                                // Already has a decimal point; drop.
-                            } else {
-                                buf.push(c);
-                            }
+                if let ViewMode::Graph(gs) = &mut self.view
+                    && let Some(buf) = gs.agg_input.as_mut()
+                {
+                    // Accept lowercase letters, digits, and a
+                    // single `.`.  Anything else is silently
+                    // dropped so the user can't escape the modal
+                    // with a stray keystroke.  Uppercase letters
+                    // are lowered so `Min` / `MAX` / `Avg` work.
+                    let c = c.to_ascii_lowercase();
+                    if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' {
+                        if c == '.' && buf.contains('.') {
+                            // Already has a decimal point; drop.
+                        } else {
+                            buf.push(c);
                         }
                     }
                 }
@@ -523,10 +519,10 @@ impl Model {
                 Effect::None
             }
             Update::GraphWindowInputChar(c) => {
-                if let ViewMode::Graph(gs) = &mut self.view {
-                    if let Some(buf) = gs.window_input.as_mut() {
-                        push_digit_or_decimal(buf, c);
-                    }
+                if let ViewMode::Graph(gs) = &mut self.view
+                    && let Some(buf) = gs.window_input.as_mut()
+                {
+                    push_digit_or_decimal(buf, c);
                 }
                 Effect::None
             }
@@ -547,11 +543,12 @@ impl Model {
                     let Some(buf) = gs.window_input.take() else {
                         return Effect::None;
                     };
-                    if let Ok(v) = buf.parse::<f64>() {
-                        if v.is_finite() && v > 0.0 {
-                            gs.window_secs = v;
-                            gs.rehydrate(&self.agg);
-                        }
+                    if let Ok(v) = buf.parse::<f64>()
+                        && v.is_finite()
+                        && v > 0.0
+                    {
+                        gs.window_secs = v;
+                        gs.rehydrate(&self.agg);
                     }
                 }
                 Effect::None
@@ -563,20 +560,20 @@ impl Model {
                 Effect::None
             }
             Update::GraphLookbackInputChar(c) => {
-                if let ViewMode::Graph(gs) = &mut self.view {
-                    if let Some(buf) = gs.lookback_input.as_mut() {
-                        // Once a unit suffix has landed, reject further
-                        // input so the user can't type "5sm".  Otherwise
-                        // accept a digit / single `.` / single trailing
-                        // `s`/`m` (the suffix needs a leading number).
-                        let has_suffix = buf.ends_with('s') || buf.ends_with('m');
-                        if !has_suffix
-                            && !push_digit_or_decimal(buf, c)
-                            && (c == 's' || c == 'm')
-                            && !buf.is_empty()
-                        {
-                            buf.push(c);
-                        }
+                if let ViewMode::Graph(gs) = &mut self.view
+                    && let Some(buf) = gs.lookback_input.as_mut()
+                {
+                    // Once a unit suffix has landed, reject further
+                    // input so the user can't type "5sm".  Otherwise
+                    // accept a digit / single `.` / single trailing
+                    // `s`/`m` (the suffix needs a leading number).
+                    let has_suffix = buf.ends_with('s') || buf.ends_with('m');
+                    if !has_suffix
+                        && !push_digit_or_decimal(buf, c)
+                        && (c == 's' || c == 'm')
+                        && !buf.is_empty()
+                    {
+                        buf.push(c);
                     }
                 }
                 Effect::None
@@ -705,10 +702,10 @@ impl Model {
 
                 match target {
                     Some(Target::Series(key)) => {
-                        if let ViewMode::Graph(gs) = &mut self.view {
-                            if !gs.hidden_series.remove(&key) {
-                                gs.hidden_series.insert(key);
-                            }
+                        if let ViewMode::Graph(gs) = &mut self.view
+                            && !gs.hidden_series.remove(&key)
+                        {
+                            gs.hidden_series.insert(key);
                         }
                     }
                     Some(Target::Key(k)) => {
@@ -724,10 +721,10 @@ impl Model {
                             // Sort might have been on this split's
                             // column; if the split is no longer in
                             // the active set, fall back to `n`.
-                            if let SortColumn::SplitKey(sk) = &gs.sort_column {
-                                if !gs.split_keys.contains(sk) {
-                                    gs.sort_column = SortColumn::Count;
-                                }
+                            if let SortColumn::SplitKey(sk) = &gs.sort_column
+                                && !gs.split_keys.contains(sk)
+                            {
+                                gs.sort_column = SortColumn::Count;
                             }
                         }
                         if let ViewMode::Graph(gs) = &mut self.view {
@@ -864,12 +861,11 @@ impl Model {
                 Effect::None
             }
             Update::ExploreSearchChar(c) => {
-                if let ViewMode::Explore(es) = &mut self.view {
-                    if let Some(buf) = es.search_input.as_mut() {
-                        if !c.is_control() {
-                            buf.push(c);
-                        }
-                    }
+                if let ViewMode::Explore(es) = &mut self.view
+                    && let Some(buf) = es.search_input.as_mut()
+                    && !c.is_control()
+                {
+                    buf.push(c);
                 }
                 Effect::None
             }
@@ -887,11 +883,11 @@ impl Model {
                 Effect::None
             }
             Update::ExploreSearchCommit => {
-                if let ViewMode::Explore(es) = &mut self.view {
-                    if let Some(buf) = es.search_input.take() {
-                        es.query = buf;
-                        es.selected = 0;
-                    }
+                if let ViewMode::Explore(es) = &mut self.view
+                    && let Some(buf) = es.search_input.take()
+                {
+                    es.query = buf;
+                    es.selected = 0;
                 }
                 Effect::None
             }
@@ -940,18 +936,18 @@ impl Model {
                 Effect::None
             }
             Update::TraceDetailExpand => {
-                if let Some(id) = trace_selected_span_id(self) {
-                    if let ViewMode::TraceDetail(td) = &mut self.view {
-                        td.collapsed.remove(&id);
-                    }
+                if let Some(id) = trace_selected_span_id(self)
+                    && let ViewMode::TraceDetail(td) = &mut self.view
+                {
+                    td.collapsed.remove(&id);
                 }
                 Effect::None
             }
             Update::TraceDetailCollapse => {
-                if let Some(id) = trace_selected_span_id(self) {
-                    if let ViewMode::TraceDetail(td) = &mut self.view {
-                        td.collapsed.insert(id);
-                    }
+                if let Some(id) = trace_selected_span_id(self)
+                    && let ViewMode::TraceDetail(td) = &mut self.view
+                {
+                    td.collapsed.insert(id);
                 }
                 Effect::None
             }

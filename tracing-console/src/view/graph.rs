@@ -231,7 +231,7 @@ pub(super) fn wall_clock_label_step(span_secs: f64) -> (f64, usize) {
         }
         let n = n_round as usize;
         let score = (n_round - TARGET_N).abs();
-        let better = best.map_or(true, |(_, prev_n)| (prev_n as f64 - TARGET_N).abs() > score);
+        let better = best.is_none_or(|(_, prev_n)| (prev_n as f64 - TARGET_N).abs() > score);
         if better {
             best = Some((step, n));
         }

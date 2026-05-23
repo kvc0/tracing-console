@@ -7,6 +7,14 @@
 //! [`EnabledPredicate`]; the default [`LevelPredicate`] enables
 //! everything at or below a given level.
 
+// Workspace lints deny `unwrap_used` / `expect_used` /
+// `panic_in_result_fn` in production code.  Tests get
+// them back.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic_in_result_fn,)
+)]
+
 mod cache;
 mod config;
 mod driver;

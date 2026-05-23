@@ -1,3 +1,12 @@
+// benchmarks are allowed to `unwrap`; `unit_arg` and
+// `redundant_closure` are noise here because of deliberately
+// routing values through `black_box` and passing bench fns around.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::unit_arg,
+    clippy::redundant_closure
+)]
 /// Throughput benchmarks for [`SpanCache`] as a `tracing::Subscriber`.
 ///
 /// Three scenarios in ascending concurrency:

@@ -27,3 +27,6 @@ serde_json                      = { workspace = true }
 spillway                        = { workspace = true }
 tokio                           = { workspace = true }
 tracing-console-host            = { workspace = true }
+
+[lints]
+workspace = true

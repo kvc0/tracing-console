@@ -11,11 +11,44 @@
 //! actually delivers, so primitive fields never touch the allocator and
 //! string variants pay only one heap-allocation per long field.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use compact_str::CompactString;
 use tracing::Metadata;
+use tracing::callsite::{Callsite, DefaultCallsite, Identifier};
+use tracing::field::FieldSet;
+use tracing::metadata::Kind;
+
+/// Fallback metadata returned from accessors when a pooled record
+/// is queried before it has been filled in.  Looks like an event
+/// at TRACE level with an empty field set, named `"unfilled"`.
+static EMPTY_CALLSITE: DefaultCallsite = {
+    static META: Metadata<'static> = Metadata::new(
+        "unfilled",
+        "tracing_cache::record",
+        tracing::Level::TRACE,
+        None,
+        None,
+        None,
+        FieldSet::new(&[], Identifier(&EMPTY_CALLSITE)),
+        Kind::EVENT,
+    );
+    DefaultCallsite::new(&META)
+};
+
+fn empty_metadata() -> &'static Metadata<'static> {
+    EMPTY_CALLSITE.metadata()
+}
+
+/// Stand-in `Instant` for unfilled records.  Captured once at
+/// first access — there's no public `Instant::ZERO`, so the
+/// earliest moment we can name is "whenever this lazy first
+/// resolved."  Consumers only see this on a fresh pool entry
+/// that hasn't been filled yet, which is a logic bug; the
+/// returned value is therefore monotonic and stable but not
+/// semantically meaningful.
+static UNFILLED_INSTANT: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Each captured field value.  `Str` keeps a `&'static str` (zero-copy
 /// for literal field arguments), `SmallString` keeps the
@@ -101,17 +134,22 @@ pub struct EventRecord {
 }
 
 impl EventRecord {
-    /// Unwrap the metadata pointer.  Always `Some` for events that have
-    /// been observed by the subscriber; only `None` on a freshly-acquired
-    /// pool entry that hasn't been filled yet.
+    /// Metadata pointer.  Always `Some` for events that have been
+    /// observed by the subscriber; freshly-acquired pool entries
+    /// that haven't been filled yet fall through to a static
+    /// `"unfilled"` metadata stand-in so consumers don't need to
+    /// guard against `None`.
     #[inline]
     pub fn metadata(&self) -> &'static Metadata<'static> {
-        self.metadata.expect("EventRecord::metadata not set")
+        self.metadata.unwrap_or_else(empty_metadata)
     }
 
+    /// Captured `Instant` for the event.  See [`Self::metadata`]
+    /// for the unfilled-entry behaviour — same shape: returns
+    /// the lazy `UNFILLED_INSTANT` stand-in instead of panicking.
     #[inline]
     pub fn recorded_at(&self) -> Instant {
-        self.recorded_at.expect("EventRecord::recorded_at not set")
+        self.recorded_at.unwrap_or(*UNFILLED_INSTANT)
     }
 
     pub fn field(&self, name: &str) -> Option<&FieldValue> {

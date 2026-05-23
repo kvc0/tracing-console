@@ -63,9 +63,10 @@ impl PartialEq for AggMode {
 /// How the chart's X-axis tick labels are rendered.  Toggled via
 /// `u` (cycles `Delta → Unix → Local → Delta`).  Affects only
 /// the chart pane labels; the lookback math is unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TimeLabels {
     /// Seconds before "now" — `-30s`, `-1m`, etc.
+    #[default]
     Delta,
     /// UTC wall clock — `14:37:58Z`.
     Unix,
@@ -82,12 +83,6 @@ impl TimeLabels {
             TimeLabels::Unix => TimeLabels::Local,
             TimeLabels::Local => TimeLabels::Delta,
         }
-    }
-}
-
-impl Default for TimeLabels {
-    fn default() -> Self {
-        TimeLabels::Delta
     }
 }
 
@@ -337,13 +332,11 @@ impl GraphSeriesStore {
                 let mut sum: u128 = 0;
                 let mut min_ns: u64 = u64::MAX;
                 let mut max_ns: u64 = 0;
-                for slot in &series.bins {
-                    if let Some(bin) = slot {
-                        count += bin.count;
-                        sum += bin.sum_ns;
-                        min_ns = min_ns.min(bin.min_ns);
-                        max_ns = max_ns.max(bin.max_ns);
-                    }
+                for bin in series.bins.iter().flatten() {
+                    count += bin.count;
+                    sum += bin.sum_ns;
+                    min_ns = min_ns.min(bin.min_ns);
+                    max_ns = max_ns.max(bin.max_ns);
                 }
                 let last_ns = series
                     .bins

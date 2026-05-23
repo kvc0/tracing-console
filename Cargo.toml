@@ -10,6 +10,15 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/momentohq/tracing-console"
 readme = "README.md"
 
+# Strict lints denied workspace-wide.  Test modules, benches, and
+# examples opt back out via `#![cfg_attr(test, allow(...))]` /
+# `#![allow(...)]` at their respective roots.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+
 [workspace.dependencies]
 tracing-cache                   = { path = "tracing-cache", version = "0.1.0" }
 tracing-console-host            = { path = "tracing-console-host", version = "0.1.0" }

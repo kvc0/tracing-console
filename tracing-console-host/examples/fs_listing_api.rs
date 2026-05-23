@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Synthetic "API" host that lists a directory once per second under a tree
 //! of tracing spans, then serves the resulting span cache to console clients.
 //!
@@ -43,8 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let predicate = tracing_cache::ChancePredicate::new(level, 100.0);
     let chance_handle = predicate.handle();
     // span rate in this demo is super low. Flush more often so the UI can get results without waiting.
-    let mut config = tracing_cache::CacheConfig::default();
-    config.pending_batch = 2;
+    let config = tracing_cache::CacheConfig {
+        pending_batch: 2,
+        ..tracing_cache::CacheConfig::default()
+    };
     let (cache, driver) = SpanCache::with_predicate_and_config(16384, predicate, config);
     let cache = Arc::new(cache);
 

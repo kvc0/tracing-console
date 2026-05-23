@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Throughput test host: emits api_request span trees at a configurable
 //! rate and serves the resulting cache to console clients.
 //!

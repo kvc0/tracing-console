@@ -173,8 +173,6 @@ impl<P: EnabledPredicate> SpanCache<P> {
             span_receiver,
             event_receiver,
             capacity,
-            batch_size: config.driver_batch,
-            tick_interval: config.driver_interval,
             side_events: std::collections::BTreeMap::new(),
         };
         (cache, driver)
@@ -244,7 +242,9 @@ impl<P: EnabledPredicate> SpanCache<P> {
     /// the id stored in `parent_id` and used as the BTreeMap key.  For
     /// in-flight spans, use [`get_active_span`].
     pub fn get_span(&self, actual_id: u64) -> Option<SpanRecord> {
-        self.map.read().unwrap().get(&actual_id).cloned()
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
+        let map = self.map.read().expect("lock must not be poisoned");
+        map.get(&actual_id).cloned()
     }
 
     /// Drop every closed span currently in the BTreeMap.  Called by
@@ -254,7 +254,9 @@ impl<P: EnabledPredicate> SpanCache<P> {
     /// not affected; if any close after this call they'll repopulate
     /// the map as normal.
     pub fn clear(&self) {
-        self.map.write().unwrap().clear();
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
+        let mut map = self.map.write().expect("lock must not be poisoned");
+        map.clear();
     }
 
     /// Resolve the `actual_id` (i.e. the [`SpanRecord::id`] used as the
@@ -270,7 +272,8 @@ impl<P: EnabledPredicate> SpanCache<P> {
     /// not included; call [`flush_pending`] + [`Driver::drain_sync`]
     /// first if you need just-closed spans to appear.
     pub fn page(&self, after_id: u64, limit: usize) -> Vec<SpanRecord> {
-        let map = self.map.read().unwrap();
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
+        let map = self.map.read().expect("lock must not be poisoned");
         if after_id == 0 {
             map.values().take(limit).cloned().collect()
         } else {
@@ -309,17 +312,17 @@ impl<P: EnabledPredicate> SpanCache<P> {
             // each unsent record (and runs `ReuseRef::Drop` for events,
             // returning the EventRecord allocation to the pool).
             pending_drain_events(|events| {
-                if events.len() > 0 {
-                    if let Err(spillway::Error::Full(_dropped)) = senders.event.send_many(events) {
-                        log::debug!("event channel full; dropping a batch — driver is behind");
-                    }
+                if events.len() > 0
+                    && let Err(spillway::Error::Full(_dropped)) = senders.event.send_many(events)
+                {
+                    log::debug!("event channel full; dropping a batch — driver is behind");
                 }
             });
             pending_drain_spans(|spans| {
-                if spans.len() > 0 {
-                    if let Err(spillway::Error::Full(_dropped)) = senders.span.send_many(spans) {
-                        log::debug!("span channel full; dropping a batch — driver is behind");
-                    }
+                if spans.len() > 0
+                    && let Err(spillway::Error::Full(_dropped)) = senders.span.send_many(spans)
+                {
+                    log::debug!("span channel full; dropping a batch — driver is behind");
                 }
             });
         });
@@ -373,7 +376,14 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             }
             None
         } else {
-            let explicit = id_to_u64(attrs.parent().unwrap());
+            // `attrs.parent()` is `Some` in this arm: the `else`
+            // branch is reached after `!is_contextual() && !is_root()`,
+            // which leaves only the "explicit parent" case in
+            // tracing's span-attributes model.
+            let Some(parent) = attrs.parent() else {
+                return disabled_id();
+            };
+            let explicit = id_to_u64(parent);
             match self.decode_tracing_id(explicit) {
                 // Lock-free read from the sidecar: the parent's actual_id
                 // was published by a `Release` store before the parent's
@@ -415,7 +425,8 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         let shard = self.pick_shard();
         let lane = &self.in_flight[shard];
         let slab_idx = {
-            let mut slab = lane.slab.lock().unwrap();
+            #[allow(clippy::expect_used, reason = "poisoned lock")]
+            let mut slab = lane.slab.lock().expect("lock must not be poisoned");
             if slab.len() >= self.shard_capacity {
                 log::warn!(
                     "span shard {shard} full; new span disabled. \
@@ -436,7 +447,11 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
             Some(t) => t,
             None => return,
         };
-        let mut shard_lock = self.in_flight[shard].slab.lock().unwrap();
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
+        let mut shard_lock = self.in_flight[shard]
+            .slab
+            .lock()
+            .expect("lock must not be poisoned");
         if let Some(rec) = shard_lock.get_mut(slab_idx) {
             values.record(&mut FieldVisitor {
                 fields: &mut rec.fields,
@@ -526,10 +541,11 @@ impl<P: EnabledPredicate> tracing::Subscriber for SpanCache<P> {
         // Single slab lookup via `try_remove` (no contains-then-remove
         // double hash), and `Instant::now()` lives outside the critical
         // section — only paid on the success path.
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
         let record = self.in_flight[shard]
             .slab
             .lock()
-            .unwrap()
+            .expect("lock must not be poisoned")
             .try_remove(slab_idx);
 
         if let Some(mut record) = record {

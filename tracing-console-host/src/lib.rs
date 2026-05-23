@@ -9,6 +9,11 @@
 //! tracing_console_host::serve(cache, "127.0.0.1:7777".parse()?).await?;
 //! ```
 
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic_in_result_fn,)
+)]
+
 pub mod protocol;
 pub mod server;
 pub mod wire;

@@ -252,23 +252,19 @@ impl Aggregator {
 
         // 4. Update the parent's contribution if it's in the ring.
         let id = span.id;
-        if parent_in_ring {
-            // Safety on the unwrap: `parent_in_ring` was set from a
-            // `by_id.get` hit above; `evict_oldest` only fires when the
-            // ring is at capacity, and a parent fresh from a hit will
-            // not be evicted to make room for its own child (the front
-            // of the queue is the oldest; the parent was just observed,
-            // so it's not at the front unless the ring is size 1 and
-            // this span itself is the only thing — in which case there
-            // is no parent_in_ring).  Still, be defensive: if eviction
-            // somehow dropped the parent, treat this span as parentless.
-            let parent_id = parent_id.unwrap();
-            if self.by_id.contains_key(&parent_id) {
-                let new_sum = self.child_sum.entry(parent_id).or_default();
-                *new_sum += total_ns;
-                let new_sum = *new_sum;
-                self.bump_parent_self(parent_id, new_sum);
-            }
+        // `parent_in_ring` only flips on after a successful by_id lookup
+        // on this same parent_id, so `parent_id` is `Some` here.  We
+        // still bind it via `let Some(..) = ..` to keep the lint
+        // policy happy and so a future evict-during-absorb race can't
+        // turn this into a silent panic.
+        if parent_in_ring
+            && let Some(parent_id) = parent_id
+            && self.by_id.contains_key(&parent_id)
+        {
+            let new_sum = self.child_sum.entry(parent_id).or_default();
+            *new_sum += total_ns;
+            let new_sum = *new_sum;
+            self.bump_parent_self(parent_id, new_sum);
         }
 
         // 5. Add this span's contribution to its bucket.
@@ -328,33 +324,31 @@ impl Aggregator {
         // more children now that it's gone.
         self.child_sum.remove(&id);
 
-        // Remove its bucket contribution.
-        let now_empty = {
-            let state = self
-                .buckets
-                .get_mut(&entry.bucket)
-                .expect("entry's bucket must be present while entry is in the ring");
+        // Remove its bucket contribution.  Invariant: a bucket is
+        // present as long as any entry references it.  A missing
+        // bucket here would be a logic bug elsewhere, but we treat
+        // the eviction defensively rather than panic — drop and
+        // move on.
+        if let Some(state) = self.buckets.get_mut(&entry.bucket) {
             state.remove(entry.total_ns, entry.self_ns);
-            state.is_empty()
-        };
-        if now_empty {
-            self.buckets.remove(&entry.bucket);
+            if state.is_empty() {
+                self.buckets.remove(&entry.bucket);
+            }
         }
 
         // Bump the parent back up: this span's total was subtracted
         // from the parent's self_ns when it arrived; now that this
         // span is leaving, give that subtraction back.
-        if let Some(parent_id) = entry.span.parent_id {
-            if self.by_id.contains_key(&parent_id) {
-                if let Some(sum) = self.child_sum.get_mut(&parent_id) {
-                    *sum = sum.saturating_sub(entry.total_ns);
-                    let new_sum = *sum;
-                    if new_sum == 0 {
-                        self.child_sum.remove(&parent_id);
-                    }
-                    self.bump_parent_self(parent_id, new_sum);
-                }
+        if let Some(parent_id) = entry.span.parent_id
+            && self.by_id.contains_key(&parent_id)
+            && let Some(sum) = self.child_sum.get_mut(&parent_id)
+        {
+            *sum = sum.saturating_sub(entry.total_ns);
+            let new_sum = *sum;
+            if new_sum == 0 {
+                self.child_sum.remove(&parent_id);
             }
+            self.bump_parent_self(parent_id, new_sum);
         }
     }
 
@@ -373,10 +367,12 @@ impl Aggregator {
         let bucket = parent_entry.bucket.clone();
         let total = parent_entry.total_ns;
         parent_entry.self_ns = new_self;
-        let state = self
-            .buckets
-            .get_mut(&bucket)
-            .expect("parent's bucket must be present");
+        // The parent is itself in this bucket so it should be
+        // present, but if some upstream code dropped it we'd
+        // rather skip the adjustment than panic.
+        let Some(state) = self.buckets.get_mut(&bucket) else {
+            return;
+        };
         state.remove(total, old_self);
         state.add(total, new_self);
         // The bucket can't be empty here because the parent itself is

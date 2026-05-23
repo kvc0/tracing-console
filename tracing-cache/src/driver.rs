@@ -28,8 +28,6 @@ pub struct Driver {
     pub(crate) span_receiver: spillway::Receiver<SpanRecord>,
     pub(crate) event_receiver: spillway::Receiver<EventMessage>,
     pub(crate) capacity: usize,
-    pub(crate) batch_size: usize,
-    pub(crate) tick_interval: std::time::Duration,
     /// Events whose parent `SpanRecord` hasn't been inserted yet,
     /// keyed by `parent_actual_id`.  Bounded by `capacity` distinct
     /// parent ids; once full, a new parent's first event evicts the
@@ -49,8 +47,6 @@ impl Driver {
             mut span_receiver,
             mut event_receiver,
             capacity,
-            batch_size: _,
-            tick_interval: _,
             mut side_events,
         } = self;
 
@@ -118,15 +114,14 @@ impl Driver {
         if batch.len() == 0 {
             return;
         }
-        let mut m = map.write().unwrap();
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
+        let mut m = map.write().expect("lock must not be poisoned");
         let any_side = !side_events.is_empty();
         for mut span in batch {
             // Fast-path: skip the lookup when the side buffer has
             // nothing in it at all (span-only workloads).
-            if any_side {
-                if let Some(events) = side_events.remove(&span.id) {
-                    span.events.extend(events);
-                }
+            if any_side && let Some(events) = side_events.remove(&span.id) {
+                span.events.extend(events);
             }
             while m.len() >= capacity {
                 if m.pop_first().is_none() {
@@ -146,7 +141,8 @@ impl Driver {
         if batch.len() == 0 {
             return;
         }
-        let mut m = map.write().unwrap();
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
+        let mut m = map.write().expect("lock must not be poisoned");
         for EventMessage {
             parent_actual_id,
             record,

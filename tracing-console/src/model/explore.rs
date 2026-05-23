@@ -30,14 +30,6 @@ pub enum ExploreSortColumn {
 }
 
 impl ExploreSortColumn {
-    pub fn label(&self) -> &str {
-        match self {
-            ExploreSortColumn::Timestamp => "time",
-            ExploreSortColumn::Latency => "latency",
-            ExploreSortColumn::Field(k) => k,
-        }
-    }
-
     /// Direction the column reads most naturally — applied
     /// whenever the user *cycles* to this column.  `i` then
     /// flips that without changing column.
@@ -292,10 +284,10 @@ fn sort_spans(spans: &mut [&WireSpan], by: &ExploreSortColumn, direction: SortDi
             spans.sort_by(|a, b| a.opened_at_ns.cmp(&b.opened_at_ns));
         }
         ExploreSortColumn::Latency => {
-            spans.sort_by(|a, b| latency_ns(a).cmp(&latency_ns(b)));
+            spans.sort_by_key(|a| latency_ns(a));
         }
         ExploreSortColumn::Field(k) => {
-            spans.sort_by(|a, b| field_string(a, k).cmp(&field_string(b, k)));
+            spans.sort_by_key(|a| field_string(a, k));
         }
     }
     if matches!(direction, SortDirection::Desc) {

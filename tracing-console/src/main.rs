@@ -15,6 +15,11 @@
 //! `main` itself just parses CLI args and hands control to
 //! [`runtime::run`].
 
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic_in_result_fn,)
+)]
+
 mod aggregate;
 mod args;
 mod model;

@@ -55,10 +55,10 @@ impl<T: Resettable + Default + Send + 'static> Pool<T> {
     /// attempt to hand the box back on drop, which is how the pool
     /// grows.
     fn try_take(self: &Arc<Self>) -> Box<T> {
-        if let Ok(mut guard) = self.items.try_lock() {
-            if let Some(b) = guard.pop() {
-                return b;
-            }
+        if let Ok(mut guard) = self.items.try_lock()
+            && let Some(b) = guard.pop()
+        {
+            return b;
         }
         Box::new(T::default())
     }
@@ -136,10 +136,13 @@ pub struct ReuseRef<T: Resettable + Default + Send + 'static> {
 
 impl<T: Resettable + Default + Send + 'static> std::ops::Deref for ReuseRef<T> {
     type Target = T;
+    // `value` is a `Some(Box<T>)` for the whole life of the
+    // ReuseRef — the only `take` is inside `drop`, after the
+    // pointer to `self` is already invalid.  The `expect` here is
+    // a smart-pointer invariant (not user-facing)
     #[inline]
+    #[allow(clippy::expect_used)]
     fn deref(&self) -> &T {
-        // SAFETY: `value` is only ever taken out in `drop`; while the
-        // ReuseRef is alive `value` is `Some`.
         self.value
             .as_deref()
             .expect("ReuseRef value taken before drop")
@@ -147,7 +150,9 @@ impl<T: Resettable + Default + Send + 'static> std::ops::Deref for ReuseRef<T> {
 }
 
 impl<T: Resettable + Default + Send + 'static> std::ops::DerefMut for ReuseRef<T> {
+    // Same invariant as the `Deref` impl above.
     #[inline]
+    #[allow(clippy::expect_used)]
     fn deref_mut(&mut self) -> &mut T {
         self.value
             .as_deref_mut()

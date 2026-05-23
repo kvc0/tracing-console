@@ -227,6 +227,7 @@ impl<P: EnabledPredicate> ConnectionService for ConnectionState<P> {
     type Request = Request;
     type Response = Response;
 
+    #[allow(clippy::expect_used, reason = "poisoned lock")]
     fn new_rpc(&mut self, msg: Request, responder: RpcResponder<'_, Response>) {
         // Every Response must echo the request id so the client's
         // completion registry (keyed by id) routes it back to the
@@ -234,7 +235,10 @@ impl<P: EnabledPredicate> ConnectionService for ConnectionState<P> {
         let request_id = msg.message_id();
         match msg.body {
             RequestBody::StartStream => {
-                self.state.write().unwrap().streaming = true;
+                self.state
+                    .write()
+                    .expect("lock must not be poisoned")
+                    .streaming = true;
                 // First StartStream on this connection — register a
                 // stream guard tied to the connection's lifetime.
                 // Subsequent StartStreams are idempotent: the guard
@@ -253,11 +257,17 @@ impl<P: EnabledPredicate> ConnectionService for ConnectionState<P> {
                 )));
             }
             RequestBody::StopStream => {
-                self.state.write().unwrap().streaming = false;
+                self.state
+                    .write()
+                    .expect("lock must not be poisoned")
+                    .streaming = false;
                 responder.immediate(Response::ack().with_id(request_id));
             }
             RequestBody::SetLevel(level) => {
-                self.state.write().unwrap().min_level = Some(level);
+                self.state
+                    .write()
+                    .expect("lock must not be poisoned")
+                    .min_level = Some(level);
                 responder.immediate(Response::ack().with_id(request_id));
             }
             RequestBody::SetCacheLevel(filter) => {
@@ -276,13 +286,25 @@ impl<P: EnabledPredicate> ConnectionService for ConnectionState<P> {
                     );
                     return;
                 }
-                self.state.write().unwrap().sampling_rate = rate;
-                self.root_decisions.write().unwrap().clear();
+                self.state
+                    .write()
+                    .expect("lock must not be poisoned")
+                    .sampling_rate = rate;
+                self.root_decisions
+                    .write()
+                    .expect("lock must not be poisoned")
+                    .clear();
                 responder.immediate(Response::ack().with_id(request_id));
             }
             RequestBody::SetFilter(f) => {
-                self.state.write().unwrap().root_filter = f;
-                self.root_decisions.write().unwrap().clear();
+                self.state
+                    .write()
+                    .expect("lock must not be poisoned")
+                    .root_filter = f;
+                self.root_decisions
+                    .write()
+                    .expect("lock must not be poisoned")
+                    .clear();
                 responder.immediate(Response::ack().with_id(request_id));
             }
             RequestBody::Noop => {}
@@ -355,7 +377,8 @@ fn span_stream<P: EnabledPredicate>(
             // Snapshot the streaming flag + filter under the lock, then drop
             // it before paging the cache so the page isn't holding two locks.
             let (streaming, min_level, sampling_rate, root_filter) = {
-                let s = state.read().unwrap();
+                #[allow(clippy::expect_used, reason = "poisoned lock")]
+                let s = state.read().expect("lock must not be poisoned");
                 (s.streaming, s.min_level, s.sampling_rate, s.root_filter.clone())
             };
             if !streaming {
@@ -367,10 +390,10 @@ fn span_stream<P: EnabledPredicate>(
             let count = batch.len();
             for record in batch {
                 cursor = record.id;
-                if let Some(min) = min_level {
-                    if !level_at_least(record.metadata.level(), min) {
-                        continue;
-                    }
+                if let Some(min) = min_level
+                    && !level_at_least(record.metadata.level(), min)
+                {
+                    continue;
                 }
                 if !sampling_passes(&record, sampling_rate) {
                     continue;
@@ -470,19 +493,28 @@ fn filter_passes(
     // Use the cache walk: if we don't have a memo for this id, and it has a
     // parent, inherit the parent's decision (which itself was memoised when
     // the parent was streamed earlier in this monotonic-id-ordered scan).
-    if record.parent_id.is_none() {
+    #[allow(clippy::expect_used, reason = "poisoned lock")]
+    let Some(parent_id) = record.parent_id else {
         let decision = root_matches(record, needle);
-        roots.write().unwrap().insert(record.id, decision);
+        roots
+            .write()
+            .expect("lock must not be poisoned")
+            .insert(record.id, decision);
         return decision;
-    }
+    };
     // Descendant: inherit the chain.
-    let parent_id = record.parent_id.unwrap();
-    let memo = roots.read().unwrap();
-    let parent_decision = memo.get(&parent_id).copied();
-    drop(memo);
+    let parent_decision = {
+        #[allow(clippy::expect_used, reason = "poisoned lock")]
+        let memo = roots.read().expect("lock must not be poisoned");
+        memo.get(&parent_id).copied()
+    };
     let decision = parent_decision.unwrap_or(false);
     // Propagate the decision down so this span's children find it directly.
-    roots.write().unwrap().insert(record.id, decision);
+    #[allow(clippy::expect_used, reason = "poisoned lock")]
+    roots
+        .write()
+        .expect("lock must not be poisoned")
+        .insert(record.id, decision);
     decision
 }
 
@@ -595,7 +627,7 @@ mod tests {
     use futures::StreamExt;
     use protosocket_messagepack::{MessagePackDecoder, MessagePackSerializer};
     use protosocket_rpc::client::{self, Configuration, RpcClient, TcpStreamConnector};
-    use tracing_cache::SpanCache;
+    use tracing_cache::{ChancePredicate, SpanCache};
 
     use crate::protocol::{ResponseBody, WireLevel};
 
