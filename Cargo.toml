@@ -3,7 +3,7 @@ resolver = "2"
 members = ["tracing-console", "tracing-cache", "tracing-console-host"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 authors = ["kvcache"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
