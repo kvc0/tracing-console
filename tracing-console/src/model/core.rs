@@ -122,8 +122,7 @@ impl RateTracker {
                         self.head = (self.head + 1) % Self::BUCKETS;
                         self.buckets[self.head] = 0;
                     }
-                    self.bucket_start =
-                        Some(start + Duration::from_millis(500 * advances as u64));
+                    self.bucket_start = Some(start + Duration::from_millis(500 * advances as u64));
                 }
             }
         }
@@ -570,8 +569,7 @@ impl Model {
                         // input so the user can't type "5sm".  Otherwise
                         // accept a digit / single `.` / single trailing
                         // `s`/`m` (the suffix needs a leading number).
-                        let has_suffix =
-                            buf.ends_with('s') || buf.ends_with('m');
+                        let has_suffix = buf.ends_with('s') || buf.ends_with('m');
                         if !has_suffix
                             && !push_digit_or_decimal(buf, c)
                             && (c == 's' || c == 'm')
@@ -656,17 +654,14 @@ impl Model {
                 };
                 let n_keys = match focus {
                     GraphFocus::Chart => 0,
-                    GraphFocus::Details => {
-                        candidate_split_keys_for(&self.agg, &locked_stack).len()
-                    }
+                    GraphFocus::Details => candidate_split_keys_for(&self.agg, &locked_stack).len(),
                 };
                 if let ViewMode::Graph(gs) = &mut self.view {
                     let total = gs.series_keys().len() + n_keys;
                     if total == 0 {
                         return Effect::None;
                     }
-                    gs.details_selected =
-                        (gs.details_selected + 1).min(total - 1);
+                    gs.details_selected = (gs.details_selected + 1).min(total - 1);
                 }
                 Effect::None
             }
@@ -688,9 +683,7 @@ impl Model {
                 };
                 let candidates = match focus {
                     GraphFocus::Chart => Vec::new(),
-                    GraphFocus::Details => {
-                        candidate_split_keys_for(&self.agg, &locked_stack)
-                    }
+                    GraphFocus::Details => candidate_split_keys_for(&self.agg, &locked_stack),
                 };
 
                 enum Target {
@@ -843,8 +836,7 @@ impl Model {
             Update::ExploreSortLeft | Update::ExploreSortRight => {
                 let delta_right = matches!(update, Update::ExploreSortRight);
                 let fields = if let ViewMode::Explore(es) = &self.view {
-                    let spans =
-                        super::explore::matching_spans(self, es);
+                    let spans = super::explore::matching_spans(self, es);
                     super::explore::distinguishing_fields(&spans)
                 } else {
                     return Effect::None;
@@ -905,8 +897,7 @@ impl Model {
             }
             Update::ExploreOpenTrace => {
                 let (span_id, es) = if let ViewMode::Explore(es) = &self.view {
-                    let spans =
-                        super::explore::matching_spans(self, es);
+                    let spans = super::explore::matching_spans(self, es);
                     if spans.is_empty() {
                         return Effect::None;
                     }
@@ -915,9 +906,7 @@ impl Model {
                 } else {
                     return Effect::None;
                 };
-                let Some(root_id) =
-                    super::explore::find_root_id(self, span_id)
-                else {
+                let Some(root_id) = super::explore::find_root_id(self, span_id) else {
                     return Effect::None;
                 };
                 self.view = ViewMode::TraceDetail(super::explore::TraceDetailState {

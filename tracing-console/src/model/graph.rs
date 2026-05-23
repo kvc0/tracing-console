@@ -353,7 +353,11 @@ impl GraphSeriesStore {
                     .next()
                     .map(|b| b.aggregate(agg))
                     .unwrap_or(0);
-                let avg_ns = if count == 0 { 0 } else { (sum / count as u128) as u64 };
+                let avg_ns = if count == 0 {
+                    0
+                } else {
+                    (sum / count as u128) as u64
+                };
                 let min_ns = if count == 0 { 0 } else { min_ns };
                 SeriesSummary {
                     key: key.clone(),
@@ -564,8 +568,7 @@ impl GraphState {
     /// colours, so a series remains visually identifiable as the
     /// user re-sorts the table.
     pub fn alpha_series_keys(&self) -> Vec<Vec<(String, String)>> {
-        let mut keys: Vec<Vec<(String, String)>> =
-            self.store.series.keys().cloned().collect();
+        let mut keys: Vec<Vec<(String, String)>> = self.store.series.keys().cloned().collect();
         keys.sort();
         keys
     }
@@ -601,10 +604,8 @@ impl GraphState {
     pub fn series_keys(&self) -> Vec<Vec<(String, String)>> {
         use std::cmp::Ordering;
         let summaries = self.store.series_summary(self.aggregation);
-        let summary_by_key: std::collections::HashMap<
-            Vec<(String, String)>,
-            SeriesSummary,
-        > = summaries.into_iter().map(|s| (s.key.clone(), s)).collect();
+        let summary_by_key: std::collections::HashMap<Vec<(String, String)>, SeriesSummary> =
+            summaries.into_iter().map(|s| (s.key.clone(), s)).collect();
         let mut keys = self.alpha_series_keys();
         keys.sort_by(|a, b| {
             let sa = summary_by_key.get(a);
@@ -652,7 +653,6 @@ impl GraphState {
         });
         keys
     }
-
 
     /// Record one span into the series store.  Caller has already
     /// verified the span's resolved stack matches `locked_stack`.

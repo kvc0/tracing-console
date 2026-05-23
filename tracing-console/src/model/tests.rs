@@ -7,7 +7,6 @@ use std::collections::BTreeSet;
 use super::*;
 use tracing_console_host::{WireLevel, WireLevelFilter, WireSpan};
 
-
 fn span(id: u64, name: &str) -> WireSpan {
     span_with_parent(id, name, None)
 }
@@ -533,10 +532,7 @@ fn graph_lookback_input_char_filter_drops_letters_and_extra_dots() {
     // or another suffix) sneak in.
     m.apply(Update::GraphLookbackInputChar('5'));
     m.apply(Update::GraphLookbackInputChar('m'));
-    assert_eq!(
-        current_graph(&m).lookback_input.as_deref(),
-        Some("1.23s"),
-    );
+    assert_eq!(current_graph(&m).lookback_input.as_deref(), Some("1.23s"),);
 }
 
 #[test]
@@ -831,7 +827,11 @@ fn graph_details_cursor_walks_series_then_keys() {
     m.apply(Update::GraphSelectUp);
     assert_eq!(current_graph(&m).details_selected, 0);
     m.apply(Update::GraphSelectUp);
-    assert_eq!(current_graph(&m).details_selected, 0, "clamped at first row");
+    assert_eq!(
+        current_graph(&m).details_selected,
+        0,
+        "clamped at first row"
+    );
 }
 
 #[test]
@@ -931,10 +931,22 @@ fn graph_series_summary_aggregates_per_series() {
         10, None, "req", 0, 100, "api", "fetch",
     )));
     m.apply(Update::SpanReceived(timed_span_with_field(
-        11, None, "req", 1_000_000_000, 1_000_000_500, "api", "fetch",
+        11,
+        None,
+        "req",
+        1_000_000_000,
+        1_000_000_500,
+        "api",
+        "fetch",
     )));
     m.apply(Update::SpanReceived(timed_span_with_field(
-        12, None, "req", 2_000_000_000, 2_000_000_200, "api", "update",
+        12,
+        None,
+        "req",
+        2_000_000_000,
+        2_000_000_200,
+        "api",
+        "update",
     )));
     m.apply(Update::ToggleGraph);
     m.apply(Update::GraphSwitchFocus);
@@ -948,8 +960,8 @@ fn graph_series_summary_aggregates_per_series() {
     let update_ = &summary[1];
     assert_eq!(fetch.key, vec![("api".into(), "fetch".into())]);
     assert_eq!(fetch.count, 2);
-    assert_eq!(fetch.min_ns, 100);          // 100 - 0
-    assert_eq!(fetch.max_ns, 500);          // 1_000_000_500 - 1_000_000_000
+    assert_eq!(fetch.min_ns, 100); // 100 - 0
+    assert_eq!(fetch.max_ns, 500); // 1_000_000_500 - 1_000_000_000
     // avg = (100 + 500) / 2 = 300
     assert_eq!(fetch.avg_ns, 300);
 
@@ -1126,7 +1138,11 @@ fn graph_chart_focus_cursor_walks_series_only() {
     assert_eq!(current_graph(&m).details_selected, 1);
     // Down clamps at series count - 1.
     m.apply(Update::GraphSelectDown);
-    assert_eq!(current_graph(&m).details_selected, 1, "no key rows in Chart focus");
+    assert_eq!(
+        current_graph(&m).details_selected,
+        1,
+        "no key rows in Chart focus"
+    );
     m.apply(Update::GraphSelectUp);
     assert_eq!(current_graph(&m).details_selected, 0);
 }
@@ -1139,7 +1155,9 @@ fn graph_chart_focus_space_toggles_series_visibility() {
     // simplest workable bucket.
     let mut m = Model::new(16);
     m.apply(Update::SpanReceived(timed_span(10, None, "alpha", 0, 100)));
-    m.apply(Update::SpanReceived(timed_span(11, None, "alpha", 100, 200)));
+    m.apply(Update::SpanReceived(timed_span(
+        11, None, "alpha", 100, 200,
+    )));
     m.apply(Update::ToggleGraph);
     assert_eq!(current_graph(&m).focus, GraphFocus::Chart);
 
@@ -1263,7 +1281,10 @@ fn collapse_selected_jumps_to_parent_when_cursor_on_leaf() {
     // to the parent and collapse it.
     m.apply(Update::CollapseSelected);
     let rows = m.visible_rows();
-    assert_eq!(rows[m.selected].key.stack, vec!["root".to_string(), "mid".into()]);
+    assert_eq!(
+        rows[m.selected].key.stack,
+        vec!["root".to_string(), "mid".into()]
+    );
     assert!(!rows[m.selected].is_expanded);
 }
 
@@ -1382,19 +1403,13 @@ fn graph_self_time_metric_subtracts_child_total() {
     // Default Metric::Total — the lone root sample is the full 1000.
     let gs = current_graph(&m);
     assert_eq!(gs.metric, Metric::Total);
-    assert_eq!(
-        gs.store.series_summary(AggMode::Avg)[0].last_ns,
-        1000,
-    );
+    assert_eq!(gs.store.series_summary(AggMode::Avg)[0].last_ns, 1000,);
     // Flip to SelfTime; rehydrate re-walks the ring with the
     // up-to-date child_sum, so the root re-records as 1000 - 300.
     m.apply(Update::ToggleGraphMetric);
     let gs = current_graph(&m);
     assert_eq!(gs.metric, Metric::SelfTime);
-    assert_eq!(
-        gs.store.series_summary(AggMode::Avg)[0].last_ns,
-        700,
-    );
+    assert_eq!(gs.store.series_summary(AggMode::Avg)[0].last_ns, 700,);
 }
 
 // ── Multi-key splits ────────────────────────────────────────
@@ -1518,9 +1533,15 @@ fn exit_explore_with_unknown_prior_level_defaults_to_trace() {
 #[test]
 fn explore_search_filters_by_field_value() {
     let mut m = Model::new(16);
-    m.apply(Update::SpanReceived(span_with_field(10, "root", None, "api", "fetch")));
-    m.apply(Update::SpanReceived(span_with_field(11, "root", None, "api", "post")));
-    m.apply(Update::SpanReceived(span_with_field(12, "root", None, "api", "delete")));
+    m.apply(Update::SpanReceived(span_with_field(
+        10, "root", None, "api", "fetch",
+    )));
+    m.apply(Update::SpanReceived(span_with_field(
+        11, "root", None, "api", "post",
+    )));
+    m.apply(Update::SpanReceived(span_with_field(
+        12, "root", None, "api", "delete",
+    )));
     m.apply(Update::EnterExplore);
     // No filter → all 3 visible.
     let es = current_explore(&m);
@@ -1544,7 +1565,9 @@ fn explore_search_filters_by_field_value() {
 #[test]
 fn explore_search_cancel_keeps_prior_committed_query() {
     let mut m = Model::new(16);
-    m.apply(Update::SpanReceived(span_with_field(10, "root", None, "api", "fetch")));
+    m.apply(Update::SpanReceived(span_with_field(
+        10, "root", None, "api", "fetch",
+    )));
     m.apply(Update::EnterExplore);
     // Commit "fetch" then open a fresh search and Esc — original
     // query is preserved.
@@ -1587,8 +1610,12 @@ fn explore_open_trace_swaps_to_trace_detail_keeping_explore_state() {
 fn explore_sort_cycle_walks_time_latency_then_field_columns() {
     let mut m = Model::new(16);
     // Two distinct field values → "api" becomes a distinguishing column.
-    m.apply(Update::SpanReceived(span_with_field(10, "root", None, "api", "a")));
-    m.apply(Update::SpanReceived(span_with_field(11, "root", None, "api", "b")));
+    m.apply(Update::SpanReceived(span_with_field(
+        10, "root", None, "api", "a",
+    )));
+    m.apply(Update::SpanReceived(span_with_field(
+        11, "root", None, "api", "b",
+    )));
     m.apply(Update::EnterExplore);
     assert_eq!(current_explore(&m).sort, ExploreSortColumn::Timestamp);
     m.apply(Update::ExploreSortRight);
@@ -1639,8 +1666,12 @@ fn explore_invert_sort_flips_direction_and_reorders() {
 #[test]
 fn explore_cycle_sort_resets_direction_to_new_columns_default() {
     let mut m = Model::new(16);
-    m.apply(Update::SpanReceived(span_with_field(10, "root", None, "api", "a")));
-    m.apply(Update::SpanReceived(span_with_field(11, "root", None, "api", "b")));
+    m.apply(Update::SpanReceived(span_with_field(
+        10, "root", None, "api", "a",
+    )));
+    m.apply(Update::SpanReceived(span_with_field(
+        11, "root", None, "api", "b",
+    )));
     m.apply(Update::EnterExplore);
     // Time default = descending; flip to ascending.
     m.apply(Update::ExploreInvertSort);

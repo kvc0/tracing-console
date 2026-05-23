@@ -25,15 +25,15 @@ fn connection_status_dot(model: &Model) -> TuiSpan<'static> {
     let (glyph, style) = match &model.connection {
         ConnectionStatus::Connected => (
             "●",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         ConnectionStatus::Disconnected(_) => (
             "●",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        ConnectionStatus::Connecting => {
-            ("●", Style::default().add_modifier(Modifier::DIM))
-        }
+        ConnectionStatus::Connecting => ("●", Style::default().add_modifier(Modifier::DIM)),
     };
     TuiSpan::styled(glyph, style)
 }
@@ -68,9 +68,7 @@ pub(super) fn connection_header_line(model: &Model) -> Line<'static> {
             // immediately reads as broken.
             spans.push(TuiSpan::styled(
                 "disconnected",
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ));
             if !reason.is_empty() {
                 spans.push(TuiSpan::raw(format!(" {reason}")));
@@ -212,7 +210,9 @@ pub(super) fn format_chance(pct: f64) -> String {
     // dots and digits and we clamp at 100 anyway.
     let s = format!("{:.3}", pct);
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    if pct < 1.0 && let Some(rest) = trimmed.strip_prefix("0.") {
+    if pct < 1.0
+        && let Some(rest) = trimmed.strip_prefix("0.")
+    {
         format!(".{rest}%")
     } else {
         format!("{trimmed}%")

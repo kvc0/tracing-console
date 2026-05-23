@@ -43,9 +43,7 @@ impl ExploreSortColumn {
     /// flips that without changing column.
     pub fn default_direction(&self) -> SortDirection {
         match self {
-            ExploreSortColumn::Timestamp | ExploreSortColumn::Latency => {
-                SortDirection::Desc
-            }
+            ExploreSortColumn::Timestamp | ExploreSortColumn::Latency => SortDirection::Desc,
             ExploreSortColumn::Field(_) => SortDirection::Asc,
         }
     }
@@ -196,10 +194,7 @@ fn walk_trace<'a>(
     span_by_id: &std::collections::HashMap<u64, &'a WireSpan>,
     collapsed: &std::collections::BTreeSet<u64>,
 ) {
-    let kids = by_parent
-        .get(&span.id)
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
+    let kids = by_parent.get(&span.id).map(|v| v.as_slice()).unwrap_or(&[]);
     let has_children = !kids.is_empty() || !span.events.is_empty();
     let expanded = !collapsed.contains(&span.id);
     out.push(TraceRow::Span {

@@ -28,7 +28,11 @@ pub fn render_explore(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(2), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
         .split(area);
     render_header_row(f, chunks[0], model);
 
@@ -55,7 +59,11 @@ pub fn render_explore(
     )];
     if let Some(buf) = &es.search_input {
         sub.push(TuiSpan::raw("   /"));
-        let body = if buf.is_empty() { " ".into() } else { buf.clone() };
+        let body = if buf.is_empty() {
+            " ".into()
+        } else {
+            buf.clone()
+        };
         sub.push(TuiSpan::styled(
             body,
             Style::default()
@@ -72,12 +80,15 @@ pub fn render_explore(
         ));
     }
     let header_row = Line::from(sub);
-    f.render_widget(Paragraph::new(header_row), Rect {
-        x: chunks[1].x,
-        y: chunks[1].y + 1,
-        width: chunks[1].width,
-        height: 1,
-    });
+    f.render_widget(
+        Paragraph::new(header_row),
+        Rect {
+            x: chunks[1].x,
+            y: chunks[1].y + 1,
+            width: chunks[1].width,
+            height: 1,
+        },
+    );
 
     // Body: span instance table.
     let spans = matching_spans(model, es);
@@ -91,8 +102,7 @@ pub fn render_explore(
     // and shows a `▲`/`▼` arrow for direction.  Inactive columns
     // render dim, matching the graph view's series-table header.
     let dim_header = Style::default().add_modifier(Modifier::DIM);
-    let active_header =
-        Style::default().add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+    let active_header = Style::default().add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
     let header_cell = |label: &str, active: bool| -> Cell<'static> {
         if active {
             let arrow = es.direction.arrow();
@@ -164,20 +174,15 @@ pub fn render_explore(
 /// `HH:MM:SS.mmm` string.  Mirrors the graph view's `Local`
 /// time-labels mode, just with millisecond precision.
 fn format_span_timestamp(opened_at_ns: u64) -> String {
-    let dt = chrono::DateTime::<chrono::Local>::from(
-        chrono::DateTime::from_timestamp_nanos(opened_at_ns as i64),
-    );
+    let dt = chrono::DateTime::<chrono::Local>::from(chrono::DateTime::from_timestamp_nanos(
+        opened_at_ns as i64,
+    ));
     dt.format("%H:%M:%S%.3f").to_string()
 }
 
 // ── Trace detail view ─────────────────────────────────────────────────────
 
-pub fn render_trace_detail(
-    f: &mut Frame<'_>,
-    area: Rect,
-    model: &Model,
-    td: &TraceDetailState,
-) {
+pub fn render_trace_detail(f: &mut Frame<'_>, area: Rect, model: &Model, td: &TraceDetailState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -212,10 +217,8 @@ pub fn render_trace_detail(
         .border_style(focused_border_style(true));
 
     if rows.is_empty() {
-        let para = Paragraph::new(Line::from(
-            "(root span has fallen out of the cache)",
-        ))
-        .block(block);
+        let para =
+            Paragraph::new(Line::from("(root span has fallen out of the cache)")).block(block);
         f.render_widget(para, chunks[1]);
         return;
     }
@@ -272,7 +275,12 @@ fn trace_row_to_row<'a>(
         ]
     };
     match row {
-        TraceRow::Span { id, depth, has_children, expanded } => {
+        TraceRow::Span {
+            id,
+            depth,
+            has_children,
+            expanded,
+        } => {
             let Some(s) = model.agg.span_by_id(*id) else {
                 let mut cells = empty_cells();
                 cells[3] = Cell::from("(missing span)");
@@ -294,8 +302,14 @@ fn trace_row_to_row<'a>(
             };
             let indent = "  ".repeat(*depth);
             let mut name_spans = vec![
-                TuiSpan::styled(format!("{indent}{marker}"), Style::default().add_modifier(Modifier::DIM)),
-                TuiSpan::styled(s.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                TuiSpan::styled(
+                    format!("{indent}{marker}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                TuiSpan::styled(
+                    s.name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
             ];
             if !s.fields.is_empty() {
                 let summary: Vec<String> = s
@@ -316,7 +330,11 @@ fn trace_row_to_row<'a>(
                 Cell::from(Line::from(name_spans)),
             ])
         }
-        TraceRow::Event { parent_id, idx, depth } => {
+        TraceRow::Event {
+            parent_id,
+            idx,
+            depth,
+        } => {
             let Some(parent) = model.agg.span_by_id(*parent_id) else {
                 let mut cells = empty_cells();
                 cells[3] = Cell::from("(missing event)");

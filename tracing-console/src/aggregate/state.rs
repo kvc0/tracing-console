@@ -80,7 +80,6 @@ fn ms_min_max(ms: &BTreeMap<u64, u32>) -> (u64, u64) {
     }
 }
 
-
 #[derive(Debug, Clone)]
 struct Entry {
     span: WireSpan,
@@ -157,9 +156,9 @@ impl Aggregator {
     /// resolved stack is the same value `bucket.stack` would carry
     /// with `split_keys = ∅`, since stacks don't depend on splits.
     pub fn iter_with_stack(&self) -> impl Iterator<Item = (&WireSpan, &Vec<String>)> + '_ {
-        self.order.iter().filter_map(move |id| {
-            self.by_id.get(id).map(|e| (&e.span, &e.bucket.stack))
-        })
+        self.order
+            .iter()
+            .filter_map(move |id| self.by_id.get(id).map(|e| (&e.span, &e.bucket.stack)))
     }
 
     /// Resolved stack for a span currently in the ring.  Used by
@@ -191,11 +190,7 @@ impl Aggregator {
     /// algorithm as `collect_splits` but parametrised so the graph
     /// view can produce its own series keys without touching the
     /// aggregator's own split state.
-    pub fn collect_splits_for(
-        &self,
-        id: u64,
-        keys: &BTreeSet<String>,
-    ) -> Vec<(String, String)> {
+    pub fn collect_splits_for(&self, id: u64, keys: &BTreeSet<String>) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut cursor = self.by_id.get(&id);
         let mut depth = 0;
@@ -304,10 +299,7 @@ impl Aggregator {
     }
 
     fn park_pending(&mut self, missing_parent: u64, span: WireSpan) {
-        self.pending
-            .entry(missing_parent)
-            .or_default()
-            .push(span);
+        self.pending.entry(missing_parent).or_default().push(span);
         self.pending_len += 1;
         while self.pending_len > self.pending_cap {
             match self.pending.pop_first() {
@@ -338,9 +330,10 @@ impl Aggregator {
 
         // Remove its bucket contribution.
         let now_empty = {
-            let state = self.buckets.get_mut(&entry.bucket).expect(
-                "entry's bucket must be present while entry is in the ring",
-            );
+            let state = self
+                .buckets
+                .get_mut(&entry.bucket)
+                .expect("entry's bucket must be present while entry is in the ring");
             state.remove(entry.total_ns, entry.self_ns);
             state.is_empty()
         };
@@ -412,7 +405,11 @@ impl Aggregator {
             .iter()
             .map(|(k, s)| (k.clone(), s.to_stack_stats()))
             .collect();
-        out.sort_by(|a, b| a.0.splits.cmp(&b.0.splits).then_with(|| a.0.stack.cmp(&b.0.stack)));
+        out.sort_by(|a, b| {
+            a.0.splits
+                .cmp(&b.0.splits)
+                .then_with(|| a.0.stack.cmp(&b.0.stack))
+        });
         out
     }
 
@@ -452,7 +449,6 @@ impl Aggregator {
     }
 }
 
-
 /// Collect splits for `span`, inheriting from the parent's already-
 /// resolved split list.  Closest-to-leaf wins: keys present on the
 /// span itself override those of any ancestor.
@@ -478,7 +474,6 @@ fn collect_splits(
     splits.sort_by(|a, b| a.0.cmp(&b.0));
     splits
 }
-
 
 // ── Manual Debug + Clone + Serialize/Deserialize ────────────────────
 

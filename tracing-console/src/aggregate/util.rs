@@ -87,4 +87,3 @@ pub fn fmt_ns(ns: u64) -> String {
         format!("{}ns", ns)
     }
 }
-

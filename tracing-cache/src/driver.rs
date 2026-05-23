@@ -251,16 +251,17 @@ mod tests {
         let events = vec![make_event(&pool, 99), make_event(&pool, 99)];
         Driver::flush_event_batch(&map, &mut side, 8, events.into_iter());
         assert_eq!(bucket_len(&side, 99), Some(2));
-        assert!(map.read().unwrap().is_empty(), "events must not insert spans");
+        assert!(
+            map.read().unwrap().is_empty(),
+            "events must not insert spans"
+        );
 
         // Parent arrives → orphans attach and the side bucket is drained.
-        Driver::flush_span_batch(
-            &map,
-            &mut side,
-            8,
-            std::iter::once(make_span(99)),
+        Driver::flush_span_batch(&map, &mut side, 8, std::iter::once(make_span(99)));
+        assert!(
+            side.is_empty(),
+            "side bucket for 99 must drain on span arrival"
         );
-        assert!(side.is_empty(), "side bucket for 99 must drain on span arrival");
         let m = map.read().unwrap();
         let span = m.get(&99).expect("span 99 inserted");
         assert_eq!(span.events.len(), 2);
@@ -382,12 +383,7 @@ mod tests {
 
         // New parent 7 evicts parent 1's *entire* bucket — all
         // three events go, not just one.
-        Driver::flush_event_batch(
-            &map,
-            &mut side,
-            CAP,
-            std::iter::once(make_event(&pool, 7)),
-        );
+        Driver::flush_event_batch(&map, &mut side, CAP, std::iter::once(make_event(&pool, 7)));
         let ids: Vec<u64> = side.keys().copied().collect();
         assert_eq!(ids, vec![2, 7]);
         assert!(bucket_len(&side, 1).is_none());

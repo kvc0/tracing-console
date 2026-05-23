@@ -166,4 +166,3 @@ pub enum Effect {
     /// not change locally — the server's `CacheChance` confirms.
     RequestSetChance(f64),
 }
-

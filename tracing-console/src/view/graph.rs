@@ -15,7 +15,6 @@ use crate::model::{
 
 use super::header::{focused_border_style, render_header_row};
 
-
 /// Same palette as the rest of the TUI, rotated round-robin per
 /// series so each line stays a stable colour across renders.
 const SERIES_PALETTE: &[Color] = &[
@@ -206,9 +205,8 @@ fn time_labels_label(mode: TimeLabels) -> &'static str {
 /// they'll line up with the axis correctly.
 pub(super) fn wall_clock_label_step(span_secs: f64) -> (f64, usize) {
     const NICE_STEPS: &[f64] = &[
-        0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5,
-        1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0,
-        60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0,
+        0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
+        300.0, 600.0, 900.0, 1800.0, 3600.0,
     ];
     const TARGET_N: f64 = 4.0;
     const MIN_N: usize = 3;
@@ -233,9 +231,7 @@ pub(super) fn wall_clock_label_step(span_secs: f64) -> (f64, usize) {
         }
         let n = n_round as usize;
         let score = (n_round - TARGET_N).abs();
-        let better = best.map_or(true, |(_, prev_n)| {
-            (prev_n as f64 - TARGET_N).abs() > score
-        });
+        let better = best.map_or(true, |(_, prev_n)| (prev_n as f64 - TARGET_N).abs() > score);
         if better {
             best = Some((step, n));
         }
@@ -264,7 +260,11 @@ fn format_seconds(s: f64) -> String {
 
 fn ns_axis_labels(y_max: f64) -> Vec<ratatui::text::Span<'static>> {
     let n_ticks = 4;
-    let step = if y_max <= 0.0 { 1.0 } else { y_max / n_ticks as f64 };
+    let step = if y_max <= 0.0 {
+        1.0
+    } else {
+        y_max / n_ticks as f64
+    };
     (0..=n_ticks)
         .map(|i| {
             let v = (i as f64) * step;
@@ -397,7 +397,11 @@ where
 {
     match buf {
         Some(buf) => {
-            let body = if buf.is_empty() { " ".to_string() } else { buf.clone() };
+            let body = if buf.is_empty() {
+                " ".to_string()
+            } else {
+                buf.clone()
+            };
             let base = Style::default()
                 .bg(Color::White)
                 .fg(Color::Black)
@@ -495,22 +499,15 @@ fn series_table_lines(
 
     let series_keys = gs.series_keys();
     if series_keys.is_empty() {
-        return (
-            None,
-            vec![Line::from("  (no series yet)")],
-            None,
-        );
+        return (None, vec![Line::from("  (no series yet)")], None);
     }
 
     let summaries = gs.store.series_summary(gs.aggregation);
-    let summary_by_key: std::collections::HashMap<
-        Vec<(String, String)>,
-        SeriesSummary,
-    > = summaries.into_iter().map(|s| (s.key.clone(), s)).collect();
+    let summary_by_key: std::collections::HashMap<Vec<(String, String)>, SeriesSummary> =
+        summaries.into_iter().map(|s| (s.key.clone(), s)).collect();
 
     let split_cols: Vec<String> = gs.split_keys.iter().cloned().collect();
-    let mut split_widths: Vec<usize> =
-        split_cols.iter().map(|k| k.chars().count()).collect();
+    let mut split_widths: Vec<usize> = split_cols.iter().map(|k| k.chars().count()).collect();
 
     // Colour slot per series comes from the chart's already-
     // computed assignment map, so legend and chart line agree
@@ -561,8 +558,13 @@ fn series_table_lines(
     }
 
     let stat_headers = ["n", "min", "avg", "max", "last"];
-    let stat_columns =
-        [SortColumn::Count, SortColumn::Min, SortColumn::Avg, SortColumn::Max, SortColumn::Last];
+    let stat_columns = [
+        SortColumn::Count,
+        SortColumn::Min,
+        SortColumn::Avg,
+        SortColumn::Max,
+        SortColumn::Last,
+    ];
     // Reserve enough width for the worst-case `fmt_ns` formatting at
     // any single scale — `XXX.Xms` / `XXX.Xµs` is 7 chars — so the
     // time columns don't flap when values waffle between tens and
@@ -586,10 +588,8 @@ fn series_table_lines(
     // Header — one span per cell so we can selectively underline
     // the active sort column while keeping the rest dim.
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let underline =
-        Style::default().add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
-    let mut header_spans: Vec<TuiSpan<'static>> =
-        vec![TuiSpan::styled("      ", dim)];
+    let underline = Style::default().add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+    let mut header_spans: Vec<TuiSpan<'static>> = vec![TuiSpan::styled("      ", dim)];
     for (i, c) in split_cols.iter().enumerate() {
         let cell = format!("{:<w$}", c, w = split_widths[i]);
         let is_active = matches!(&gs.sort_column, SortColumn::SplitKey(k) if k == c);
@@ -686,10 +686,7 @@ fn render_graph_details(
         ));
 
         let series_keys = gs.series_keys();
-        let candidates = crate::aggregate::candidate_split_keys_for(
-            &model.agg,
-            &gs.locked_stack,
-        );
+        let candidates = crate::aggregate::candidate_split_keys_for(&model.agg, &gs.locked_stack);
         let combined_len = series_keys.len() + candidates.len();
         let sel = if combined_len == 0 {
             usize::MAX
@@ -719,9 +716,7 @@ fn render_graph_details(
             "metadata keys  (Space splits/unsplits, Tab to leave):",
         ));
         if candidates.is_empty() {
-            body.push(Line::from(
-                "  (no metadata keys present on matching spans)",
-            ));
+            body.push(Line::from("  (no metadata keys present on matching spans)"));
         } else {
             let series_count = series_keys.len();
             for (i, k) in candidates.iter().enumerate() {
@@ -837,10 +832,7 @@ mod tests {
                 (step * n as f64 - span).abs() < 1e-6,
                 "step={step} n={n} span={span}: step*n must equal span",
             );
-            assert!(
-                (3..=8).contains(&n),
-                "n={n} out of [3,8] for span={span}",
-            );
+            assert!((3..=8).contains(&n), "n={n} out of [3,8] for span={span}",);
         }
     }
 
@@ -894,10 +886,7 @@ mod tests {
         assert_eq!(format_axis_label(30.0, TimeLabels::Unix, now), "14:37:28Z");
         assert_eq!(format_axis_label(60.0, TimeLabels::Unix, now), "14:36:58Z");
         // Span backward across the minute boundary.
-        assert_eq!(
-            format_axis_label(120.0, TimeLabels::Unix, now),
-            "14:35:58Z",
-        );
+        assert_eq!(format_axis_label(120.0, TimeLabels::Unix, now), "14:35:58Z",);
     }
 
     #[test]
@@ -1016,10 +1005,7 @@ mod tests {
         m.apply(Update::GraphToggleSplit);
         // Three distinct series.
         for (i, api) in ["fetch", "post", "delete"].iter().enumerate() {
-            m.apply(Update::SpanReceived(span_with_api(
-                20 + i as u64,
-                api,
-            )));
+            m.apply(Update::SpanReceived(span_with_api(20 + i as u64, api)));
         }
         let gs = match &m.view {
             ViewMode::Graph(gs) => gs,

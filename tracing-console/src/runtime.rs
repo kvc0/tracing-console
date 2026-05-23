@@ -112,15 +112,15 @@ async fn run_network(
 
     'reconnect: loop {
         let _ = tx.send(Update::Status(format!("connecting to {addr}…")));
-        let (rpc_client, conn) =
-            match client::connect::<ClientCodec, _>(addr, &configuration).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    let _ = tx.send(Update::Disconnected(format!("connect failed: {e}")));
-                    tokio::time::sleep(RECONNECT_DELAY).await;
-                    continue 'reconnect;
-                }
-            };
+        let (rpc_client, conn) = match client::connect::<ClientCodec, _>(addr, &configuration).await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = tx.send(Update::Disconnected(format!("connect failed: {e}")));
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue 'reconnect;
+            }
+        };
         let conn_task = tokio::spawn(conn);
         let _ = tx.send(Update::Connected);
 

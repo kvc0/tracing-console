@@ -12,9 +12,7 @@ use protosocket_rpc::Message;
 use protosocket_rpc::server::{ConnectionService, RpcResponder, SocketRpcServer, SocketService};
 use tokio::sync::watch;
 use tracing::metadata::LevelFilter;
-use tracing_cache::{
-    ChanceHandle, ChancePredicate, EnabledPredicate, LevelHandle, SpanCache, SpanRecord,
-};
+use tracing_cache::{ChanceHandle, EnabledPredicate, LevelHandle, SpanCache, SpanRecord};
 
 use crate::protocol::{Request, RequestBody, Response, WireLevel, WireLevelFilter};
 use crate::wire::{TimeBase, span_to_wire};
@@ -706,9 +704,8 @@ mod tests {
     where
         F: FnOnce(),
     {
-        let level = tracing_cache::LevelPredicate::with_filter(
-            tracing::metadata::LevelFilter::TRACE,
-        );
+        let level =
+            tracing_cache::LevelPredicate::with_filter(tracing::metadata::LevelFilter::TRACE);
         let level_handle = level.handle();
         let predicate = ChancePredicate::new(level, 100.0);
         let chance_handle = predicate.handle();
@@ -787,7 +784,12 @@ mod tests {
             }
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let (addr, server) = spawn_server(
+            Arc::clone(&cache),
+            level_handle.clone(),
+            chance_handle.clone(),
+        )
+        .await;
         let client = connect_client(addr).await;
         let mut stream = client
             .send_streaming(Request::new(RequestBody::StartStream))
@@ -811,7 +813,12 @@ mod tests {
             }
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let (addr, server) = spawn_server(
+            Arc::clone(&cache),
+            level_handle.clone(),
+            chance_handle.clone(),
+        )
+        .await;
         let client = connect_client(addr).await;
         let mut stream = client
             .send_streaming(Request::new(RequestBody::StartStream))
@@ -854,7 +861,12 @@ mod tests {
             drop(span_debug);
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let (addr, server) = spawn_server(
+            Arc::clone(&cache),
+            level_handle.clone(),
+            chance_handle.clone(),
+        )
+        .await;
         let client = connect_client(addr).await;
 
         let ack = client
@@ -884,7 +896,12 @@ mod tests {
             }
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let (addr, server) = spawn_server(
+            Arc::clone(&cache),
+            level_handle.clone(),
+            chance_handle.clone(),
+        )
+        .await;
         let client = connect_client(addr).await;
 
         client
@@ -921,7 +938,12 @@ mod tests {
             }
         });
 
-        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let (addr, server) = spawn_server(
+            Arc::clone(&cache),
+            level_handle.clone(),
+            chance_handle.clone(),
+        )
+        .await;
         let client = connect_client(addr).await;
 
         client
@@ -953,7 +975,12 @@ mod tests {
             let s = tracing::span!(parent: None, tracing::Level::INFO, "pre_level");
             drop(s);
         });
-        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let (addr, server) = spawn_server(
+            Arc::clone(&cache),
+            level_handle.clone(),
+            chance_handle.clone(),
+        )
+        .await;
         let client = connect_client(addr).await;
         // Distinct ids — the framework matches responses to RPCs by
         // request id, and id=0 would clobber on the client side.
@@ -1018,7 +1045,12 @@ mod tests {
         // Start at INFO via the cache predicate handle.
         level_handle.set(LevelFilter::INFO);
 
-        let (addr, server) = spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let (addr, server) = spawn_server(
+            Arc::clone(&cache),
+            level_handle.clone(),
+            chance_handle.clone(),
+        )
+        .await;
 
         // Open a streaming RPC; drop it immediately to mimic a console
         // disconnect.
@@ -1145,8 +1177,7 @@ mod tests {
     #[test]
     fn filter_passes_descendant_inherits_root_decision_via_memo() {
         let filter = Some("alpha".to_string());
-        let roots: Arc<RwLock<HashMap<u64, bool>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let roots: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
         // Pre-populate the memo with parent=42 mapped to `false`.
         roots.write().unwrap().insert(42, false);
 
@@ -1162,8 +1193,7 @@ mod tests {
     fn filter_passes_root_caches_match_in_memo() {
         // Root with name == "sampling_test" matches "sampling".
         let filter = Some("sampling".to_string());
-        let roots: Arc<RwLock<HashMap<u64, bool>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let roots: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
         let root = synth_span(10, None);
         assert!(filter_passes(&root, &filter, &roots));
         assert_eq!(roots.read().unwrap().get(&10).copied(), Some(true));
@@ -1171,8 +1201,7 @@ mod tests {
 
     #[test]
     fn filter_passes_empty_or_none_filter_accepts_everything() {
-        let roots: Arc<RwLock<HashMap<u64, bool>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let roots: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
         let s = synth_span(1, None);
         assert!(filter_passes(&s, &None, &roots));
         assert!(filter_passes(&s, &Some(String::new()), &roots));
@@ -1185,8 +1214,12 @@ mod tests {
     #[tokio::test]
     async fn set_sampling_rate_rejects_out_of_range() {
         let (cache, level_handle, chance_handle) = cache_with_spans(|| {});
-        let (addr, server) =
-            spawn_server(Arc::clone(&cache), level_handle.clone(), chance_handle.clone()).await;
+        let (addr, server) = spawn_server(
+            Arc::clone(&cache),
+            level_handle.clone(),
+            chance_handle.clone(),
+        )
+        .await;
         let client = connect_client(addr).await;
 
         for bad in [1.5_f64, -0.1, f64::NAN] {

@@ -10,11 +10,13 @@ without needing a bunch of infrastructure.
 The downside is that if you wanted to see something that already happened, you can't. This is for looking at problems that are
 happening!
 
+Currently this repo doesn't offer opentelemetry traces.
+
 ## What this is for
 
-This is suited for **short-lived API traces** — request-response work, RPC handlers, background jobs that complete in
-milliseconds to seconds. The cache only commits spans to its shared map when they close, and the protocol only streams *closed*
-spans. Anything still in flight is invisible to the console.
+This is suited for short-lived APIs — request-response work, RPC handlers, background jobs that complete in milliseconds to
+seconds. The cache only commits spans to its shared map when they close, and the protocol only streams closed spans. Anything
+still in flight is invisible to the console.
 
 That makes it a poor fit for:
 
@@ -23,7 +25,7 @@ That makes it a poor fit for:
 - **Distributed observability** — This is a single-host debugging console, not a distributed tracing backend.
 
 What it is good at: attaching to a running server, watching the live shape of recent requests, finding outliers, drilling into
-one trace's full event/span tree, and disabling again without leaving any trace behind.
+one trace's full event/span tree, and disabling again without leaving any undue overhead behind.
 
 ## Getting started — integrating with your server
 
