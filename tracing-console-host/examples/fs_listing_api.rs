@@ -44,7 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let level_handle = level.handle();
     let predicate = tracing_cache::ChancePredicate::new(level, 100.0);
     let chance_handle = predicate.handle();
-    let (cache, driver) = SpanCache::with_predicate(16384, predicate);
+    // span rate in this demo is super low. Flush more often so the UI can get results without waiting.
+    let mut config = tracing_cache::CacheConfig::default();
+    config.pending_batch = 2;
+    let (cache, driver) = SpanCache::with_predicate_and_config(16384, predicate, config);
     let cache = Arc::new(cache);
 
     tracing::subscriber::set_global_default(Arc::clone(&cache))?;
@@ -120,14 +123,8 @@ fn walk_body(path: &Path) {
 }
 
 fn fetch_size(path: &Path) {
-    let span = tracing::span!(
-        Level::INFO,
-        "file_size",
-        path = %path.display(),
-    );
-    let _g = span.enter();
     match std::fs::metadata(path) {
-        Ok(m) => tracing::event!(Level::INFO, bytes = m.len(), "size"),
-        Err(e) => tracing::event!(Level::WARN, error = %e, "metadata failed"),
+        Ok(m) => tracing::event!(Level::DEBUG, bytes = m.len(), path = %path.display(), "size"),
+        Err(e) => tracing::event!(Level::WARN, error = %e, path = %path.display(), "metadata failed"),
     }
 }

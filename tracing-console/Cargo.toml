@@ -1,7 +1,14 @@
 [package]
 name = "tracing-console"
-version = "0.1.0"
-edition = "2024"
+description = "Interactive TUI for inspecting `tracing` spans served by `tracing-console-host`."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+# Local CLI only — not published to crates.io.
+publish = false
 
 [[bin]]
 name = "tracing-console"
@@ -12,9 +19,6 @@ chrono                          = { workspace = true }
 clap                            = { workspace = true }
 crossterm                       = { workspace = true }
 futures                         = { workspace = true }
-k-cache                         = { workspace = true }
-log                             = { workspace = true }
-protosocket                     = { workspace = true }
 protosocket-messagepack         = { workspace = true }
 protosocket-rpc                 = { workspace = true }
 ratatui                         = { workspace = true }

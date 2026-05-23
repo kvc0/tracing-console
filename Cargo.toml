@@ -2,16 +2,26 @@
 resolver = "2"
 members = ["tracing-console", "tracing-cache", "tracing-console-host"]
 
+[workspace.package]
+version = "0.1.0"
+authors = ["kvcache"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/momentohq/tracing-console"
+readme = "README.md"
+
 [workspace.dependencies]
-criterion                       = { version = "0", features = ["async_tokio"] }
+tracing-cache                   = { path = "tracing-cache", version = "0.1.0" }
+tracing-console-host            = { path = "tracing-console-host", version = "0.1.0" }
+
 async-stream                    = { version = "0.3" }
 chrono                          = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap                            = { version = "4", features = ["derive"] }
 compact_str                     = { version = "0.8", features = ["serde"] }
+criterion                       = { version = "0", features = ["async_tokio"] }
 crossterm                       = { version = "0.28" }
 futures                         = { version = "0.3" }
 futures-core                    = { version = "0.3" }
-k-cache                         = { version = "0" }
 log                             = { version = "0.4" }
 protosocket                     = { version = "1" }
 protosocket-messagepack         = { version = "1" }
@@ -22,12 +32,9 @@ ratatui                         = { version = "0.29" }
 serde                           = { version = "1", features = ["derive"] }
 serde_json                      = { version = "1" }
 slab                            = { version = "0" }
-smallvec                        = { version = "1" }
 spillway                        = { version = "1" }
 tokio                           = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 tracing                         = { version = "0" }
-tracing-cache                   = { path = "tracing-cache" }
-tracing-console-host            = { path = "tracing-console-host" }
 tracing-futures                 = { version = "0.2" }
 
 [profile.bench]

@@ -1,11 +1,17 @@
 [package]
 name = "tracing-cache"
-version = "0.1.0"
-edition = "2024"
+description = "A `tracing::Subscriber` that captures closed spans into a bounded in-memory ring buffer with a background driver."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["tracing", "subscriber", "observability", "cache", "debugging"]
+categories = ["development-tools::debugging", "development-tools::profiling"]
 
 [dependencies]
 compact_str                     = { workspace = true }
-k-cache                         = { workspace = true }
 log                             = { workspace = true }
 rand                            = { workspace = true }
 slab                            = { workspace = true }
