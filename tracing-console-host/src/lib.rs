@@ -1,7 +1,7 @@
 //! protosocket-rpc host that streams closed spans from a `tracing-cache::SpanCache`
 //! to console clients over messagepack.
 //!
-//! Usage sketch:
+//! Usage:
 //! ```ignore
 //! let (cache, driver) = tracing_cache::SpanCache::new(16384);
 //! let cache = std::sync::Arc::new(cache);

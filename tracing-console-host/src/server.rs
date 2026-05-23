@@ -27,7 +27,7 @@ type ServerCodec = (MessagePackSerializer<Response>, MessagePackDecoder<Request>
 // interval is scaled by `target / observed`, then clamped to ±20% of the
 // previous interval and bounded by `STREAM_MIN_INTERVAL` / `STREAM_MAX_INTERVAL`.
 // `STREAM_BATCH` is the per-page cap fed to `cache.page()`; it must exceed
-// the target so observed counts above target signal a real backlog.
+// the target so observed counts above target signal a backlog.
 const STREAM_POLL_INTERVAL_INITIAL: Duration = Duration::from_millis(50);
 // Per-poll page cap.  Sets the maximum throughput the loop can move per
 // tick — at high arrival rates the adaptive interval bottoms out near
@@ -200,7 +200,7 @@ pub(crate) struct ConnectionState<P: EnabledPredicate> {
     /// Lazily set on the first StartStream RPC.  Liveness probes that
     /// open + close a TCP connection without ever issuing a streaming
     /// RPC leave this `None`, so their drop doesn't decrement the
-    /// active-stream counter and trigger a spurious reset.  A real
+    /// active-stream counter and trigger a spurious reset.  A
     /// console always sends StartStream once, so its connection's
     /// drop reliably fires the reset.
     stream_guard: Option<StreamGuard>,
