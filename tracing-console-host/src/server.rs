@@ -84,7 +84,7 @@ impl StreamState {
 /// [`StreamGuard`] so the host can fall back to `OFF` when the last
 /// console drops — the cache costs zero work when nobody's watching.
 #[derive(Clone)]
-pub struct CacheLevelBroadcast {
+pub(crate) struct CacheLevelBroadcast {
     level_handle: LevelHandle,
     level_tx: watch::Sender<WireLevelFilter>,
     chance_handle: ChanceHandle,
@@ -167,7 +167,7 @@ impl CacheLevelBroadcast {
 /// generator (and thus the spawned responder.stream future) ends —
 /// e.g. when the client cancels the streaming RPC by dropping the
 /// `StreamingCompletion`.
-pub struct StreamGuard {
+pub(crate) struct StreamGuard {
     broadcast: CacheLevelBroadcast,
 }
 
@@ -192,7 +192,7 @@ impl Drop for StreamGuard {
 
 /// One per active client connection.  Holds an `Arc` to the shared cache so
 /// it can page closed spans, plus its own filter / sampling / level state.
-pub struct ConnectionState<P: EnabledPredicate> {
+pub(crate) struct ConnectionState<P: EnabledPredicate> {
     cache: Arc<SpanCache<P>>,
     base: TimeBase,
     state: Arc<RwLock<StreamState>>,

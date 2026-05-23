@@ -30,7 +30,10 @@ mod tests;
 pub use cache::SpanCache;
 pub use config::{CacheConfig, DEFAULT_LANE_COUNT};
 pub use driver::Driver;
-pub use object_pool::{ObjectPool, Pool, Resettable, ReuseRef};
+// `Pool` and `ObjectPool` are crate-private — only `ReuseRef`
+// (visible on `SpanRecord.events`) and its `Resettable` bound
+// remain on the public surface.
+pub use object_pool::{Resettable, ReuseRef};
 pub use predicate::{
     ChanceHandle, ChancePredicate, EnabledPredicate, Interest, LevelHandle, LevelPredicate,
 };

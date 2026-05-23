@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex};
 use crate::thread_state::ensure_thread_shard_key;
 
 /// State that can be reset to a pool-ready empty form.
+// `pub` because it appears as a bound on `ReuseRef<T>`, which is
+// part of the public surface (`SpanRecord.events`).
+#[doc(hidden)]
 pub trait Resettable {
     fn reset(&mut self);
 }
@@ -33,7 +36,7 @@ pub trait Resettable {
 /// is recycled — `acquire` is `Vec::pop` returning the prior Box, and
 /// `return` is `Vec::push` putting it back; no `Box::new` on the hot
 /// path after warmup.
-pub struct Pool<T: Resettable + Default + Send + 'static> {
+pub(crate) struct Pool<T: Resettable + Default + Send + 'static> {
     items: Mutex<Vec<Box<T>>>,
     capacity: usize,
 }
@@ -85,7 +88,7 @@ impl<T: Resettable + Default + Send + 'static> Pool<T> {
 /// items are created lazily via `T::default()` when no ready item is
 /// available.  Sharding keeps `try_lock`-failure rates low under
 /// concurrent acquire / release.
-pub struct ObjectPool<T: Resettable + Default + Send + 'static> {
+pub(crate) struct ObjectPool<T: Resettable + Default + Send + 'static> {
     shards: Vec<Arc<Pool<T>>>,
     shard_mask: u64,
 }

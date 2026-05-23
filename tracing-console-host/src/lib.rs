@@ -14,12 +14,12 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::panic_in_result_fn,)
 )]
 
-pub mod protocol;
-pub mod server;
-pub mod wire;
+mod protocol;
+mod server;
+mod wire;
 
 pub use protocol::{
     Request, RequestBody, Response, ResponseBody, WireEvent, WireFieldValue, WireLevel,
     WireLevelFilter, WireSpan,
 };
-pub use server::serve;
+pub use server::{ServeError, serve};

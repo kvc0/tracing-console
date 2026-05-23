@@ -27,7 +27,7 @@ fn field_to_wire(value: &FieldValue) -> WireFieldValue {
 /// nanoseconds since the Unix epoch — convertible directly via
 /// `chrono::DateTime::from_timestamp_nanos`.
 #[derive(Debug, Clone, Copy)]
-pub struct TimeBase {
+pub(crate) struct TimeBase {
     instant_at_start: Instant,
     systime_at_start: SystemTime,
 }
@@ -53,7 +53,7 @@ impl TimeBase {
     }
 }
 
-pub fn span_to_wire(record: &SpanRecord, base: TimeBase) -> WireSpan {
+pub(crate) fn span_to_wire(record: &SpanRecord, base: TimeBase) -> WireSpan {
     let metadata = record.metadata;
     WireSpan {
         id: record.id,
@@ -76,7 +76,7 @@ pub fn span_to_wire(record: &SpanRecord, base: TimeBase) -> WireSpan {
     }
 }
 
-pub fn event_to_wire(event: &EventRecord, base: TimeBase) -> WireEvent {
+pub(crate) fn event_to_wire(event: &EventRecord, base: TimeBase) -> WireEvent {
     let metadata = event.metadata();
     WireEvent {
         name: metadata.name().to_string(),
