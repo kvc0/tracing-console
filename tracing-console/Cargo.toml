@@ -1,0 +1,32 @@
+[package]
+name = "tracing-console"
+description = "Interactive TUI for inspecting `tracing` spans served by `tracing-console-host`."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+# Local CLI only — not published to crates.io.
+publish = false
+
+[[bin]]
+name = "tracing-console"
+path = "src/main.rs"
+
+[dependencies]
+chrono                          = { workspace = true }
+clap                            = { workspace = true }
+crossterm                       = { workspace = true }
+futures                         = { workspace = true }
+protosocket-messagepack         = { workspace = true }
+protosocket-rpc                 = { workspace = true }
+ratatui                         = { workspace = true }
+serde                           = { workspace = true }
+serde_json                      = { workspace = true }
+spillway                        = { workspace = true }
+tokio                           = { workspace = true }
+tracing-console-host            = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v0.*
+      - v1.*
+      - v2.*
+      - v3.*
+      - v4.*
+      - v5.*
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build the `tracing-console` binary for each supported target,
+  # tar it up, and stash it as a workflow artifact for the
+  # `gh-release` job to consume.  Linux targets cross-compile via
+  # `cross` (always works on the ubuntu runner regardless of the
+  # host's musl/glibc); macOS Apple Silicon builds natively on an
+  # `macos-26` runner.
+  binaries:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - label: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - label: macos-aarch64
+            os: macos-26
+            target: aarch64-apple-darwin
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked --version 0.2.5
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release -p tracing-console --target ${{ matrix.target }}
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release -p tracing-console --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          set -euo pipefail
+          archive="tracing-console-${{ matrix.label }}.tar.gz"
+          tar -czf "$archive" \
+            -C "target/${{ matrix.target }}/release" tracing-console
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tracing-console-${{ matrix.label }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  # Collect every per-target artifact and attach them to a fresh
+  # GitHub release for the pushed tag.  Auto-generates release
+  # notes from the commit log since the previous tag.
+  gh-release:
+    name: GitHub release
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  # crates.io publish for `tracing-cache` + `tracing-console-host`.
+  # `tracing-console` is `publish = false` so it's skipped
+  # automatically.  Runs in parallel with the binary build — the
+  # crate publish doesn't depend on the artifact step.
+  crates-io:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: katyo/publish-crates@v2
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}

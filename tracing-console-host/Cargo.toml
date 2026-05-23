@@ -1,0 +1,29 @@
+[package]
+name = "tracing-console-host"
+description = "Server that streams closed spans from a `tracing-cache` to remote console clients over protosocket-rpc."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["tracing", "observability", "rpc", "debugging", "protosocket"]
+categories = ["development-tools::debugging", "network-programming"]
+
+[dependencies]
+async-stream                    = { workspace = true }
+futures-core                    = { workspace = true }
+protosocket                     = { workspace = true }
+protosocket-messagepack         = { workspace = true }
+protosocket-rpc                 = { workspace = true }
+serde                           = { workspace = true }
+tokio                           = { workspace = true }
+tracing                         = { workspace = true }
+tracing-cache                   = { workspace = true }
+
+[dev-dependencies]
+clap                            = { workspace = true }
+futures                         = { workspace = true }
+
+[lints]
+workspace = true

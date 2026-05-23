@@ -1,0 +1,31 @@
+[package]
+name = "tracing-cache"
+description = "A `tracing::Subscriber` that captures closed spans into a bounded in-memory ring buffer with a background driver."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["tracing", "subscriber", "observability", "cache", "debugging"]
+categories = ["development-tools::debugging", "development-tools::profiling"]
+
+[dependencies]
+compact_str                     = { workspace = true }
+log                             = { workspace = true }
+rand                            = { workspace = true }
+slab                            = { workspace = true }
+spillway                        = { workspace = true }
+tokio                           = { workspace = true }
+tracing                         = { workspace = true }
+
+[[bench]]
+name = "span_throughput"
+harness = false
+
+[dev-dependencies]
+criterion                       = { workspace = true }
+tracing-futures                 = { workspace = true }
+
+[lints]
+workspace = true

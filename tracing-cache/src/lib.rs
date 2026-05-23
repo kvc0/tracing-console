@@ -1,0 +1,40 @@
+//! In-memory `tracing::Subscriber` that holds spans and events for
+//! inspection by a console UI.
+//!
+//! Open spans live in a sharded slab; closed spans flow through a
+//! lock-free spillway channel into a background [`Driver`] that
+//! commits them to a shared `BTreeMap`.  Filtering is pluggable via
+//! [`EnabledPredicate`]; the default [`LevelPredicate`] enables
+//! everything at or below a given level.
+
+// Workspace lints deny `unwrap_used` / `expect_used` /
+// `panic_in_result_fn` in production code.  Tests get
+// them back.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic_in_result_fn,)
+)]
+
+mod cache;
+mod config;
+mod driver;
+mod id_encoding;
+mod object_pool;
+mod predicate;
+mod record;
+mod thread_state;
+
+#[cfg(test)]
+mod tests;
+
+pub use cache::SpanCache;
+pub use config::{CacheConfig, DEFAULT_LANE_COUNT};
+pub use driver::Driver;
+// `Pool` and `ObjectPool` are crate-private — only `ReuseRef`
+// (visible on `SpanRecord.events`) and its `Resettable` bound
+// remain on the public surface.
+pub use object_pool::{Resettable, ReuseRef};
+pub use predicate::{
+    ChanceHandle, ChancePredicate, EnabledPredicate, Interest, LevelHandle, LevelPredicate,
+};
+pub use record::{EventRecord, FieldList, FieldValue, SpanRecord};

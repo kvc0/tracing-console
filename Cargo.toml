@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["tracing-console", "tracing-cache", "tracing-console-host"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["kvcache"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/momentohq/tracing-console"
+readme = "README.md"
+
+# Strict lints denied workspace-wide.  Test modules, benches, and
+# examples opt back out via `#![cfg_attr(test, allow(...))]` /
+# `#![allow(...)]` at their respective roots.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+
+[workspace.dependencies]
+tracing-cache                   = { path = "tracing-cache", version = "0.1.0" }
+tracing-console-host            = { path = "tracing-console-host", version = "0.1.0" }
+
+async-stream                    = { version = "0.3" }
+chrono                          = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap                            = { version = "4", features = ["derive"] }
+compact_str                     = { version = "0.9", features = ["serde"] }
+criterion                       = { version = "0", features = ["async_tokio"] }
+crossterm                       = { version = "0.29" }
+futures                         = { version = "0.3" }
+futures-core                    = { version = "0.3" }
+log                             = { version = "0.4" }
+protosocket                     = { version = "1" }
+protosocket-messagepack         = { version = "1" }
+protosocket-rpc                 = { version = "1" }
+rand                            = { version = "0.10" }
+ratatui                         = { version = "0.30" }
+serde                           = { version = "1", features = ["derive"] }
+serde_json                      = { version = "1" }
+slab                            = { version = "0" }
+spillway                        = { version = "1" }
+tokio                           = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
+tracing                         = { version = "0" }
+tracing-futures                 = { version = "0.2" }
+
+[profile.bench]
+debug = "line-tables-only"
+
+[profile.release]
+debug = "line-tables-only"
