@@ -189,8 +189,14 @@ fn select_navigation_clamps() {
 }
 
 #[test]
-fn quit_returns_quit_effect() {
+fn quit_takes_two_presses_via_the_confirm_modal() {
+    // First press arms the modal; second press within the deadline
+    // quits.  See the dedicated `first_q_arms_quit_confirm_*` and
+    // `second_q_within_deadline_quits` tests for the modal-state
+    // details — this one just locks in the public behaviour the
+    // runtime depends on.
     let mut m = Model::new(8);
+    assert_eq!(m.apply(Update::Quit), Effect::None);
     assert_eq!(m.apply(Update::Quit), Effect::Quit);
 }
 
@@ -953,7 +959,9 @@ fn graph_series_summary_aggregates_per_series() {
     move_cursor_to_first_key(&mut m);
     m.apply(Update::GraphToggleSplit);
 
-    let summary = current_graph(&m).store.series_summary(AggMode::Avg);
+    let summary = current_graph(&m)
+        .store
+        .series_summary(AggMode::Avg, Metric::Total);
     assert_eq!(summary.len(), 2);
     // Sorted by key — `api=fetch` first, `api=update` second.
     let fetch = &summary[0];
@@ -1380,11 +1388,114 @@ fn graph_percentile_via_series_summary_last() {
     // Sorted samples include the original (10) plus the new 10 →
     // [10, 20, 40, ..., 200].  p50 of 11 samples is index
     // round(0.5 * 10) = 5 → 100ns.
-    let summary = gs.store.series_summary(AggMode::Percentile(50.0));
+    let summary = gs
+        .store
+        .series_summary(AggMode::Percentile(50.0), Metric::Total);
     assert_eq!(summary[0].last_ns, 100);
     // p100 should map to the max sample (200).
-    let summary = gs.store.series_summary(AggMode::Max);
+    let summary = gs.store.series_summary(AggMode::Max, Metric::Total);
     assert_eq!(summary[0].last_ns, 200);
+}
+
+#[test]
+fn graph_metric_m_key_cycles_total_self_count() {
+    // `m` cycles through three metrics now; full round trip lands
+    // back at the starting Total.
+    let mut m = Model::new(8);
+    m.apply(Update::SpanReceived(timed_span(10, None, "r", 0, 1000)));
+    m.apply(Update::ToggleGraph);
+    assert_eq!(current_graph(&m).metric, Metric::Total);
+    m.apply(Update::ToggleGraphMetric);
+    assert_eq!(current_graph(&m).metric, Metric::SelfTime);
+    m.apply(Update::ToggleGraphMetric);
+    assert_eq!(current_graph(&m).metric, Metric::Count);
+    m.apply(Update::ToggleGraphMetric);
+    assert_eq!(current_graph(&m).metric, Metric::Total);
+}
+
+#[test]
+fn count_metric_drops_the_still_collecting_latest_bin() {
+    // The most-recent bin is still filling, so the Count projection
+    // hides its point — otherwise the chart's right edge looks like
+    // a sudden drop while the bin accumulates.  Latency metrics
+    // keep the latest bin (a partial-sample aggregate is still
+    // meaningful).
+    let mut m = Model::new(16);
+    m.apply(Update::SpanReceived(timed_span(10, None, "r", 0, 1_000)));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::ToggleGraphMetric); // SelfTime
+    m.apply(Update::ToggleGraphMetric); // Count
+    assert_eq!(current_graph(&m).metric, Metric::Count);
+
+    // Drive two more arrivals into separate 1 s bins.
+    m.apply(Update::SpanReceived(timed_span(
+        11,
+        None,
+        "r",
+        0,
+        1_000_000_000,
+    )));
+    m.apply(Update::SpanReceived(timed_span(
+        12,
+        None,
+        "r",
+        1_500_000_000,
+        2_500_000_000,
+    )));
+
+    let gs = current_graph(&m);
+    let count_points: Vec<(f64, f64)> = gs
+        .store
+        .project(gs.aggregation, gs.metric, gs.lookback_secs)
+        .into_iter()
+        .flat_map(|p| p.points)
+        .collect();
+    // The latest bin sits at x == 0; under Count it must be absent.
+    assert!(
+        count_points.iter().all(|(x, _)| *x < 0.0),
+        "Count projection should drop the latest bin, got {count_points:?}",
+    );
+
+    // Same data under Total — the latest bin SHOULD appear.
+    let total_points: Vec<(f64, f64)> = gs
+        .store
+        .project(gs.aggregation, Metric::Total, gs.lookback_secs)
+        .into_iter()
+        .flat_map(|p| p.points)
+        .collect();
+    assert!(
+        total_points.iter().any(|(x, _)| *x == 0.0),
+        "Total projection should include the latest bin, got {total_points:?}",
+    );
+}
+
+#[test]
+fn graph_count_metric_records_span_arrivals_per_bin() {
+    // Three spans into the locked stack ⇒ the Count metric's
+    // summary reports total=3 and last=3 (single bin, 1 s window).
+    let mut m = Model::new(16);
+    m.apply(Update::SpanReceived(timed_span(10, None, "r", 0, 1_000)));
+    m.apply(Update::ToggleGraph);
+    m.apply(Update::ToggleGraphMetric);
+    m.apply(Update::ToggleGraphMetric); // → Count
+    assert_eq!(current_graph(&m).metric, Metric::Count);
+
+    // Now emit two more matching root spans.
+    m.apply(Update::SpanReceived(timed_span(
+        11, None, "r", 1_000, 2_000,
+    )));
+    m.apply(Update::SpanReceived(timed_span(
+        12, None, "r", 2_000, 3_000,
+    )));
+
+    let gs = current_graph(&m);
+    let summary = gs.store.series_summary(gs.aggregation, gs.metric);
+    assert_eq!(summary.len(), 1);
+    let s = &summary[0];
+    // `count` in the summary is now the sum of per-bin span counts
+    // — equal to the number of recorded spans (the original from
+    // rehydrate + two new arrivals = 3).
+    assert_eq!(s.count, 3, "summary: {s:?}");
 }
 
 #[test]
@@ -1403,13 +1514,19 @@ fn graph_self_time_metric_subtracts_child_total() {
     // Default Metric::Total — the lone root sample is the full 1000.
     let gs = current_graph(&m);
     assert_eq!(gs.metric, Metric::Total);
-    assert_eq!(gs.store.series_summary(AggMode::Avg)[0].last_ns, 1000,);
+    assert_eq!(
+        gs.store.series_summary(AggMode::Avg, Metric::Total)[0].last_ns,
+        1000,
+    );
     // Flip to SelfTime; rehydrate re-walks the ring with the
     // up-to-date child_sum, so the root re-records as 1000 - 300.
     m.apply(Update::ToggleGraphMetric);
     let gs = current_graph(&m);
     assert_eq!(gs.metric, Metric::SelfTime);
-    assert_eq!(gs.store.series_summary(AggMode::Avg)[0].last_ns, 700,);
+    assert_eq!(
+        gs.store.series_summary(AggMode::Avg, Metric::SelfTime)[0].last_ns,
+        700,
+    );
 }
 
 // ── Multi-key splits ────────────────────────────────────────
@@ -1819,4 +1936,259 @@ fn trace_detail_collapse_then_expand_round_trip() {
         _ => panic!("expected trace detail"),
     };
     assert_eq!(after_expand, 2);
+}
+
+// ── Quit-confirm modal ────────────────────────────────────────────────────
+
+#[test]
+fn first_q_arms_quit_confirm_without_quitting() {
+    let mut m = Model::new(4);
+    let effect = m.apply(Update::Quit);
+    assert_eq!(effect, Effect::None);
+    assert!(m.quit_confirm_deadline.is_some());
+}
+
+#[test]
+fn second_q_within_deadline_quits() {
+    let mut m = Model::new(4);
+    assert_eq!(m.apply(Update::Quit), Effect::None);
+    assert_eq!(m.apply(Update::Quit), Effect::Quit);
+    // Reducer clears the deadline on success — so a (hypothetical)
+    // third press would re-arm rather than fire again.
+    assert!(m.quit_confirm_deadline.is_none());
+}
+
+#[test]
+fn esc_dismisses_quit_confirm() {
+    let mut m = Model::new(4);
+    m.apply(Update::Quit);
+    assert!(m.quit_confirm_deadline.is_some());
+    let effect = m.apply(Update::QuitConfirmDismiss);
+    assert_eq!(effect, Effect::None);
+    assert!(m.quit_confirm_deadline.is_none());
+}
+
+#[test]
+fn expired_quit_confirm_does_not_quit_on_next_q() {
+    // Manually set the deadline in the past — that's the state the
+    // runtime ticker observes when 2s elapses with no second press.
+    let mut m = Model::new(4);
+    m.quit_confirm_deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    let effect = m.apply(Update::Quit);
+    assert_eq!(
+        effect,
+        Effect::None,
+        "an expired deadline must re-arm, not quit"
+    );
+    // The fresh press should have armed a NEW (future) deadline.
+    let deadline = m
+        .quit_confirm_deadline
+        .expect("re-armed deadline should be Some");
+    assert!(deadline > std::time::Instant::now());
+}
+
+#[test]
+fn expire_quit_confirm_if_due_clears_past_deadline() {
+    let mut m = Model::new(4);
+    m.quit_confirm_deadline = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+    m.expire_quit_confirm_if_due();
+    assert!(m.quit_confirm_deadline.is_none());
+}
+
+#[test]
+fn expire_quit_confirm_if_due_leaves_future_deadline() {
+    let mut m = Model::new(4);
+    let future = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    m.quit_confirm_deadline = Some(future);
+    m.expire_quit_confirm_if_due();
+    assert_eq!(m.quit_confirm_deadline, Some(future));
+}
+
+// ── Regression: split-by on a sub-span ────────────────────────────────────
+//
+// Reported bug: applying a split on a key that only appears on a sub-span
+// made the resulting child rows disappear because the visibility check
+// required the parent's `(stack, splits)` BucketKey to be in `expanded`,
+// and the parent's bucket has different (empty) splits.  The fix decouples
+// `expanded` from `splits` (stacks only).
+
+#[test]
+fn split_on_sub_span_shows_child_rows() {
+    let mut m = Model::new(16);
+    // parent root has no "endpoint"; two child api_calls do.
+    m.apply(Update::SpanReceived(span(10, "request")));
+    m.apply(Update::SpanReceived(span_with_field(
+        11,
+        "api_call",
+        Some(10),
+        "endpoint",
+        "/users",
+    )));
+    m.apply(Update::SpanReceived(span_with_field(
+        12,
+        "api_call",
+        Some(10),
+        "endpoint",
+        "/posts",
+    )));
+
+    // Add the split.
+    let mut sk = BTreeSet::new();
+    sk.insert("endpoint".to_string());
+    m.agg.set_split_keys(sk);
+
+    // Before expansion: just the root visible, and it must report
+    // has_children=true so the user sees a disclosure marker.
+    let rows = m.visible_rows();
+    assert_eq!(rows.len(), 1, "got rows: {:?}", rows);
+    assert_eq!(rows[0].key.stack, vec!["request"]);
+    assert!(rows[0].has_children, "request must show as expandable");
+
+    // Expand the root.  Both split-variant children should appear
+    // — neither should "disappear" because of the splits mismatch
+    // with the parent's empty splits.
+    m.apply(Update::ExpandSelected);
+    let rows = m.visible_rows();
+    let stacks: Vec<&[String]> = rows.iter().map(|r| r.key.stack.as_slice()).collect();
+    assert_eq!(stacks.len(), 3, "got stacks: {stacks:?}");
+    // Each row's leaf name + the two split variants are present.
+    let leaves: Vec<&str> = rows
+        .iter()
+        .map(|r| r.key.stack.last().map(String::as_str).unwrap_or(""))
+        .collect();
+    assert_eq!(leaves, vec!["request", "api_call", "api_call"]);
+    let split_values: BTreeSet<String> = rows[1..]
+        .iter()
+        .filter_map(|r| r.key.splits.iter().find(|(k, _)| k == "endpoint"))
+        .map(|(_, v)| v.clone())
+        .collect();
+    assert!(split_values.contains("/users"), "got: {split_values:?}");
+    assert!(split_values.contains("/posts"), "got: {split_values:?}");
+}
+
+#[test]
+fn collapse_root_hides_split_children() {
+    // Round-trip: expand, see both split variants, collapse, both gone.
+    let mut m = Model::new(16);
+    m.apply(Update::SpanReceived(span(10, "request")));
+    m.apply(Update::SpanReceived(span_with_field(
+        11,
+        "api_call",
+        Some(10),
+        "endpoint",
+        "/users",
+    )));
+    m.apply(Update::SpanReceived(span_with_field(
+        12,
+        "api_call",
+        Some(10),
+        "endpoint",
+        "/posts",
+    )));
+    let mut sk = BTreeSet::new();
+    sk.insert("endpoint".to_string());
+    m.agg.set_split_keys(sk);
+
+    m.apply(Update::ExpandSelected);
+    assert_eq!(m.visible_rows().len(), 3);
+    m.apply(Update::CollapseSelected);
+    assert_eq!(m.visible_rows().len(), 1);
+}
+
+// ── Regression: graph receives drained sub-spans ──────────────────────────
+//
+// When a parent span arrives after its child, the child is parked in
+// `pending` and only lands in the ring when the parent is absorbed.  The
+// SpanReceived handler used to forward only the *originally-passed* span
+// to the graph store, so a graph locked on the child stack stayed empty
+// even though the child was sitting in the aggregator.  Fix: agg.absorb
+// returns every newly-inserted id, and the handler records each match.
+
+#[test]
+fn graph_records_sub_span_when_parent_arrives_after_child() {
+    let mut m = Model::new(16);
+    // Seed the table with an api_call so we can lock the graph onto it.
+    m.apply(Update::SpanReceived(span_with_parent(10, "request", None)));
+    m.apply(Update::SpanReceived(span_with_parent(
+        11,
+        "api_call",
+        Some(10),
+    )));
+    // Expand to reach the sub-span row, select it, open graph.
+    m.apply(Update::ExpandSelected);
+    m.apply(Update::SelectDown);
+    m.apply(Update::ToggleGraph);
+    let pre_count: u64 = match &m.view {
+        ViewMode::Graph(gs) => {
+            assert_eq!(gs.locked_stack, vec!["request", "api_call"]);
+            gs.store
+                .series_summary(gs.aggregation, gs.metric)
+                .iter()
+                .map(|s| s.count)
+                .sum()
+        }
+        _ => panic!("expected graph mode"),
+    };
+
+    // Now stream a new (child, parent) pair in CHILD-FIRST order — the
+    // close-order the subscriber actually delivers in practice.
+    m.apply(Update::SpanReceived(span_with_parent(
+        21,
+        "api_call",
+        Some(20),
+    )));
+    m.apply(Update::SpanReceived(span_with_parent(20, "request", None)));
+
+    let post_count: u64 = match &m.view {
+        ViewMode::Graph(gs) => gs
+            .store
+            .series_summary(gs.aggregation, gs.metric)
+            .iter()
+            .map(|s| s.count)
+            .sum(),
+        _ => panic!("expected graph mode"),
+    };
+    assert!(
+        post_count > pre_count,
+        "graph store should record the drained sub-span (pre={pre_count} post={post_count})",
+    );
+}
+
+#[test]
+fn split_on_sub_span_survives_expand_all() {
+    // ExpandAllSelected used to also key on (stack, splits) — should
+    // expand the stack tree alone now, surfacing every descendant
+    // regardless of split values.
+    let mut m = Model::new(16);
+    m.apply(Update::SpanReceived(span(10, "request")));
+    m.apply(Update::SpanReceived(span_with_parent(
+        11,
+        "api_call",
+        Some(10),
+    )));
+    m.apply(Update::SpanReceived(span_with_field(
+        12,
+        "db_query",
+        Some(11),
+        "table",
+        "users",
+    )));
+    m.apply(Update::SpanReceived(span_with_field(
+        13,
+        "db_query",
+        Some(11),
+        "table",
+        "posts",
+    )));
+    let mut sk = BTreeSet::new();
+    sk.insert("table".to_string());
+    m.agg.set_split_keys(sk);
+
+    m.apply(Update::ExpandAllSelected);
+    let rows = m.visible_rows();
+    let leaves: Vec<&str> = rows
+        .iter()
+        .map(|r| r.key.stack.last().map(String::as_str).unwrap_or(""))
+        .collect();
+    assert_eq!(leaves, vec!["request", "api_call", "db_query", "db_query"]);
 }

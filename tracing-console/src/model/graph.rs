@@ -29,11 +29,32 @@ pub enum ViewMode {
 /// Which sample a span contributes to the graph.  `Total` is the
 /// span's wall-clock duration; `SelfTime` subtracts the totals of
 /// direct children that the aggregator currently knows about (the
-/// same self-time the stacks table shows).
+/// same self-time the stacks table shows).  `Count` plots span-
+/// arrivals per bin — the aggregation mode is ignored in this case
+/// (a count has no min/max/avg variants) and the y-axis switches
+/// from `fmt_ns` units to humanised k/M units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Metric {
     Total,
     SelfTime,
+    Count,
+}
+
+impl Metric {
+    /// `m` cycles through `Total → SelfTime → Count → Total`.
+    pub fn next(self) -> Self {
+        match self {
+            Metric::Total => Metric::SelfTime,
+            Metric::SelfTime => Metric::Count,
+            Metric::Count => Metric::Total,
+        }
+    }
+
+    /// `true` when this metric is a count (so the y axis should
+    /// render with `fmt_count` instead of `fmt_ns`).
+    pub fn is_count(self) -> bool {
+        matches!(self, Metric::Count)
+    }
 }
 
 /// Aggregation applied per (series, time-bin) before rendering.
@@ -272,17 +293,26 @@ impl GraphSeriesStore {
     }
 
     /// Project the stored bins into ratatui-friendly per-series
-    /// `(x = seconds-relative-to-now, y = agg_ns_as_f64)` lists.
+    /// `(x = seconds-relative-to-now, y = value_as_f64)` lists.
     /// `x_max_secs` is the visible window, set by the caller; the
     /// chart's x axis runs `[-x_max_secs, 0]`.  Older bins outside
-    /// that window are clipped.
-    pub fn project(&self, agg: AggMode, x_max_secs: f64) -> Vec<SeriesProjection> {
+    /// that window are clipped.  `metric == Metric::Count` plots
+    /// the per-bin span-arrival count directly and ignores `agg`.
+    pub fn project(&self, agg: AggMode, metric: Metric, x_max_secs: f64) -> Vec<SeriesProjection> {
         if self.series.is_empty() || self.window_ns == 0 {
             return Vec::new();
         }
         let window_secs = self.window_secs();
         let visible_bins = ((x_max_secs / window_secs).ceil() as u64).max(1);
         let oldest = self.latest_bin_idx.saturating_sub(visible_bins);
+        // In Count mode the most-recent bin is mid-collection — its
+        // value will climb until the bin rolls over.  Plotting it
+        // makes the rightmost data point read as a sudden drop /
+        // partial value, which is visually misleading.  Skip it.
+        // Latency-style metrics (Total / SelfTime) are running
+        // aggregates over individual span durations, so the partial
+        // bin is just a smaller sample size — still meaningful.
+        let skip_latest = metric.is_count();
         let mut out: Vec<SeriesProjection> = self
             .series
             .iter()
@@ -293,6 +323,9 @@ impl GraphSeriesStore {
                     if abs_idx < oldest {
                         continue;
                     }
+                    if skip_latest && abs_idx == self.latest_bin_idx {
+                        continue;
+                    }
                     let bin = match slot {
                         Some(b) => b,
                         None => continue,
@@ -300,7 +333,7 @@ impl GraphSeriesStore {
                     // x = signed seconds vs. latest bin's right edge.
                     let bins_back = self.latest_bin_idx.saturating_sub(abs_idx) as f64;
                     let x = -(bins_back * window_secs);
-                    let y = bin.aggregate(agg) as f64;
+                    let y = bin_value(bin, agg, metric) as f64;
                     pts.push((x, y));
                 }
                 pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -323,11 +356,43 @@ impl GraphSeriesStore {
     /// extremes without first changing modes.  `last_ns` *is* under
     /// the active agg, because it lines up with the right edge of
     /// the chart line.
-    pub fn series_summary(&self, agg: AggMode) -> Vec<SeriesSummary> {
+    pub fn series_summary(&self, agg: AggMode, metric: Metric) -> Vec<SeriesSummary> {
         let mut out: Vec<SeriesSummary> = self
             .series
             .iter()
             .map(|(key, series)| {
+                if metric.is_count() {
+                    // Min/max/avg of per-bin span counts (rather
+                    // than latency stats) — these are what the user
+                    // actually wants to compare across series when
+                    // they've selected the Count metric.
+                    let bin_counts: Vec<u64> =
+                        series.bins.iter().flatten().map(|b| b.count).collect();
+                    let total: u64 = bin_counts.iter().sum();
+                    let min_v = bin_counts.iter().copied().min().unwrap_or(0);
+                    let max_v = bin_counts.iter().copied().max().unwrap_or(0);
+                    let avg_v = if bin_counts.is_empty() {
+                        0
+                    } else {
+                        total / bin_counts.len() as u64
+                    };
+                    let last_v = series
+                        .bins
+                        .iter()
+                        .rev()
+                        .flatten()
+                        .next()
+                        .map(|b| b.count)
+                        .unwrap_or(0);
+                    return SeriesSummary {
+                        key: key.clone(),
+                        count: total,
+                        min_ns: min_v,
+                        max_ns: max_v,
+                        avg_ns: avg_v,
+                        last_ns: last_v,
+                    };
+                }
                 let mut count: u64 = 0;
                 let mut sum: u128 = 0;
                 let mut min_ns: u64 = u64::MAX;
@@ -364,6 +429,19 @@ impl GraphSeriesStore {
             .collect();
         out.sort_by(|a, b| a.key.cmp(&b.key));
         out
+    }
+}
+
+/// Pick the per-bin value the chart plots — `bin.count` when the
+/// active metric is `Count` (ignoring `agg` entirely), otherwise the
+/// usual aggregation over per-span samples.  Kept as a free function
+/// so [`GraphSeriesStore::project`] and any future external use
+/// share one definition.
+fn bin_value(bin: &Bin, agg: AggMode, metric: Metric) -> u64 {
+    if metric.is_count() {
+        bin.count
+    } else {
+        bin.aggregate(agg)
     }
 }
 
@@ -596,7 +674,7 @@ impl GraphState {
     /// full series key.
     pub fn series_keys(&self) -> Vec<Vec<(String, String)>> {
         use std::cmp::Ordering;
-        let summaries = self.store.series_summary(self.aggregation);
+        let summaries = self.store.series_summary(self.aggregation, self.metric);
         let summary_by_key: std::collections::HashMap<Vec<(String, String)>, SeriesSummary> =
             summaries.into_iter().map(|s| (s.key.clone(), s)).collect();
         let mut keys = self.alpha_series_keys();
@@ -650,7 +728,9 @@ impl GraphState {
     /// Record one span into the series store.  Caller has already
     /// verified the span's resolved stack matches `locked_stack`.
     /// Reads child-sum from the aggregator when the active metric
-    /// is `SelfTime`.
+    /// is `SelfTime`.  `Count` ignores the duration entirely — the
+    /// stored value is always 1, and the projection picks the bin's
+    /// running `count` field at render time.
     pub fn record_span(&mut self, agg: &Aggregator, span: &WireSpan) {
         let Some(closed) = span.closed_at_ns else {
             return;
@@ -659,6 +739,10 @@ impl GraphState {
         let value = match self.metric {
             Metric::Total => total,
             Metric::SelfTime => total.saturating_sub(agg.child_sum_for(span.id)),
+            // We still go through `record` so the bin's `count`
+            // bumps; the per-bin `sum_ns`/min/max sit unused for
+            // Count and the projection reads `bin.count` directly.
+            Metric::Count => 1,
         };
         let series_key = agg.collect_splits_for(span.id, &self.split_keys);
         self.store.record(series_key, closed, value);

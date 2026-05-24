@@ -43,6 +43,41 @@ fn render_overlays(f: &mut ratatui::Frame<'_>, area: Rect, model: &Model) {
     if let Some(c) = &model.confirm_version_switch {
         render_confirm_version_switch(f, area, c);
     }
+    if model.quit_confirm_deadline.is_some() {
+        render_quit_confirm(f, area);
+    }
+}
+
+/// Centred two-line "press q again to quit" prompt.  Same `Clear +
+/// Block` overlay pattern as the version-switch modal but much
+/// smaller — the message is the whole UI.  Dismissed by a second
+/// `q` (which the keyboard loop turns into `Update::Quit`, and the
+/// reducer interprets against the live deadline), by `Esc` (the
+/// runtime intercepts and sends `QuitConfirmDismiss`), or by the
+/// runtime ticker expiring the 2 s deadline.
+fn render_quit_confirm(f: &mut ratatui::Frame<'_>, area: Rect) {
+    let msg = "press q again to quit";
+    // 4 cells of padding around the message.
+    let w = area
+        .width
+        .min((msg.chars().count() as u16).saturating_add(8));
+    let h = area.height.min(3);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let modal_area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().add_modifier(Modifier::BOLD));
+    let inner = block.inner(modal_area);
+    f.render_widget(Clear, modal_area);
+    f.render_widget(block, modal_area);
+    let line = Line::from(msg).alignment(Alignment::Center);
+    f.render_widget(Paragraph::new(line), inner);
 }
 
 /// Centred modal for the server/client version mismatch — renders

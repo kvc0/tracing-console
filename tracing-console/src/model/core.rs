@@ -12,7 +12,7 @@ use tracing_console_host::WireLevelFilter;
 use crate::aggregate::{Aggregator, BucketKey, StackStats, candidate_split_keys_for};
 
 use super::graph::{
-    GraphFocus, GraphState, Metric, SortColumn, ViewMode, parse_agg_input, parse_lookback_input,
+    GraphFocus, GraphState, SortColumn, ViewMode, parse_agg_input, parse_lookback_input,
 };
 use super::update::{Effect, Update};
 
@@ -224,7 +224,14 @@ pub struct Model {
     pub agg: Aggregator,
     /// Stack prefixes whose children should be revealed.  A row whose
     /// bucket-key proper prefixes are all in this set is visible.
-    pub expanded: HashSet<BucketKey>,
+    /// Stacks the user has expanded in the tree.  Keyed on stack
+    /// alone (not `BucketKey`) so multiple split-variants of the
+    /// same stack expand together — and so that expanding a parent
+    /// row reveals every child stack-extension regardless of which
+    /// split values those children resolve to (issue: split key on
+    /// a sub-span used to leave the child rows hidden because the
+    /// child's `(stack, splits)` didn't match the parent's).
+    pub expanded: HashSet<Vec<String>>,
     /// Selection index into the visible-row list (Stacks focus) or
     /// the details key list (Details focus).
     pub selected: usize,
@@ -258,6 +265,17 @@ pub struct Model {
     /// installer effect pinned to that version.
     #[serde(default)]
     pub confirm_version_switch: Option<ConfirmVersionSwitch>,
+    /// When `Some`, the "press q again to quit" modal is up; the
+    /// inner `Instant` is the auto-dismiss deadline.  A second `q`
+    /// before the deadline returns `Effect::Quit`; `Esc` clears the
+    /// modal; the runtime's ticker calls
+    /// [`Model::expire_quit_confirm_if_due`] every render so the
+    /// modal vanishes on its own after 2 s.
+    ///
+    /// Skipped from serde because `Instant` isn't serialisable and
+    /// the prompt is purely transient UI state.
+    #[serde(skip)]
+    pub quit_confirm_deadline: Option<Instant>,
     /// When `Some`, the user is typing a new chance value (after
     /// pressing `c`).  Only digits and `.` are accepted; `Enter`
     /// commits and emits [`Effect::RequestSetChance`]; `Esc`
@@ -290,6 +308,7 @@ impl Model {
             cache_chance: None,
             server_version: None,
             confirm_version_switch: None,
+            quit_confirm_deadline: None,
             chance_input: None,
             view: ViewMode::Table,
             rate: RateTracker::default(),
@@ -300,23 +319,45 @@ impl Model {
         self.agg.split_keys()
     }
 
+    /// Drop the quit-confirm prompt if its 2s deadline has passed.
+    /// Called by the runtime on every render tick so an idle user
+    /// who pressed `q` once doesn't see the prompt forever.
+    pub fn expire_quit_confirm_if_due(&mut self) {
+        if let Some(deadline) = self.quit_confirm_deadline
+            && Instant::now() >= deadline
+        {
+            self.quit_confirm_deadline = None;
+        }
+    }
+
     pub fn apply(&mut self, update: Update) -> Effect {
         match update {
             Update::SpanReceived(span) => {
-                // If the graph view is active, clone the span up
-                // front so we can feed the per-bucket time series
-                // store after the aggregator has resolved its
-                // stack.  Cost is one clone per span, paid only
-                // while the user is actively watching a graph.
-                let graph_clone = matches!(self.view, ViewMode::Graph(_)).then(|| span.clone());
-                let span_id = span.id;
-                self.agg.absorb(span);
                 self.rate.record(Instant::now());
-                if let (ViewMode::Graph(gs), Some(cloned)) = (&mut self.view, graph_clone)
-                    && let Some(stack) = self.agg.resolved_stack(span_id)
-                    && stack == gs.locked_stack.as_slice()
-                {
-                    gs.record_span(&self.agg, &cloned);
+                // The aggregator may absorb more than just `span` —
+                // a parent arrival drains any pending children that
+                // were parked waiting on it.  We want the graph
+                // store to see every newly-committed span (so a
+                // graph locked on a sub-span keeps updating when
+                // its parent shows up after it), so iterate the
+                // full inserted-ids list, not just the original
+                // span.id.
+                let inserted_ids = self.agg.absorb(span);
+                if let ViewMode::Graph(gs) = &mut self.view {
+                    for id in inserted_ids {
+                        if matches!(
+                            self.agg.resolved_stack(id),
+                            Some(stack) if stack == gs.locked_stack.as_slice()
+                        ) && let Some(span_ref) = self.agg.span_by_id(id)
+                        {
+                            // Cloning here is per-matched-span only —
+                            // a graph locked on a leaf stack sees a
+                            // handful of spans per second, not the
+                            // whole firehose.
+                            let span_clone = span_ref.clone();
+                            gs.record_span(&self.agg, &span_clone);
+                        }
+                    }
                 }
                 Effect::None
             }
@@ -346,7 +387,7 @@ impl Model {
                     if let Some(r) = rows.get(self.selected)
                         && r.has_children
                     {
-                        self.expanded.insert(r.key.clone());
+                        self.expanded.insert(r.key.stack.clone());
                     }
                 }
                 Effect::None
@@ -357,22 +398,16 @@ impl Model {
                 }
                 let rows = self.visible_rows();
                 if let Some(r) = rows.get(self.selected) {
-                    // Expand every descendant of the selected bucket
-                    // that has its own children.  Cheap: one pass over
-                    // every bucket in the (unfiltered) tree.
+                    // Expand every stack-prefix descendant of the
+                    // selected row.  Splits are irrelevant here:
+                    // expanding a stack reveals every split-variant
+                    // child below it.
                     let root_stack = r.key.stack.clone();
-                    let root_splits = r.key.splits.clone();
                     let all = self.agg.rows();
                     for (k, _) in &all {
-                        if k.stack.starts_with(&root_stack)
-                            && k.stack.len() > root_stack.len()
-                            && k.splits == root_splits
-                        {
+                        if k.stack.starts_with(&root_stack) && k.stack.len() > root_stack.len() {
                             for len in root_stack.len()..k.stack.len() {
-                                self.expanded.insert(BucketKey {
-                                    stack: k.stack[..len].to_vec(),
-                                    splits: root_splits.clone(),
-                                });
+                                self.expanded.insert(k.stack[..len].to_vec());
                             }
                         }
                     }
@@ -386,22 +421,19 @@ impl Model {
                 let rows = self.visible_rows();
                 if let Some(r) = rows.get(self.selected) {
                     if r.is_expanded {
-                        let root = r.key.clone();
-                        self.expanded.retain(|k| {
-                            !(k.splits == root.splits && k.stack.starts_with(&root.stack))
-                        });
+                        let root_stack = r.key.stack.clone();
+                        self.expanded.retain(|s| !s.starts_with(&root_stack));
                     } else if r.depth > 0 {
                         // Jump to parent and collapse it.
                         let parent_stack: Vec<String> =
                             r.key.stack[..r.key.stack.len() - 1].to_vec();
-                        let parent_splits = r.key.splits.clone();
-                        self.expanded.retain(|k| {
-                            !(k.splits == parent_splits && k.stack.starts_with(&parent_stack))
-                        });
+                        self.expanded.retain(|s| !s.starts_with(&parent_stack));
                         let new_rows = self.visible_rows();
-                        if let Some((idx, _)) = new_rows.iter().enumerate().find(|(_, row)| {
-                            row.key.stack == parent_stack && row.key.splits == parent_splits
-                        }) {
+                        if let Some((idx, _)) = new_rows
+                            .iter()
+                            .enumerate()
+                            .find(|(_, row)| row.key.stack == parent_stack)
+                        {
                             self.selected = idx;
                         }
                     }
@@ -519,10 +551,7 @@ impl Model {
             }
             Update::ToggleGraphMetric => {
                 if let ViewMode::Graph(gs) = &mut self.view {
-                    gs.metric = match gs.metric {
-                        Metric::Total => Metric::SelfTime,
-                        Metric::SelfTime => Metric::Total,
-                    };
+                    gs.metric = gs.metric.next();
                     gs.rehydrate(&self.agg);
                 }
                 Effect::None
@@ -1079,7 +1108,28 @@ impl Model {
                 }
                 Effect::None
             }
-            Update::Quit => Effect::Quit,
+            Update::Quit => {
+                // Two-step confirm.  First `q` arms the modal with a
+                // 2s deadline; second `q` before that deadline
+                // returns Effect::Quit.  After the deadline the
+                // modal has been cleared by the runtime ticker and
+                // the next `q` re-arms — never "click-through" the
+                // confirm by accident.
+                match self.quit_confirm_deadline {
+                    Some(deadline) if Instant::now() < deadline => {
+                        self.quit_confirm_deadline = None;
+                        Effect::Quit
+                    }
+                    _ => {
+                        self.quit_confirm_deadline = Some(Instant::now() + Duration::from_secs(2));
+                        Effect::None
+                    }
+                }
+            }
+            Update::QuitConfirmDismiss => {
+                self.quit_confirm_deadline = None;
+                Effect::None
+            }
             Update::BeginConfirmVersionSwitch => {
                 // Only meaningful when the server and client crate
                 // versions disagree.  Silently ignored otherwise so
@@ -1161,17 +1211,15 @@ impl Model {
 
         let mut out = Vec::with_capacity(rows.len());
         for (i, (key, stats)) in rows.iter().enumerate() {
-            // Visibility: every proper-stack prefix of this bucket's
-            // stack must also be expanded.  Splits are shared between
-            // parent and child within a subtree (children inherit), so
-            // the expanded entry is keyed on (prefix_stack, splits).
+            // Visibility: every proper-stack prefix of this row's
+            // stack must be in `expanded` (which is keyed on stack
+            // only).  Splits are intentionally ignored — a split key
+            // that appears on a sub-span should still let the child
+            // render when its parent bucket has different splits.
             let mut visible = true;
             for k in 1..key.stack.len() {
-                let parent_key = BucketKey {
-                    stack: key.stack[..k].to_vec(),
-                    splits: key.splits.clone(),
-                };
-                if !self.expanded.contains(&parent_key) {
+                let prefix = &key.stack[..k];
+                if !self.expanded.contains(prefix) {
                     visible = false;
                     break;
                 }
@@ -1179,25 +1227,23 @@ impl Model {
             if !visible {
                 continue;
             }
-            // has_children = some later row extends this stack by ≥1
-            // level *within the same splits group*.  Rows are sorted
-            // by (splits, stack), so once splits change we've left
-            // this group entirely.
+            // has_children = some later row extends this row's stack
+            // by ≥1 level.  Rows are sorted `(stack, splits)`, so
+            // children share a stack-prefix with the parent and sit
+            // contiguously after it — scanning until the prefix
+            // breaks is enough.  Splits intentionally don't bound
+            // the scan: a split-only child still counts as a child.
             let mut has_children = false;
-            for (_, (next_key, _)) in rows.iter().enumerate().skip(i + 1) {
-                if next_key.splits != key.splits {
-                    break;
-                }
-                if next_key.stack.len() > key.stack.len() && next_key.stack.starts_with(&key.stack)
-                {
-                    has_children = true;
-                    break;
-                }
+            for (next_key, _) in rows.iter().skip(i + 1) {
                 if !next_key.stack.starts_with(&key.stack) {
                     break;
                 }
+                if next_key.stack.len() > key.stack.len() {
+                    has_children = true;
+                    break;
+                }
             }
-            let is_expanded = self.expanded.contains(key);
+            let is_expanded = self.expanded.contains(&key.stack);
             out.push(VisibleRow {
                 key: key.clone(),
                 stats: stats.clone(),

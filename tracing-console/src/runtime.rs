@@ -297,11 +297,16 @@ async fn run_tui(
     // `model.apply`.
     let modal_kind = Arc::new(AtomicU8::new(MODAL_NONE));
     let current_view = Arc::new(AtomicU8::new(VIEW_TABLE));
+    // Quit-confirm is orthogonal to the text-input modals — it doesn't
+    // swallow keys; it just changes what `Esc` means.  Tracked
+    // separately so the modal_kind table doesn't need extra states.
+    let quit_confirm_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let kb_tx = tx.clone();
     let kb_modal = Arc::clone(&modal_kind);
     let kb_view = Arc::clone(&current_view);
-    std::thread::spawn(move || keyboard_loop(kb_tx, kb_modal, kb_view));
+    let kb_quit = Arc::clone(&quit_confirm_active);
+    std::thread::spawn(move || keyboard_loop(kb_tx, kb_modal, kb_view, kb_quit));
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -424,12 +429,24 @@ async fn run_tui(
                                     ViewMode::TraceDetail(_) => VIEW_TRACE_DETAIL,
                                 };
                                 current_view.store(view_tag, Ordering::Relaxed);
+                                quit_confirm_active.store(
+                                    model.quit_confirm_deadline.is_some(),
+                                    Ordering::Relaxed,
+                                );
                             }
                         }
                         None => return Ok(()),
                     }
                 }
                 _ = ticker.tick() => {
+                    // Auto-dismiss the quit-confirm prompt after its
+                    // 2s window — runs every tick (~100 ms) so the
+                    // modal disappears even with no keystrokes.
+                    model.expire_quit_confirm_if_due();
+                    quit_confirm_active.store(
+                        model.quit_confirm_deadline.is_some(),
+                        Ordering::Relaxed,
+                    );
                     terminal.draw(|f| view::render(f, &model, colorize))?;
                 }
             }
@@ -504,6 +521,7 @@ fn keyboard_loop(
     tx: spillway::Sender<Update>,
     modal_kind: std::sync::Arc<std::sync::atomic::AtomicU8>,
     current_view: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    quit_confirm_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -589,6 +607,19 @@ fn keyboard_loop(
         };
         if let Some(level) = level {
             if send_or_exit(Update::RequestCacheLevel(level)).is_break() {
+                return;
+            }
+            continue;
+        }
+
+        // While the quit-confirm prompt is up, Esc dismisses it
+        // rather than firing whatever the active view binds Esc to
+        // (which would itself often quit).  `q` flows through to
+        // the normal binding (which sends Update::Quit) — the
+        // reducer interprets that as "second press" against the
+        // live deadline.
+        if quit_confirm_active.load(Ordering::Relaxed) && matches!(k.code, KeyCode::Esc) {
+            if send_or_exit(Update::QuitConfirmDismiss).is_break() {
                 return;
             }
             continue;

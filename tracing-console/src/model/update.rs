@@ -166,6 +166,9 @@ pub enum Update {
     /// `n` / `Esc` in the confirm-version modal: close it, no effect.
     /// Ignored while the installer is mid-run (`ConfirmStatus::Running`).
     ConfirmVersionSwitchNo,
+    /// `Esc` while the "press q again to quit" prompt is up.
+    /// Clears `quit_confirm_deadline` without quitting.
+    QuitConfirmDismiss,
     /// The async installer task finished with a successful exit
     /// status.  The currently-running binary is now stale, so the
     /// reducer returns `Effect::Quit`.

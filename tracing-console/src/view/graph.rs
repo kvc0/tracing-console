@@ -82,9 +82,12 @@ fn agg_label(mode: AggMode) -> String {
 }
 
 fn metric_label(metric: Metric) -> &'static str {
+    // Cycled by the `m` key: total → self → count → total.  The
+    // labels are short enough to fit in the compact status row.
     match metric {
         Metric::Total => "total",
         Metric::SelfTime => "self",
+        Metric::Count => "count",
     }
 }
 
@@ -258,6 +261,13 @@ fn nice_step(raw: f64) -> f64 {
 /// ceils to the next — so a chart with raw range `96.1..148.1ms`
 /// renders cleanly as `90..150ms` in `10ms` ticks instead of the
 /// ratatui-default raw-bounds rendering.
+///
+/// The returned bounds *strictly* bracket the data: if `raw_min`
+/// already sits exactly on a step boundary, `min` drops one step
+/// further; same for `max`.  Without this, a perfectly-constant
+/// series at e.g. `5` would render with `y_min == y_max == 5` and
+/// the line would sit on the bottom edge of the chart — pad both
+/// sides so the line sits inside the plot area.
 fn nice_axis(raw_min: f64, raw_max: f64) -> (f64, f64, f64) {
     if !raw_min.is_finite() || !raw_max.is_finite() {
         return (0.0, 1.0, 0.25);
@@ -275,10 +285,26 @@ fn nice_axis(raw_min: f64, raw_max: f64) -> (f64, f64, f64) {
     };
     let target_intervals = 4;
     let step = nice_step(effective_range / target_intervals as f64);
-    let min = (raw_min / step).floor() * step;
+    let mut min = (raw_min / step).floor() * step;
     let mut max = (raw_max / step).ceil() * step;
-    if max <= min {
-        max = min + step;
+    // Strict containment: nudge by one step whenever the floored
+    // / ceiled boundary lands exactly on the observed value.
+    // `tol` absorbs the floor/ceil + multiply float drift so we
+    // don't spuriously skip the bump on values that are
+    // representational ε off a step.
+    let tol = step * 1e-9;
+    if min >= raw_min - tol {
+        // Don't bump min below zero — every latency/count we plot
+        // is non-negative, and a negative tick label on a duration
+        // axis reads wrong.  Accept touching the raw_min in that
+        // narrow case.
+        let candidate = min - step;
+        if candidate >= 0.0 {
+            min = candidate;
+        }
+    }
+    if max <= raw_max + tol {
+        max += step;
     }
     (min, max, step)
 }
@@ -307,6 +333,38 @@ fn ns_axis_labels(min: f64, max: f64, step: f64) -> Vec<ratatui::text::Span<'sta
         .collect()
 }
 
+/// Count-axis labels: same tick layout as [`ns_axis_labels`], but
+/// the values render as humanised counts (`1k`, `12.3M`) instead of
+/// nanosecond durations.  Used when the active metric is
+/// `Metric::Count` — a "150ms" suffix on a span-count chart is
+/// actively misleading, so the formatter swaps wholesale.
+fn count_axis_labels(min: f64, max: f64, step: f64) -> Vec<ratatui::text::Span<'static>> {
+    axis_ticks(min, max, step)
+        .into_iter()
+        .map(|v| ratatui::text::Span::raw(fmt_count(v.max(0.0))))
+        .collect()
+}
+
+/// Render a non-negative count in k/M/B units, matching the
+/// `fmt_ns`-style "always one significant fractional digit when
+/// scaled" convention.  Examples: `0` → `"0"`, `5` → `"5"`,
+/// `12_300` → `"12.3k"`, `4_500_000` → `"4.5M"`.
+pub(super) fn fmt_count(v: f64) -> String {
+    let v = v.max(0.0);
+    if v >= 1_000_000_000.0 {
+        format!("{:.1}B", v / 1_000_000_000.0)
+    } else if v >= 1_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else if v >= 1_000.0 {
+        format!("{:.1}k", v / 1_000.0)
+    } else if v.fract() == 0.0 {
+        // Sub-1k integer counts render without a decimal — `42` not `42.0`.
+        format!("{}", v as u64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
 pub(super) fn render_graph(
     f: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
@@ -331,7 +389,7 @@ pub(super) fn render_graph(
     // show" — driven by the `l` lookback knob and clamped to be
     // at least one bin wide.
     let x_max_secs = gs.lookback_secs.max(gs.window_secs);
-    let projections = gs.store.project(gs.aggregation, x_max_secs);
+    let projections = gs.store.project(gs.aggregation, gs.metric, x_max_secs);
     // Collision-avoiding palette assignment: when ≤ palette
     // length series exist, every one is guaranteed a unique
     // colour.  Both the chart and the legend pull from the same
@@ -429,10 +487,15 @@ pub(super) fn render_graph(
         .style(Style::default().add_modifier(Modifier::DIM))
         .bounds([-x_max_secs, 0.0])
         .labels(wall_clock_labels(x_max_secs, gs.time_labels, now));
+    let y_labels = if gs.metric.is_count() {
+        count_axis_labels(y_min, y_max, y_step)
+    } else {
+        ns_axis_labels(y_min, y_max, y_step)
+    };
     let y_axis = Axis::default()
         .style(Style::default().add_modifier(Modifier::DIM))
         .bounds([y_min, y_max])
-        .labels(ns_axis_labels(y_min, y_max, y_step));
+        .labels(y_labels);
 
     let chart_focused = gs.focus == GraphFocus::Chart;
     let chart = Chart::new(datasets)
@@ -568,7 +631,7 @@ fn series_table_lines(
         return (None, vec![Line::from("  (no series yet)")], None);
     }
 
-    let summaries = gs.store.series_summary(gs.aggregation);
+    let summaries = gs.store.series_summary(gs.aggregation, gs.metric);
     let summary_by_key: std::collections::HashMap<Vec<(String, String)>, SeriesSummary> =
         summaries.into_iter().map(|s| (s.key.clone(), s)).collect();
 
@@ -607,10 +670,20 @@ fn series_table_lines(
             split_widths[i] = split_widths[i].max(v.chars().count());
         }
         let n = s.map(|s| s.count.to_string()).unwrap_or_else(|| "0".into());
-        let min = crate::aggregate::fmt_ns(s.map(|s| s.min_ns).unwrap_or(0));
-        let avg = crate::aggregate::fmt_ns(s.map(|s| s.avg_ns).unwrap_or(0));
-        let max = crate::aggregate::fmt_ns(s.map(|s| s.max_ns).unwrap_or(0));
-        let last = crate::aggregate::fmt_ns(s.map(|s| s.last_ns).unwrap_or(0));
+        // `series_summary` already swaps to "per-bin span-count
+        // stats" when the active metric is Count, so the values in
+        // `min/avg/max/last` are unitless counts in that mode —
+        // format them with `fmt_count` so a `120ms`-suffixed cell
+        // doesn't appear next to a count.
+        let fmt: fn(u64) -> String = if gs.metric.is_count() {
+            |v| fmt_count(v as f64)
+        } else {
+            crate::aggregate::fmt_ns
+        };
+        let min = fmt(s.map(|s| s.min_ns).unwrap_or(0));
+        let avg = fmt(s.map(|s| s.avg_ns).unwrap_or(0));
+        let max = fmt(s.map(|s| s.max_ns).unwrap_or(0));
+        let last = fmt(s.map(|s| s.last_ns).unwrap_or(0));
         rows.push(Row {
             color_idx: color_idx_of(key),
             visible: !gs.hidden_series.contains(key),
@@ -1111,10 +1184,48 @@ mod tests {
     fn nice_axis_handles_constant_series() {
         // All samples at the same y — synthesise a small window
         // around the value rather than collapsing to a zero-height
-        // axis.
+        // axis.  The bracketing must be strict so the rendered line
+        // doesn't sit on the chart edge.
         let (min, max, step) = super::nice_axis(50.0, 50.0);
-        assert!(max > min, "constant series should still span a range");
+        assert!(min < 50.0, "min must sit BELOW the data, got {min}");
+        assert!(max > 50.0, "max must sit ABOVE the data, got {max}");
         assert!(step > 0.0);
+    }
+
+    #[test]
+    fn nice_axis_strictly_brackets_data_on_step_boundaries() {
+        // Both endpoints land exactly on multiples of the step
+        // chosen by the algorithm — `100..200` would, with naive
+        // floor/ceil, produce `min == 100` and `max == 200`,
+        // collapsing the line to the chart edges.  Strict
+        // containment must nudge by one step on each side.
+        let (min, max, _) = super::nice_axis(100.0, 200.0);
+        assert!(min < 100.0, "min must be strictly below 100, got {min}");
+        assert!(max > 200.0, "max must be strictly above 200, got {max}");
+    }
+
+    #[test]
+    fn nice_axis_does_not_drop_min_below_zero() {
+        // For data anchored at zero we'd rather touch the axis
+        // (min == 0) than show a negative tick — durations and
+        // counts are both non-negative, and a "-2 ms" label reads
+        // wrong on a duration chart.
+        let (min, max, _) = super::nice_axis(0.0, 5.0);
+        assert_eq!(min, 0.0);
+        assert!(max > 5.0);
+    }
+
+    // ── fmt_count humanisation ────────────────────────────────────
+
+    #[test]
+    fn fmt_count_renders_human_units() {
+        assert_eq!(super::fmt_count(0.0), "0");
+        assert_eq!(super::fmt_count(7.0), "7");
+        assert_eq!(super::fmt_count(999.0), "999");
+        assert_eq!(super::fmt_count(1_000.0), "1.0k");
+        assert_eq!(super::fmt_count(12_300.0), "12.3k");
+        assert_eq!(super::fmt_count(4_500_000.0), "4.5M");
+        assert_eq!(super::fmt_count(2_000_000_000.0), "2.0B");
     }
 
     #[test]

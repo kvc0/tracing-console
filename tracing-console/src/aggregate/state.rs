@@ -210,15 +210,25 @@ impl Aggregator {
         out
     }
 
-    pub fn absorb(&mut self, span: WireSpan) {
+    /// Absorb `span` plus any of its pending descendants that this
+    /// arrival unblocks.  Returns the ids of every span that ended
+    /// up in the ring (in insertion order), so callers — notably
+    /// the graph view — can react to the *full* set of newly-
+    /// committed spans rather than just the originally-passed one.
+    /// Without this, a parent that drained a backlog of children
+    /// would silently land them in the aggregator while the graph
+    /// state machine only saw the parent — and missed every sample.
+    pub fn absorb(&mut self, span: WireSpan) -> Vec<u64> {
         // Discard open spans — same as the old `bucket_by_stack`.
         if span.closed_at_ns.is_none() {
-            return;
+            return Vec::new();
         }
-        self.absorb_resolved(span);
+        let mut inserted = Vec::new();
+        self.absorb_resolved(span, &mut inserted);
+        inserted
     }
 
-    fn absorb_resolved(&mut self, span: WireSpan) {
+    fn absorb_resolved(&mut self, span: WireSpan, inserted: &mut Vec<u64>) {
         let parent_id = span.parent_id;
 
         // 1. Try to resolve this span's bucket.
@@ -284,12 +294,13 @@ impl Aggregator {
                 self_ns,
             },
         );
+        inserted.push(id);
 
         // 7. Drain any pending children of this id.
         if let Some(waiters) = self.pending.remove(&id) {
             self.pending_len -= waiters.len();
             for w in waiters {
-                self.absorb_resolved(w);
+                self.absorb_resolved(w, inserted);
             }
         }
     }
@@ -392,9 +403,12 @@ impl Aggregator {
         BucketKey { stack, splits }
     }
 
-    /// Snapshot every bucket as `(BucketKey, StackStats)` sorted in
-    /// the same `(splits, stack)` order the old `bucket_by_stack`
-    /// returned.  Cheap because `|buckets|` is small.
+    /// Snapshot every bucket as `(BucketKey, StackStats)` sorted by
+    /// `(stack, splits)`.  Stack first so children sit immediately
+    /// after their parents in the list, which is what the visibility
+    /// / has-children scan in `Model::visible_rows` relies on — and
+    /// what lets a split on a sub-span render correctly when the
+    /// parent bucket has different (or empty) splits.
     pub fn rows(&self) -> Vec<(BucketKey, StackStats)> {
         let mut out: Vec<(BucketKey, StackStats)> = self
             .buckets
@@ -402,9 +416,9 @@ impl Aggregator {
             .map(|(k, s)| (k.clone(), s.to_stack_stats()))
             .collect();
         out.sort_by(|a, b| {
-            a.0.splits
-                .cmp(&b.0.splits)
-                .then_with(|| a.0.stack.cmp(&b.0.stack))
+            a.0.stack
+                .cmp(&b.0.stack)
+                .then_with(|| a.0.splits.cmp(&b.0.splits))
         });
         out
     }
@@ -428,13 +442,16 @@ impl Aggregator {
         let saved_pending = std::mem::take(&mut self.pending);
         let saved_pending_len = self.pending_len;
         self.pending_len = 0;
+        let mut sink: Vec<u64> = Vec::new();
         for id in &order {
             if let Some(entry) = by_id.remove(id) {
                 // Re-feed the WireSpan back through absorb.  Since
                 // every parent appears before its children in `order`,
                 // the bucket resolution succeeds without paging
-                // through pending.
-                self.absorb_resolved(entry.span);
+                // through pending.  We discard the inserted-ids list
+                // here — rebuild_buckets is internal bookkeeping
+                // and has no graph store to notify.
+                self.absorb_resolved(entry.span, &mut sink);
             }
         }
         // Restore any pre-existing pending entries that never made it
