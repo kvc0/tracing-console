@@ -2,6 +2,24 @@
 
 An interactive TUI for inspecting `tracing` spans coming off a live server, plus the cache and RPC layer that gets them to you.
 
+## Quick install
+
+Prebuilt binaries are published for Linux (x86_64, aarch64) and macOS (aarch64 / Apple Silicon). To install the latest release into `~/.local/tracing-console/<version>/` and symlink it as `~/.local/bin/tracing-console`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kvc0/tracing-console/main/install.sh | bash
+```
+
+To pin a specific version instead, pass it as a positional argument:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kvc0/tracing-console/main/install.sh | bash -s -- 0.1.1
+```
+
+If `~/.local/bin` isn't already on your `PATH` the installer prints the one-liner to add it for your shell.
+
+## Overview
+
 The `tracing` tie-in, `tracing-cache`, is made to have the lowest possible overhead while disabled. It's expected that you will
 have nothing connected to your tracing port almost all the time. In the rare case you need it, you can connect, enable briefly,
 (or for longer with a non-100% sampling rate) and then disable. In this way you can capture detailed traces during events

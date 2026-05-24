@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 use tracing_console_host::{WireLevelFilter, WireSpan};
+// `WireServerInfo` is referenced via fully-qualified path in the
+// `ServerInfoReceived` variant so the `use` block stays narrow.
 
 use super::graph::AggMode;
 
@@ -25,6 +27,10 @@ pub enum Update {
     /// In Details focus: toggle the highlighted metadata key in/out
     /// of `split_keys`.
     ToggleSplitSelected,
+    /// Server pushed its handshake `ServerInfo` (the very first
+    /// message on every `StartStream`).  Carries the server crate's
+    /// version so the UI can flag a client/server mismatch.
+    ServerInfoReceived(tracing_console_host::WireServerInfo),
     /// Server pushed the current cache-recording level — display
     /// state is updated to reflect this (and only this).
     CacheLevelReceived(WireLevelFilter),
@@ -150,6 +156,25 @@ pub enum Update {
     Disconnected(String),
     Status(String),
     Quit,
+    /// `v`: when the server and client crate versions disagree,
+    /// open a y/n modal asking whether to re-run the installer
+    /// pinned to the server's version.  No-op otherwise.
+    BeginConfirmVersionSwitch,
+    /// `y` in the confirm-version modal: close it and emit
+    /// [`Effect::RunUpdateInstaller`] pinned to the server's version.
+    ConfirmVersionSwitchYes,
+    /// `n` / `Esc` in the confirm-version modal: close it, no effect.
+    /// Ignored while the installer is mid-run (`ConfirmStatus::Running`).
+    ConfirmVersionSwitchNo,
+    /// The async installer task finished with a successful exit
+    /// status.  The currently-running binary is now stale, so the
+    /// reducer returns `Effect::Quit`.
+    InstallerSucceeded,
+    /// The async installer task failed — exit status non-zero, or
+    /// the subprocess couldn't be launched at all.  Carries the
+    /// captured stdout+stderr (best-effort merged) so the modal
+    /// can show what went wrong.
+    InstallerFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,4 +190,19 @@ pub enum Effect {
     /// into an outgoing `SetCacheChance` RPC.  `cache_chance` does
     /// not change locally — the server's `CacheChance` confirms.
     RequestSetChance(f64),
+    /// Tear down the TUI and re-run the public installer (`curl |
+    /// bash`), pinned to `version` when `Some` or "latest" when
+    /// `None`.  Used by `--update` and by the in-app
+    /// version-mismatch confirm modal.  The runtime exits once the
+    /// installer finishes so the user can `exec` the upgraded
+    /// binary.
+    RunUpdateInstaller {
+        version: Option<String>,
+    },
+    /// Exec the installed binary in place of this process — same
+    /// argv, same env, same controlling terminal.  Emitted by the
+    /// post-install Restart confirm.  The runtime tears down the
+    /// TUI before exec'ing so the new process starts with a clean
+    /// terminal state.
+    Restart,
 }

@@ -14,7 +14,14 @@ pub const DEFAULT_STREAM_BUFFER: usize = 4096;
 #[command(
     name = "tracing-console",
     about = "Interactive console for browsing live spans from a tracing-console-host",
-    version
+    version,
+    help_template = "\
+{about-with-newline}
+v{version}
+
+{usage-heading} {usage}
+
+{all-args}{after-help}"
 )]
 pub struct Args {
     /// Address of the host to connect to (e.g. `127.0.0.1:7777`).
@@ -56,6 +63,12 @@ pub struct Args {
     /// `ChancePredicate` percentage to this value (0.0–100.0).
     #[arg(long)]
     pub set_chance: Option<f64>,
+
+    /// Re-run the public installer to upgrade to the latest published
+    /// release.  Shells out to `curl … | bash` and exits; does not
+    /// connect to a host.  All other flags are ignored.
+    #[arg(long, exclusive = true)]
+    pub update: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

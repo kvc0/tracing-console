@@ -269,7 +269,11 @@ fn span_stream<P: EnabledPredicate>(
     request_id: u64,
 ) -> impl futures_core::Stream<Item = Response> {
     async_stream::stream! {
-        // Push current level + chance first so the client renders
+        // Identify the host crate first so the client can spot a
+        // version mismatch before consuming any spans.  `CARGO_PKG_VERSION`
+        // is the workspace-pinned version, same as the client binary's.
+        yield Response::server_info(env!("CARGO_PKG_VERSION")).with_id(request_id);
+        // Push current level + chance next so the client renders
         // its switcher / chance UI before any spans land.
         let initial_level = *level_rx.borrow_and_update();
         yield Response::cache_level(initial_level).with_id(request_id);
@@ -500,20 +504,24 @@ mod tests {
         cache.flush_pending();
     }
 
-    /// Drain the initial `CacheLevel` and `CacheChance` messages
-    /// `span_stream` always pushes before subscribing.  Receiving
-    /// both is the sync point that proves the subscriber is
-    /// registered, so any span emitted afterward will be fanned
-    /// out into this stream.
+    /// Drain the initial `ServerInfo` + `CacheLevel` + `CacheChance`
+    /// messages `span_stream` always pushes before subscribing.
+    /// Receiving all three is the sync point that proves the
+    /// subscriber is registered, so any span emitted afterward will
+    /// be fanned out into this stream.
     async fn wait_for_initial(
         stream: &mut (impl futures::Stream<Item = Result<Response, protosocket_rpc::Error>> + Unpin),
     ) {
+        let mut got_server_info = false;
         let mut got_level = false;
         let mut got_chance = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while !(got_level && got_chance) && tokio::time::Instant::now() < deadline {
+        while !(got_server_info && got_level && got_chance)
+            && tokio::time::Instant::now() < deadline
+        {
             match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
                 Ok(Some(Ok(resp))) => match resp.body {
+                    ResponseBody::ServerInfo(_) => got_server_info = true,
                     ResponseBody::CacheLevel(_) => got_level = true,
                     ResponseBody::CacheChance(_) => got_chance = true,
                     _ => {}
@@ -522,8 +530,8 @@ mod tests {
             }
         }
         assert!(
-            got_level && got_chance,
-            "stream did not yield initial CacheLevel/CacheChance",
+            got_server_info && got_level && got_chance,
+            "stream did not yield initial ServerInfo/CacheLevel/CacheChance",
         );
     }
 
@@ -756,17 +764,39 @@ mod tests {
         start.id = 100;
         let mut stream = client.send_streaming(start).unwrap();
 
-        // First push is always the initial CacheLevel snapshot.
+        // First push is always the ServerInfo handshake.
         let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(
-            matches!(first.body, ResponseBody::CacheLevel(_)),
-            "first message should be CacheLevel, got {:?}",
-            first.body
+        let server_info = match first.body {
+            ResponseBody::ServerInfo(info) => info,
+            other => panic!("first message should be ServerInfo, got {other:?}"),
+        };
+        assert_eq!(
+            server_info.version,
+            env!("CARGO_PKG_VERSION"),
+            "server should advertise its own CARGO_PKG_VERSION",
         );
+
+        // Drain the initial CacheLevel + CacheChance pushes so the
+        // loop below observes the *updated* CacheLevel rather than
+        // the initial one.
+        let mut drained_level = false;
+        let mut drained_chance = false;
+        while !(drained_level && drained_chance) {
+            let item = tokio::time::timeout(Duration::from_millis(500), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match item.body {
+                ResponseBody::CacheLevel(_) => drained_level = true,
+                ResponseBody::CacheChance(_) => drained_chance = true,
+                other => panic!("unexpected message during initial drain: {other:?}"),
+            }
+        }
 
         // Change the level — the unary should ack while the streaming
         // RPC stays open.
@@ -787,6 +817,7 @@ mod tests {
                 // Initial chance push + any chance broadcasts are fine
                 // — we just don't care about them in this test.
                 ResponseBody::CacheChance(_) => continue,
+                ResponseBody::ServerInfo(_) => continue,
                 ResponseBody::Span(_) => continue,
                 other => panic!("unexpected stream item: {other:?}"),
             }

@@ -251,10 +251,27 @@ impl Message for Request {
 
 // ── Response body — what the server can send ─────────────────────────────────
 
+/// One-shot server-pushed handshake describing the host binary the
+/// client is talking to.  Sent as the very first response on every
+/// `StartStream` so the client can verify it's connected to a
+/// compatible version (the host crate's version is workspace-pinned
+/// to the same number as the client binary).  Kept as a struct so
+/// future fields (build sha, supported features, …) don't require a
+/// wire-protocol break.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireServerInfo {
+    /// `CARGO_PKG_VERSION` of the `tracing-console-host` crate on the
+    /// server.  Use it to spot mismatched client/server pairs.
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResponseBody {
     /// Filler used by the framework for control-only frames (cancel / end).
     Noop,
+    /// First message of every `StartStream` — identifies the server
+    /// binary.  See [`WireServerInfo`].
+    ServerInfo(WireServerInfo),
     /// One closed span snapshot.  The streaming response side of `StartStream`
     /// emits these one at a time as the host's span cache produces them.
     Span(WireSpan),
@@ -303,6 +320,11 @@ impl Response {
     }
     pub fn cache_chance(pct: f64) -> Self {
         Self::new(ResponseBody::CacheChance(pct))
+    }
+    pub fn server_info(version: impl Into<String>) -> Self {
+        Self::new(ResponseBody::ServerInfo(WireServerInfo {
+            version: version.into(),
+        }))
     }
     /// Set the message id and return `self` so the call chains.  The
     /// server must echo the request id on every response so the

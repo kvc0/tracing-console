@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span as TuiSpan};
 use ratatui::widgets::Paragraph;
 use tracing_console_host::WireLevelFilter;
 
-use crate::model::{ConnectionStatus, Model, ViewMode};
+use crate::model::{CLIENT_VERSION, ConnectionStatus, Model, ViewMode};
 
 /// Faint vertical separator between logical groups in the header
 /// row.  Same DIM `│` glyph used by the stacks-table column
@@ -62,6 +62,43 @@ pub(super) fn connection_header_line(model: &Model) -> Line<'static> {
                 n = model.agg.len(),
                 rate = format_span_rate(model),
             )));
+            // Version line.  Two cases:
+            //   * Server matches client (or hasn't yet handshaken to a
+            //     different value): show `v<client>` dim — present so
+            //     `--version` info is visible, unobtrusive otherwise.
+            //   * Server and client disagree: yellow `server vX client
+            //     vY`, with the `v` in `server v` underlined as the
+            //     keybind hint for opening the version-switch confirm.
+            if let Some(server_version) = &model.server_version {
+                spans.push(header_separator());
+                if server_version == CLIENT_VERSION {
+                    spans.push(TuiSpan::styled(
+                        format!("v{server_version}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                } else {
+                    let yellow = Style::default().fg(Color::Yellow);
+                    spans.push(TuiSpan::styled("server ", yellow));
+                    spans.push(TuiSpan::styled(
+                        "v",
+                        yellow.add_modifier(Modifier::UNDERLINED),
+                    ));
+                    spans.push(TuiSpan::styled(
+                        format!("{server_version} client v{CLIENT_VERSION}"),
+                        yellow,
+                    ));
+                }
+            } else {
+                // No handshake yet (just connected, ServerInfo
+                // hasn't arrived) — still show the client's own
+                // version so the user knows which binary they're
+                // running.
+                spans.push(header_separator());
+                spans.push(TuiSpan::styled(
+                    format!("v{CLIENT_VERSION}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
         }
         ConnectionStatus::Disconnected(reason) => {
             // Highlight just the word so a glance across the screen

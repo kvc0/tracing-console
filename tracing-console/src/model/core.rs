@@ -142,6 +142,53 @@ impl RateTracker {
     }
 }
 
+/// Open-state of the version-mismatch confirm modal.  Stored on
+/// the model as `Option<ConfirmVersionSwitch>`; when `Some`, the
+/// modal is rendered and the keyboard loop routes `y`/`n`/`Esc`
+/// into it.  `server_version` is snapshotted at open time so the
+/// modal text and the emitted effect can't be torn by a
+/// concurrent `ServerInfo` push.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfirmVersionSwitch {
+    pub server_version: String,
+    /// Lifecycle of the modal — starts as `Confirming`; flips to
+    /// `Running` while the installer subprocess runs; ends as
+    /// `Failed` if the installer non-zero-exits (or as a process
+    /// `exit()` if it succeeds — the modal never reaches a "Done"
+    /// state, since success means the binary's been replaced and
+    /// the user wants the new one).
+    #[serde(default)]
+    pub status: ConfirmStatus,
+}
+
+/// Stage of the version-switch modal.  See [`ConfirmVersionSwitch`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ConfirmStatus {
+    /// Initial state — showing the y/n prompt.
+    #[default]
+    Confirming,
+    /// `y` was pressed; the installer is running in the background.
+    /// All keystrokes are dropped while in this state — there's no
+    /// safe mid-install cancel that wouldn't leave a half-installed
+    /// binary on disk.
+    Running,
+    /// Installer exited non-zero or couldn't be launched.  The
+    /// captured stdout+stderr is shown in the modal; `n`/`Esc`
+    /// dismisses.
+    Failed(String),
+    /// Installer succeeded.  The new binary is on disk at
+    /// ~/.local/bin/tracing-console but this process is still the
+    /// old one — prompt the user to restart so the upgrade takes
+    /// effect.  `y` execs the new binary with the same argv;
+    /// `n`/`Esc` keeps running the stale process.
+    Restart,
+}
+
+/// Workspace-pinned crate version this binary was built from
+/// (`CARGO_PKG_VERSION`).  Compared against the server's
+/// `ServerInfo` to decide whether the version-mismatch UI shows.
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// One visible line in the hierarchical tree view.
 #[derive(Debug, Clone)]
 pub struct VisibleRow {
@@ -197,6 +244,20 @@ pub struct Model {
     /// pushes its first `CacheChance`, and updates only via
     /// `Update::CacheChanceReceived`.
     pub cache_chance: Option<f64>,
+    /// Server's advertised `tracing-console-host` crate version, as
+    /// of the most recent `ServerInfo` handshake.  `None` until
+    /// `StartStream` has produced its first message.  Surfaced in the
+    /// header so a client/server version mismatch is visible at a
+    /// glance — both binaries are workspace-pinned to the same value.
+    #[serde(default)]
+    pub server_version: Option<String>,
+    /// When `Some`, the y/n version-switch confirm modal is open
+    /// (the user pressed `v` while a server/client version mismatch
+    /// was visible).  Carries the server version so the modal
+    /// renders the right number and so committing emits an
+    /// installer effect pinned to that version.
+    #[serde(default)]
+    pub confirm_version_switch: Option<ConfirmVersionSwitch>,
     /// When `Some`, the user is typing a new chance value (after
     /// pressing `c`).  Only digits and `.` are accepted; `Enter`
     /// commits and emits [`Effect::RequestSetChance`]; `Esc`
@@ -227,6 +288,8 @@ impl Model {
             history_budget,
             cache_level: None,
             cache_chance: None,
+            server_version: None,
+            confirm_version_switch: None,
             chance_input: None,
             view: ViewMode::Table,
             rate: RateTracker::default(),
@@ -388,6 +451,10 @@ impl Model {
             }
             Update::CacheLevelReceived(filter) => {
                 self.cache_level = Some(filter);
+                Effect::None
+            }
+            Update::ServerInfoReceived(info) => {
+                self.server_version = Some(info.version);
                 Effect::None
             }
             Update::RequestCacheLevel(filter) => Effect::RequestSetLevel(filter),
@@ -1013,6 +1080,75 @@ impl Model {
                 Effect::None
             }
             Update::Quit => Effect::Quit,
+            Update::BeginConfirmVersionSwitch => {
+                // Only meaningful when the server and client crate
+                // versions disagree.  Silently ignored otherwise so
+                // an unbound `v` keystroke can't accidentally pop a
+                // modal with nothing to confirm.  If a modal is
+                // already open (Running or Failed), don't reset its
+                // status — `v` is a no-op in those states.
+                if self.confirm_version_switch.is_none()
+                    && let Some(server_version) = self.server_version.clone()
+                    && server_version != CLIENT_VERSION
+                {
+                    self.confirm_version_switch = Some(ConfirmVersionSwitch {
+                        server_version,
+                        status: ConfirmStatus::Confirming,
+                    });
+                }
+                Effect::None
+            }
+            Update::ConfirmVersionSwitchYes => {
+                // `y` means different things at different stages of
+                // the modal: in `Confirming` it commits the install;
+                // in `Restart` it execs the new binary; in `Running`
+                // and `Failed` it's a no-op (running can't be
+                // cancelled mid-stream, failed retries dismiss-then-
+                // -reopen so the user sees the prior error first).
+                let Some(c) = self.confirm_version_switch.as_mut() else {
+                    return Effect::None;
+                };
+                match &c.status {
+                    ConfirmStatus::Confirming => {
+                        let version = c.server_version.clone();
+                        c.status = ConfirmStatus::Running;
+                        Effect::RunUpdateInstaller {
+                            version: Some(version),
+                        }
+                    }
+                    ConfirmStatus::Restart => Effect::Restart,
+                    ConfirmStatus::Running | ConfirmStatus::Failed(_) => Effect::None,
+                }
+            }
+            Update::ConfirmVersionSwitchNo => {
+                // Dismiss only when there isn't a live subprocess —
+                // dropping the modal mid-install would orphan an
+                // unfinished install on disk with nothing on screen
+                // to tell the user it's still going.
+                if let Some(c) = self.confirm_version_switch.as_ref()
+                    && !matches!(c.status, ConfirmStatus::Running)
+                {
+                    self.confirm_version_switch = None;
+                }
+                Effect::None
+            }
+            Update::InstallerSucceeded => {
+                // New binary is on disk at ~/.local/bin/tracing-console,
+                // but the running process is still the old one.  Park
+                // in the Restart prompt so the user explicitly opts
+                // into the exec — accidentally execing while typing
+                // is more surprising than asking once.
+                if let Some(c) = self.confirm_version_switch.as_mut() {
+                    c.status = ConfirmStatus::Restart;
+                }
+                Effect::None
+            }
+            Update::InstallerFailed(output) => {
+                if let Some(c) = self.confirm_version_switch.as_mut() {
+                    c.status = ConfirmStatus::Failed(output);
+                }
+                Effect::None
+            }
         }
     }
 

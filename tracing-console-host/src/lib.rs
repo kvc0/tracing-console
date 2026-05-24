@@ -20,6 +20,6 @@ mod wire;
 
 pub use protocol::{
     Request, RequestBody, Response, ResponseBody, WireEvent, WireFieldValue, WireLevel,
-    WireLevelFilter, WireSpan,
+    WireLevelFilter, WireServerInfo, WireSpan,
 };
 pub use server::{ServeError, serve};

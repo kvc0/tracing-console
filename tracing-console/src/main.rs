@@ -22,12 +22,27 @@
 
 mod aggregate;
 mod args;
+mod installer;
 mod model;
 mod runtime;
 mod stats;
 mod view;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    runtime::run(args::Args::from_cli()).await
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = args::Args::from_cli();
+
+    // `--update` is a side-channel: skip the async runtime entirely
+    // and shell out to the public installer.  Doing this before the
+    // tokio runtime starts avoids spinning up infrastructure we'd
+    // tear down immediately, and lets the installer's output share
+    // the user's terminal with no contention.
+    if args.update {
+        let status = installer::run(None)?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(runtime::run(args))
 }

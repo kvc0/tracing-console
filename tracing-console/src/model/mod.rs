@@ -24,7 +24,10 @@ mod update;
 #[cfg(test)]
 mod tests;
 
-pub use core::{ConnectionStatus, Focus, LEVEL_OPTIONS, Model, RateTracker, VisibleRow};
+pub use core::{
+    CLIENT_VERSION, ConfirmStatus, ConfirmVersionSwitch, ConnectionStatus, Focus, LEVEL_OPTIONS,
+    Model, RateTracker, VisibleRow,
+};
 pub use explore::{ExploreSortColumn, ExploreState, TraceDetailState, TraceRow};
 pub use graph::{
     AggMode, GraphFocus, GraphState, Metric, SeriesProjection, SeriesSummary, SortColumn,

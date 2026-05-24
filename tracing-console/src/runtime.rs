@@ -146,6 +146,7 @@ async fn run_network(
                 ResponseBody::Span(s) => Some(Update::SpanReceived(s)),
                 ResponseBody::CacheLevel(filter) => Some(Update::CacheLevelReceived(filter)),
                 ResponseBody::CacheChance(pct) => Some(Update::CacheChanceReceived(pct)),
+                ResponseBody::ServerInfo(info) => Some(Update::ServerInfoReceived(info)),
                 _ => None,
             }
         };
@@ -311,6 +312,8 @@ async fn run_tui(
     let mut model = Model::new(history_budget);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
 
+    let installer_tx = tx.clone();
+    let mut restart_after_teardown = false;
     let result: Result<(), Box<dyn std::error::Error>> = (async {
         // Continuous drain via `select!`: the rx.next_batch() arm
         // absorbs Updates as fast as the producer pushes them, and
@@ -335,8 +338,64 @@ async fn run_tui(
                                     Effect::RequestSetChance(pct) => {
                                         let _ = out_tx.send(Outgoing::SetCacheChance(pct));
                                     }
+                                    Effect::Restart => {
+                                        // Bubble out so the runtime can
+                                        // tear down the terminal before
+                                        // exec'ing — without that, the
+                                        // new binary starts inside the
+                                        // old alt-screen + raw mode.
+                                        restart_after_teardown = true;
+                                        return Ok(());
+                                    }
+                                    Effect::RunUpdateInstaller { version } => {
+                                        // Spawn the installer in the background
+                                        // so the modal can stay up.  The task
+                                        // reports back through `tx` with either
+                                        // `InstallerSucceeded` (reducer issues
+                                        // Quit, runtime exits cleanly so the
+                                        // user can run the upgraded binary) or
+                                        // `InstallerFailed(output)` (modal
+                                        // transitions to its Failed state and
+                                        // renders the captured stderr+stdout).
+                                        let tx = installer_tx.clone();
+                                        tokio::spawn(async move {
+                                            let update = match crate::installer::run_capturing(
+                                                version.as_deref(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(out) if out.status.success() => {
+                                                    Update::InstallerSucceeded
+                                                }
+                                                Ok(out) => {
+                                                    let msg = if out.combined_output.is_empty() {
+                                                        format!(
+                                                            "installer exited with status {}",
+                                                            out.status,
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "installer exited with status {}\n\n{}",
+                                                            out.status,
+                                                            out.combined_output.trim_end(),
+                                                        )
+                                                    };
+                                                    Update::InstallerFailed(msg)
+                                                }
+                                                Err(e) => Update::InstallerFailed(format!(
+                                                    "failed to launch installer: {e}"
+                                                )),
+                                            };
+                                            let _ = tx.send(update);
+                                        });
+                                    }
                                 }
-                                let kind = if model.chance_input.is_some() {
+                                let kind = if model.confirm_version_switch.is_some() {
+                                    // Version-mismatch confirm overrides every
+                                    // other modal kind — only y/n/Esc are
+                                    // routed while it's up.
+                                    MODAL_CONFIRM_VERSION_SWITCH
+                                } else if model.chance_input.is_some() {
                                     MODAL_CHANCE
                                 } else if let ViewMode::Graph(gs) = &model.view {
                                     if gs.agg_input.is_some() {
@@ -381,7 +440,41 @@ async fn run_tui(
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    result
+    result?;
+    if restart_after_teardown {
+        // exec only returns on error; this call replaces the current
+        // process image with the freshly-installed binary at the
+        // path the installer always writes to.  Args are inherited
+        // verbatim so a `tracing-console 1.2.3.4:7777 --mode stats`
+        // session resumes against the same host with the same flags.
+        let new_binary = home_local_bin().join("tracing-console");
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let err = exec_replace(&new_binary, &argv);
+        // If we got here, exec failed.  Bubble out as a normal io
+        // error — the terminal's already restored, so the message
+        // lands in cooked stdout.
+        return Err(Box::new(std::io::Error::other(format!(
+            "failed to exec {}: {err}",
+            new_binary.display(),
+        ))));
+    }
+    Ok(())
+}
+
+/// Resolve `$HOME/.local/bin`.  Matches `install.sh`'s `BIN_DIR`
+/// so the restart targets the exact path the installer wrote to,
+/// regardless of where the *currently-running* binary lives.
+fn home_local_bin() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".local").join("bin")
+}
+
+/// `execvp`-style process replacement.  Returns the `io::Error` from
+/// the underlying call; on success exec never returns at all.
+#[cfg(unix)]
+fn exec_replace(binary: &std::path::Path, argv: &[String]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new(binary).args(argv).exec()
 }
 
 /// Modal-kind sentinels for the shared `AtomicU8` between the
@@ -394,6 +487,10 @@ const MODAL_GRAPH_AGG: u8 = 2;
 const MODAL_GRAPH_WINDOW: u8 = 3;
 const MODAL_GRAPH_LOOKBACK: u8 = 4;
 const MODAL_EXPLORE_SEARCH: u8 = 5;
+/// Version-mismatch confirm dialog — only `y`/`n`/`Esc` routed
+/// while open; opening triggered by the `v` key when the header
+/// is showing a `server v… client v…` mismatch line.
+const MODAL_CONFIRM_VERSION_SWITCH: u8 = 6;
 
 // `current_view` mirrors `model.view`'s variant tag.  The
 // keyboard loop reads this to pick the right binding table for
@@ -461,6 +558,16 @@ fn keyboard_loop(
                 (MODAL_EXPLORE_SEARCH, KeyCode::Backspace) => Update::ExploreSearchBackspace,
                 (MODAL_EXPLORE_SEARCH, KeyCode::Enter) => Update::ExploreSearchCommit,
                 (MODAL_EXPLORE_SEARCH, KeyCode::Esc) => Update::ExploreSearchCancel,
+                // y/Y commits the version switch; n/N/Esc cancels.
+                // Everything else is silently dropped so the user
+                // can't accidentally run the installer with a
+                // random keystroke.
+                (MODAL_CONFIRM_VERSION_SWITCH, KeyCode::Char('y' | 'Y')) => {
+                    Update::ConfirmVersionSwitchYes
+                }
+                (MODAL_CONFIRM_VERSION_SWITCH, KeyCode::Char('n' | 'N') | KeyCode::Esc) => {
+                    Update::ConfirmVersionSwitchNo
+                }
                 _ => continue,
             };
             if send_or_exit(update).is_break() {
@@ -482,6 +589,18 @@ fn keyboard_loop(
         };
         if let Some(level) = level {
             if send_or_exit(Update::RequestCacheLevel(level)).is_break() {
+                return;
+            }
+            continue;
+        }
+
+        // Global `v`: open the version-mismatch confirm modal.  The
+        // reducer no-ops it unless the server has advertised a
+        // version different from CLIENT_VERSION, so the binding is
+        // safe to claim in every view (it doesn't conflict because
+        // none of the per-view tables use `v`).
+        if matches!(k.code, KeyCode::Char('v')) {
+            if send_or_exit(Update::BeginConfirmVersionSwitch).is_break() {
                 return;
             }
             continue;
