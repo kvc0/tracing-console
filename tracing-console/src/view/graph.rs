@@ -192,51 +192,22 @@ fn time_labels_label(mode: TimeLabels) -> &'static str {
     }
 }
 
-/// Pick a `(step, n)` such that `n * step == span_secs` exactly and
-/// `n` falls in `[3, 8]`, preferring `n ≈ 4`.  The product
-/// equality is load-bearing: ratatui distributes axis labels
-/// evenly across the bounds, so if the labels' stated values
-/// don't span the bounds exactly, the leftmost label reads
-/// something smaller than the actual leftmost edge (the
-/// regression that made "lookback 2m" display as "-1.7m").
+/// Pick the `(step, n)` for x-axis labels.  Always returns `n = 2`
+/// (i.e. three labels: leftmost / midpoint / rightmost), because
+/// ratatui's chart label renderer cannot space four or more labels
+/// evenly: it pins the first and last to the chart edges but
+/// centers each intermediate label inside a `width / N` slot, so
+/// for `N = 5` the resulting visual positions are roughly
+/// `0, 0.3W, 0.5W, 0.7W, W` — the middle three cluster.  Three
+/// labels collapse to `0, W/2, W` and read cleanly.
 ///
-/// Falls back to `(span_secs / 4, 4)` when no nice round step
-/// divides `span_secs` — labels won't be at round numbers but
-/// they'll line up with the axis correctly.
+/// `step = span_secs / 2` is exact regardless of whether
+/// `span_secs` is a round number, so the previous concern about
+/// labels not lining up with the axis bounds (when `step * n ≠
+/// span_secs` and the leftmost label rendered as something other
+/// than the leftmost edge) doesn't apply.
 pub(super) fn wall_clock_label_step(span_secs: f64) -> (f64, usize) {
-    const NICE_STEPS: &[f64] = &[
-        0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
-        300.0, 600.0, 900.0, 1800.0, 3600.0,
-    ];
-    const TARGET_N: f64 = 4.0;
-    const MIN_N: usize = 3;
-    const MAX_N: usize = 8;
-
-    let mut best: Option<(f64, usize)> = None;
-    for &step in NICE_STEPS {
-        if step > span_secs {
-            break;
-        }
-        let ratio = span_secs / step;
-        let n_round = ratio.round();
-        if !(MIN_N as f64..=MAX_N as f64).contains(&n_round) {
-            continue;
-        }
-        // Step must divide span_secs exactly (within float noise)
-        // — otherwise n*step ≠ span_secs and the leftmost label
-        // gets placed at the wrong axis position.
-        let tol = 1e-6 * span_secs.max(1.0);
-        if (ratio - n_round).abs() > tol {
-            continue;
-        }
-        let n = n_round as usize;
-        let score = (n_round - TARGET_N).abs();
-        let better = best.is_none_or(|(_, prev_n)| (prev_n as f64 - TARGET_N).abs() > score);
-        if better {
-            best = Some((step, n));
-        }
-    }
-    best.unwrap_or_else(|| (span_secs / TARGET_N, TARGET_N as usize))
+    (span_secs / 2.0, 2)
 }
 
 fn format_seconds(s: f64) -> String {
@@ -258,18 +229,81 @@ fn format_seconds(s: f64) -> String {
     }
 }
 
-fn ns_axis_labels(y_max: f64) -> Vec<ratatui::text::Span<'static>> {
-    let n_ticks = 4;
-    let step = if y_max <= 0.0 {
+/// Round a positive number up to the nearest "nice" step in
+/// {1, 2, 5, 10} × 10^n, picking the nearest one rather than always
+/// rounding up — gives endpoints like `90 → 150` rather than the
+/// uglier `80 → 160` for the same raw range.  Used by `nice_axis`.
+fn nice_step(raw: f64) -> f64 {
+    if !raw.is_finite() || raw <= 0.0 {
+        return 1.0;
+    }
+    let exp = raw.log10().floor() as i32;
+    let pow = 10f64.powi(exp);
+    let frac = raw / pow; // in [1, 10)
+    let nice = if frac < 1.5 {
         1.0
+    } else if frac < 3.5 {
+        2.0
+    } else if frac < 7.5 {
+        5.0
     } else {
-        y_max / n_ticks as f64
+        10.0
     };
-    (0..=n_ticks)
-        .map(|i| {
-            let v = (i as f64) * step;
-            ratatui::text::Span::raw(crate::aggregate::fmt_ns(v as u64))
-        })
+    nice * pow
+}
+
+/// Snap `(raw_min, raw_max)` to round-number axis bounds at a shared
+/// nice step.  Returns `(min, max, step)`.  Both endpoints get
+/// autoscaled — `min` floors to the previous step boundary, `max`
+/// ceils to the next — so a chart with raw range `96.1..148.1ms`
+/// renders cleanly as `90..150ms` in `10ms` ticks instead of the
+/// ratatui-default raw-bounds rendering.
+fn nice_axis(raw_min: f64, raw_max: f64) -> (f64, f64, f64) {
+    if !raw_min.is_finite() || !raw_max.is_finite() {
+        return (0.0, 1.0, 0.25);
+    }
+    let raw_min = raw_min.max(0.0);
+    let raw_max = raw_max.max(raw_min);
+    let raw_range = raw_max - raw_min;
+    // Constant or empty series: pretend the range is ~10% of the
+    // value (and at least 1) so the autoscale still produces a
+    // sensibly-bounded axis instead of a degenerate zero-height one.
+    let effective_range = if raw_range > 0.0 {
+        raw_range
+    } else {
+        (raw_max * 0.1).max(1.0)
+    };
+    let target_intervals = 4;
+    let step = nice_step(effective_range / target_intervals as f64);
+    let min = (raw_min / step).floor() * step;
+    let mut max = (raw_max / step).ceil() * step;
+    if max <= min {
+        max = min + step;
+    }
+    (min, max, step)
+}
+
+/// Inclusive list of tick values from `min` to `max` at `step`
+/// granularity.  Shared by `ns_axis_labels` (formats them into
+/// label spans) and `guide_y_values` (draws a faint guide at each).
+fn axis_ticks(min: f64, max: f64, step: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    if step <= 0.0 {
+        return out;
+    }
+    let mut v = min;
+    // Half-step slop so floating drift doesn't drop the final tick.
+    while v <= max + step * 0.5 {
+        out.push(v);
+        v += step;
+    }
+    out
+}
+
+fn ns_axis_labels(min: f64, max: f64, step: f64) -> Vec<ratatui::text::Span<'static>> {
+    axis_ticks(min, max, step)
+        .into_iter()
+        .map(|v| ratatui::text::Span::raw(crate::aggregate::fmt_ns(v.max(0.0).round() as u64)))
         .collect()
 }
 
@@ -316,21 +350,53 @@ pub(super) fn render_graph(
             }
         })
         .collect();
-    let datasets: Vec<Dataset<'_>> = series
+    // Autoscale BOTH y bounds — not just the max — to a shared
+    // round-number step.  Then draw a faint horizontal guide at
+    // every tick value so the eye can read off a value without
+    // tracing back to the label column.
+    let (raw_y_min, raw_y_max) = series
         .iter()
-        .map(|(proj, label, color)| {
+        .flat_map(|(p, ..)| p.points.iter().map(|(_, y)| *y))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), y| {
+            (lo.min(y), hi.max(y))
+        });
+    let (y_min, y_max, y_step) = nice_axis(raw_y_min, raw_y_max);
+
+    // Pre-materialise each guide's two endpoints so the slices the
+    // `Dataset::data(&[…])` borrows from outlive the chart render.
+    let guide_lines: Vec<[(f64, f64); 2]> = axis_ticks(y_min, y_max, y_step)
+        .into_iter()
+        .map(|y| [(-x_max_secs, y), (0.0, y)])
+        .collect();
+    let guide_style = if colorize {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+
+    let mut datasets: Vec<Dataset<'_>> = Vec::with_capacity(guide_lines.len() + series.len());
+    // Guides first so the actual series render over them.  No
+    // `.name(...)` → omitted from the legend (ratatui filters out
+    // datasets without a name).
+    for line in &guide_lines {
+        datasets.push(
+            Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(guide_style)
+                .data(line.as_slice()),
+        );
+    }
+    for (proj, label, color) in &series {
+        datasets.push(
             Dataset::default()
                 .name(label.as_str())
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(*color))
-                .data(proj.points.as_slice())
-        })
-        .collect();
-    let y_max = series
-        .iter()
-        .flat_map(|(p, ..)| p.points.iter().map(|(_, y)| *y))
-        .fold(0.0_f64, f64::max);
+                .data(proj.points.as_slice()),
+        );
+    }
 
     // Verbose title for screenshot-friendliness: stack path, the
     // active aggregation, metric, window, lookback, split keys (if
@@ -365,8 +431,8 @@ pub(super) fn render_graph(
         .labels(wall_clock_labels(x_max_secs, gs.time_labels, now));
     let y_axis = Axis::default()
         .style(Style::default().add_modifier(Modifier::DIM))
-        .bounds([0.0, y_max.max(1.0)])
-        .labels(ns_axis_labels(y_max.max(1.0)));
+        .bounds([y_min, y_max])
+        .labels(ns_axis_labels(y_min, y_max, y_step));
 
     let chart_focused = gs.focus == GraphFocus::Chart;
     let chart = Chart::new(datasets)
@@ -819,54 +885,36 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, 19, 14, 37, 58).unwrap()
     }
 
-    /// Direct values from the user-reported regression:
-    /// "with window 0.25s, lookback 2m shows -1.7m, 3m → -2.5m,
-    /// 4m → -3.3m".  Each of these must produce a step that
-    /// divides span_secs exactly, otherwise ratatui places the
-    /// leftmost label at the wrong axis position.
+    /// Every span must produce a `(step, n)` whose product equals
+    /// the span exactly — without this, ratatui places the leftmost
+    /// label at the wrong axis position (the prior "lookback 2m
+    /// displays as -1.7m" regression).  Also asserts the n=2
+    /// invariant the function now guarantees so a future "let me
+    /// add intermediate labels back" change has to update this
+    /// suite and re-evaluate the spacing question.
     #[test]
-    fn wall_clock_label_step_evenly_divides_user_lookback_inputs() {
-        for &span in &[60.0_f64, 120.0, 180.0, 240.0, 300.0, 600.0] {
+    fn wall_clock_label_step_yields_three_evenly_spaced_labels() {
+        for &span in &[
+            0.25_f64, 1.0, 30.0, 60.0, 67.0, 120.0, 180.0, 240.0, 300.0, 600.0,
+        ] {
             let (step, n) = wall_clock_label_step(span);
+            assert_eq!(n, 2, "want 3 labels (n=2 intervals) for span {span}");
             assert!(
                 (step * n as f64 - span).abs() < 1e-6,
                 "step={step} n={n} span={span}: step*n must equal span",
             );
-            assert!((3..=8).contains(&n), "n={n} out of [3,8] for span={span}",);
         }
     }
 
     #[test]
-    fn wall_clock_label_step_picks_nice_minutes_for_minute_spans() {
-        // The specific outputs the user expects to see.
-        assert_eq!(wall_clock_label_step(60.0), (15.0, 4));
-        assert_eq!(wall_clock_label_step(120.0), (30.0, 4));
-        assert_eq!(wall_clock_label_step(180.0), (60.0, 3));
-        assert_eq!(wall_clock_label_step(240.0), (60.0, 4));
-        assert_eq!(wall_clock_label_step(300.0), (60.0, 5));
-        assert_eq!(wall_clock_label_step(600.0), (120.0, 5));
-    }
-
-    #[test]
-    fn wall_clock_label_step_handles_sub_second_spans() {
-        // Window=0.25, lookback at floor — same correctness rule.
-        let (step, n) = wall_clock_label_step(0.25);
-        assert!((step * n as f64 - 0.25).abs() < 1e-9);
-        assert!((3..=8).contains(&n));
-
-        let (step, n) = wall_clock_label_step(1.0);
-        assert!((step * n as f64 - 1.0).abs() < 1e-9);
-        assert!((3..=8).contains(&n));
-    }
-
-    #[test]
-    fn wall_clock_label_step_fallback_when_no_nice_divisor() {
-        // A span that no nice step divides exactly (67s is prime
-        // among the candidates) — the fallback must still satisfy
-        // n*step == span so labels line up with the axis.
-        let span = 67.0_f64;
-        let (step, n) = wall_clock_label_step(span);
-        assert!((step * n as f64 - span).abs() < 1e-6);
+    fn wall_clock_label_step_round_outputs() {
+        // Common lookbacks all land at round midpoint values — the
+        // visible labels are `-Xm/-Xs ... -X/2 ... 0s`.
+        assert_eq!(wall_clock_label_step(60.0), (30.0, 2)); // -1m / -30s / 0s
+        assert_eq!(wall_clock_label_step(120.0), (60.0, 2)); // -2m / -1m / 0s
+        assert_eq!(wall_clock_label_step(600.0), (300.0, 2)); // -10m / -5m / 0s
+        assert_eq!(wall_clock_label_step(1800.0), (900.0, 2)); // -30m / -15m / 0s
+        assert_eq!(wall_clock_label_step(3600.0), (1800.0, 2)); // -1h / -30m / 0s
     }
 
     #[test]
@@ -1023,5 +1071,57 @@ mod tests {
         for s in &values {
             assert!(*s < super::SERIES_PALETTE.len());
         }
+    }
+
+    // ── y-axis snapping ────────────────────────────────────────
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-6, "{a} ≉ {b}");
+    }
+
+    #[test]
+    fn nice_axis_snaps_to_round_endpoints() {
+        // The motivating example: raw 96.1ms..148.1ms should snap
+        // to 90ms..150ms in 10ms ticks (1e6 ns = 1ms).
+        let (min, max, step) = super::nice_axis(96.1e6, 148.1e6);
+        approx(min, 90e6);
+        approx(max, 150e6);
+        approx(step, 10e6);
+    }
+
+    #[test]
+    fn nice_axis_handles_wide_range() {
+        // 5..993 → 0..1000 in 200 steps (1000/200 = 5 intervals).
+        let (min, max, step) = super::nice_axis(5.0, 993.0);
+        approx(min, 0.0);
+        approx(max, 1000.0);
+        approx(step, 200.0);
+    }
+
+    #[test]
+    fn nice_axis_handles_empty_series() {
+        // No finite fold → fallback axis.
+        let (min, max, step) = super::nice_axis(f64::INFINITY, f64::NEG_INFINITY);
+        approx(min, 0.0);
+        approx(max, 1.0);
+        approx(step, 0.25);
+    }
+
+    #[test]
+    fn nice_axis_handles_constant_series() {
+        // All samples at the same y — synthesise a small window
+        // around the value rather than collapsing to a zero-height
+        // axis.
+        let (min, max, step) = super::nice_axis(50.0, 50.0);
+        assert!(max > min, "constant series should still span a range");
+        assert!(step > 0.0);
+    }
+
+    #[test]
+    fn axis_ticks_inclusive() {
+        let ticks = super::axis_ticks(90e6, 150e6, 10e6);
+        assert_eq!(ticks.len(), 7); // 90, 100, ..., 150
+        approx(ticks[0], 90e6);
+        approx(ticks[ticks.len() - 1], 150e6);
     }
 }

@@ -113,6 +113,14 @@ tar -xzf "$tmpdir/$archive" -C "$target_dir"
     || die "archive did not contain a tracing-console binary"
 chmod +x "$target_dir/tracing-console"
 
+# ── macOS unblocking ────────────────────────────────────────────────
+# gatekeeper and code signatures. It's not good like using apple's
+# notary service, but I do not have a developer subscription.
+if [ "$os" = "macos" ]; then
+    xattr -dr com.apple.quarantine "$target_dir/tracing-console" 2>/dev/null || true
+    codesign --sign - --force "$target_dir/tracing-console" >/dev/null 2>&1 || true
+fi
+
 mkdir -p "$BIN_DIR"
 # `-f` overwrites an existing symlink (e.g. previous install); `-n`
 # avoids descending into a directory if $BIN_LINK happens to point at
