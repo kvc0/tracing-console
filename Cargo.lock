@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "tracing-cache"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "compact_str",
  "criterion",
@@ -2295,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "tracing-console"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "clap",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "tracing-console-host"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-stream",
  "clap",
